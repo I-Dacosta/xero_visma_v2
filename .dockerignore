@@ -1,0 +1,15 @@
+# Keep the build context small — only ship what cargo actually reads.
+target
+**/target
+.git
+.gitignore
+**/*.md
+docs
+docker-compose*.yml
+Dockerfile
+.dockerignore
+.env
+.env.*
+tooling
+*.log
+.DS_Store

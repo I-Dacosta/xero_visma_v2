@@ -1,0 +1,28 @@
+[package]
+name    = "xero-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "xero"
+path = "src/main.rs"
+
+[dependencies]
+xero-common = { workspace = true }
+xero-auth   = { workspace = true }
+xero-state  = { workspace = true }
+xero-sync   = { workspace = true }
+xero-http   = { workspace = true }
+xero-client = { workspace = true }
+tokio       = { workspace = true }
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json     = { workspace = true }
+sqlx           = { workspace = true }
+chrono         = { workspace = true }
+deadpool-redis = { workspace = true }
+dashmap        = "6"

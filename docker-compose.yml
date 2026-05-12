@@ -1,0 +1,84 @@
+# ─── local dev stack for xero_service_v2 ───
+# Ports deliberately offset from visma_service_v2 (5432/6379) to coexist.
+#   Postgres → localhost:5434
+#   Redis    → localhost:6381
+
+services:
+  xero-server:
+    image: rust:1.80-bookworm
+    restart: unless-stopped
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - xero_cargo_cache:/usr/local/cargo/registry
+      - xero_target_cache:/workspace/target
+    environment:
+      DATABASE_URL: postgresql://xero_user:xero_dev_password@xero-postgres:5432/xero_v2
+      REDIS_URL: redis://xero-redis:6379/0
+      XERO_HTTP_BIND: 0.0.0.0:5002
+      RUST_LOG: info,xero_cli=debug,xero_state=debug
+      XERO_CONNECTION_TYPE: ${XERO_CONNECTION_TYPE:-pkce}
+      XERO_CUSTOM_CONNECTION: ${XERO_CUSTOM_CONNECTION:-false}
+      XERO_CLIENT_ID: ${XERO_CLIENT_ID:-your_xero_client_id}
+      XERO_CLIENT_SECRET: ${XERO_CLIENT_SECRET:-your_xero_client_secret}
+      XERO_REDIRECT_URI: ${XERO_REDIRECT_URI:-http://localhost:5002/api/xero/callback}
+      XERO_SCOPES: ${XERO_SCOPES:-openid profile email offline_access accounting.transactions accounting.transactions.read accounting.contacts accounting.contacts.read accounting.settings accounting.settings.read accounting.reports.read accounting.reports.tenninetynine.read accounting.budgets.read accounting.journals.read accounting.attachments.read accounting.banktransactions.read accounting.invoices.read accounting.manualjournals.read accounting.payments.read accounting.reports.banksummary.read accounting.reports.balancesheet.read accounting.reports.aged.read accounting.reports.budgetsummary.read accounting.reports.executivesummary.read accounting.reports.profitandloss.read accounting.reports.taxreports.read accounting.reports.trialbalance.read files.read assets.read projects.read payroll.employees.read payroll.payruns.read payroll.payslip.read payroll.timesheets.read payroll.settings.read}
+      XERO_CUSTOM_CONNECTION_ORG_INDEX: ${XERO_CUSTOM_CONNECTION_ORG_INDEX:-1}
+      XERO_CC_CLIENT_ID: ${XERO_CC_CLIENT_ID:-}
+      XERO_CC_CLIENT_SECRET: ${XERO_CC_CLIENT_SECRET:-}
+      XERO_CC_TENANT_ID: ${XERO_CC_TENANT_ID:-}
+      XERO_CC_TENANT_NAME: ${XERO_CC_TENANT_NAME:-}
+      XERO_ORG_1_CLIENT_ID: ${XERO_ORG_1_CLIENT_ID:-}
+      XERO_ORG_1_CLIENT_SECRET: ${XERO_ORG_1_CLIENT_SECRET:-}
+      XERO_ORG_1_TENANT_ID: ${XERO_ORG_1_TENANT_ID:-}
+      XERO_ORG_1_NAME: ${XERO_ORG_1_NAME:-}
+      XERO_ORG_2_CLIENT_ID: ${XERO_ORG_2_CLIENT_ID:-}
+      XERO_ORG_2_CLIENT_SECRET: ${XERO_ORG_2_CLIENT_SECRET:-}
+      XERO_ORG_2_TENANT_ID: ${XERO_ORG_2_TENANT_ID:-}
+      XERO_ORG_2_NAME: ${XERO_ORG_2_NAME:-}
+    depends_on:
+      xero-postgres:
+        condition: service_healthy
+      xero-redis:
+        condition: service_healthy
+    command: >
+      bash -c "
+      export PATH=/usr/local/cargo/bin:$$PATH &&
+      cargo run -p xero-cli -- db-migrate &&
+      cargo run -p xero-cli -- serve
+      "
+    ports:
+      - "5002:5002"
+
+  xero-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       xero_v2
+      POSTGRES_USER:     xero_user
+      POSTGRES_PASSWORD: xero_dev_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - xero_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xero_user -d xero_v2"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  xero-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  xero_pg_data:
+  xero_cargo_cache:
+  xero_target_cache:

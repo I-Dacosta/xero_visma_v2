@@ -1,0 +1,49 @@
+# Rust build artifacts
+target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python tooling artefacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Secrets — NEVER commit real values
+.env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+
+# GCP service-account credentials (always live outside the repo on the host)
+app/gcp-credentials.json
+**/gcp-credentials*.json
+**/*-credentials.json
+**/service-account*.json
+*.pem
+*.key
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Logs + temp
+*.log
+logs/
+tmp/
+*.tmp
+
+# Local overrides — keep template visible, ignore personal copy
+docker-compose.local.yml
