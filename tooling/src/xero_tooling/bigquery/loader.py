@@ -41,6 +41,7 @@ import json
 import logging
 import sys
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -49,10 +50,19 @@ logger = logging.getLogger(__name__)
 COMPOSITE_PK_SEPARATOR = "\x1f"  # ASCII unit-separator — won't appear in real keys
 
 
+@lru_cache(maxsize=256)
+def _split_path(path: str) -> tuple[str, ...]:
+    """Cache dotted-path splits. Called once per distinct PK path; the hot
+    loop in `_record_pk` then walks the precomputed tuple instead of
+    re-splitting per-record. The handful of distinct PK paths in the system
+    fits trivially in the LRU."""
+    return tuple(path.split("."))
+
+
 def _get_path(record: dict[str, Any], path: str) -> Any:
     """Resolve a dotted JSON path inside a record (e.g. 'contact.contactID')."""
     current: Any = record
-    for part in path.split("."):
+    for part in _split_path(path):
         if not isinstance(current, dict):
             return None
         current = current.get(part)
@@ -126,7 +136,28 @@ def _field_expr(alias: str, path: str) -> str:
     Top-level: `T`.`field`
     Nested:    `T`.`a`.`b` (BQ struct field access via dotted backticks)
     """
-    return f"{alias}." + ".".join(f"`{part}`" for part in path.split("."))
+    return f"{alias}." + ".".join(f"`{part}`" for part in _split_path(path))
+
+
+@lru_cache(maxsize=256)
+def _build_merge_clauses(
+    columns: tuple[str, ...], primary_keys: tuple[str, ...]
+) -> tuple[str, str, str, str]:
+    """Cache MERGE clause fragments by (columns, primary_keys) shape.
+
+    Each hourly sync runs the same MERGE for the same endpoint with the same
+    schema — caching the on_clause/set_clause/insert_* strings means repeat
+    calls reuse precomputed work instead of rebuilding the strings.
+    """
+    pk_top_level = {pk.split(".", maxsplit=1)[0] for pk in primary_keys}
+    set_clause = ", ".join(f"T.`{c}` = S.`{c}`" for c in columns if c not in pk_top_level)
+    insert_cols = ", ".join(f"`{c}`" for c in columns)
+    insert_vals = ", ".join(f"S.`{c}`" for c in columns)
+    on_clause = " AND ".join(
+        f"{_field_expr('T', pk)} IS NOT DISTINCT FROM {_field_expr('S', pk)}"
+        for pk in primary_keys
+    )
+    return on_clause, set_clause, insert_cols, insert_vals
 
 
 def _validate_target_pk_schema(
@@ -260,14 +291,8 @@ def merge(
                 "primary key field(s) missing from loaded records: " + ", ".join(missing_pk)
             )
 
-        set_clause = ", ".join(
-            f"T.`{c}` = S.`{c}`" for c in columns if c not in pk_top_level
-        )
-        insert_cols = ", ".join(f"`{c}`" for c in columns)
-        insert_vals = ", ".join(f"S.`{c}`" for c in columns)
-        on_clause = " AND ".join(
-            f"{_field_expr('T', pk)} IS NOT DISTINCT FROM {_field_expr('S', pk)}"
-            for pk in primary_keys
+        on_clause, set_clause, insert_cols, insert_vals = _build_merge_clauses(
+            tuple(columns), tuple(primary_keys)
         )
 
         merge_sql = f"""

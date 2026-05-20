@@ -311,6 +311,55 @@ impl SyncExecutor {
         self.sync_one_with_run_id(run_id, tenant, &entity, records, &options)
             .await
     }
+
+    /// Run several entities for one tenant concurrently, bounded by
+    /// `max_concurrent`. Each entity gets its own `Result<Uuid>` so a
+    /// failure on one does not abort the others.
+    ///
+    /// The Xero rate limiter (see `xero-client::rate_limit`) already caps
+    /// in-flight requests at `MAX_CONCURRENT_PER_TENANT = 6`, so the safe
+    /// ceiling for `max_concurrent` is 6 for a single tenant. Callers that
+    /// orchestrate multiple tenants should multiply by their tenant fan-out.
+    ///
+    /// Returns one result per requested (tenant, entity) pair, in the same
+    /// order as `entities`. Use `.into_iter().enumerate()` to map results
+    /// back to entities.
+    pub async fn run_many(
+        &self,
+        access_token: &str,
+        tenant: TenantId,
+        entities: Vec<EntityType>,
+        options: RunOptions,
+        max_concurrent: usize,
+    ) -> Vec<Result<Uuid>> {
+        use futures::stream::{FuturesOrdered, StreamExt};
+
+        let concurrency = max_concurrent.clamp(1, 6);
+        let mut in_flight: FuturesOrdered<_> = entities
+            .into_iter()
+            .map(|entity| {
+                let opts = options.clone();
+                let t = tenant.clone();
+                async move {
+                    self.run_with_options(access_token, t, entity, opts).await
+                }
+            })
+            .collect();
+
+        // FuturesOrdered processes everything but yields in input order. To
+        // bound concurrency we drain in chunks of `concurrency` — a simple
+        // pattern that doesn't pull in tokio_util::StreamExt::buffered.
+        let mut results = Vec::with_capacity(in_flight.len());
+        let mut buffered = Vec::with_capacity(concurrency);
+        while let Some(fut) = in_flight.next().await {
+            buffered.push(fut);
+            if buffered.len() >= concurrency {
+                results.extend(buffered.drain(..));
+            }
+        }
+        results.extend(buffered.drain(..));
+        results
+    }
 }
 
 /// Decide the new `last_modified_watermark` value for a run.
