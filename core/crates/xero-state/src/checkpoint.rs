@@ -60,7 +60,35 @@ pub async fn load(pg: &PgPool, tenant_id: &str, entity_type: &str) -> Result<Opt
 }
 
 /// Upsert a checkpoint (update watermark + stats after a successful sync run).
+///
+/// Refuses to regress `last_modified_watermark`: if a stored watermark exists
+/// and is strictly greater than the incoming one, the upsert is rejected with
+/// `Error::StateStore`. This guards against an off-by-one in
+/// `compute_next_watermark` or a misordered concurrent write rewinding the
+/// cursor and re-fetching already-seen records (which would inflate the
+/// dedupe pre-filter cost and risk masking upstream issues).
+///
+/// `last_modified_watermark = None` on the input is allowed unconditionally —
+/// that's the "checkpoint reset" case used by manual ops.
 pub async fn upsert(pg: &PgPool, cp: &Checkpoint) -> Result<()> {
+    if let Some(new_wm) = cp.last_modified_watermark {
+        let existing = load(pg, cp.key.tenant.as_str(), &cp.key.entity_type).await?;
+        if let Some(existing) = existing {
+            if let Some(old_wm) = existing.last_modified_watermark {
+                if new_wm < old_wm {
+                    return Err(Error::StateStore(format!(
+                        "watermark regression refused: tenant={} entity={} \
+                         existing={} attempted={}",
+                        cp.key.tenant.as_str(),
+                        cp.key.entity_type,
+                        old_wm,
+                        new_wm,
+                    )));
+                }
+            }
+        }
+    }
+
     sqlx::query(
         r#"
         INSERT INTO xero.sync_checkpoint

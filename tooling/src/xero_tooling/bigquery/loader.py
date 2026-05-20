@@ -129,6 +129,73 @@ def _field_expr(alias: str, path: str) -> str:
     return f"{alias}." + ".".join(f"`{part}`" for part in path.split("."))
 
 
+def _validate_target_pk_schema(
+    client: Any, target_id: str, primary_keys: list[str]
+) -> None:
+    """Verify each primary-key top-level column exists on the target table.
+
+    Runs BEFORE any load to fail fast on PK/schema mismatches — saves a
+    load-job round trip and avoids leaving an orphan temp table on a
+    config error. NotFound on the target itself is allowed (caller may be
+    creating the table); we only block when the table exists and the PK
+    column is missing.
+    """
+    from google.api_core.exceptions import NotFound  # type: ignore[import]
+
+    try:
+        target_meta = client.get_table(target_id)
+    except NotFound:
+        # First write to a new table — autodetect will create the schema.
+        return
+    target_cols = {f.name for f in target_meta.schema}
+    top_level = {pk.split(".", maxsplit=1)[0] for pk in primary_keys}
+    missing = sorted(top_level - target_cols)
+    if missing:
+        raise ValueError(
+            f"primary-key column(s) missing from target {target_id}: {missing}. "
+            f"Available: {sorted(target_cols)[:20]}{'...' if len(target_cols) > 20 else ''}"
+        )
+
+
+def _warn_on_suspicious_dml(
+    *,
+    target_id: str,
+    source_count: int,
+    affected: int,
+    inserted: int | None,
+    updated: int | None,
+) -> None:
+    """Emit warnings on DML patterns that historically masked sync bugs.
+
+    Specifically:
+      * ``inserted == source_count, updated == 0, source_count > 0`` was the
+        v1 Bug E signature — every source row fell through to INSERT because
+        the MERGE ON-clause was NULL-unsafe. The IS NOT DISTINCT FROM fix
+        eliminates that mechanism, but a recurrence (e.g. a column rename
+        breaking the ON-clause) would show the same shape.
+      * ``affected == 0, source_count > 0`` means MERGE silently did nothing.
+        Usually fine on a no-op resync, but on a fresh-data sync it indicates
+        the MERGE matched nothing AND inserted nothing — schema or join key
+        mismatch.
+    """
+    if source_count == 0:
+        return
+    if inserted is not None and updated is not None:
+        if inserted == source_count and updated == 0 and source_count > 0:
+            logger.warning(
+                "DML pattern alert: every source row INSERTed (none matched). "
+                "Target=%s source=%d inserted=%d updated=0. "
+                "Verify MERGE ON-clause and column names against target schema.",
+                target_id, source_count, inserted,
+            )
+    if affected == 0:
+        logger.warning(
+            "MERGE affected zero rows for %d source rows on %s. "
+            "If this is a fresh-data sync, investigate; on a no-op resync it's expected.",
+            source_count, target_id,
+        )
+
+
 def merge(
     *,
     project: str,
@@ -167,6 +234,11 @@ def merge(
 
     target_id = f"{project}.{dataset}.{table}"
     temp_id = f"{project}.{dataset}.{table}_tmp_{uuid.uuid4().hex[:8]}"
+
+    # Fail fast on schema mismatch BEFORE any load happens. Catches typo'd
+    # --primary-key arguments and renamed-column situations without paying
+    # for a doomed load job + orphan temp-table cleanup.
+    _validate_target_pk_schema(client, target_id, primary_keys)
 
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
@@ -222,6 +294,13 @@ def merge(
             affected,
             inserted if inserted is not None else "n/a",
             updated if updated is not None else "n/a",
+        )
+        _warn_on_suspicious_dml(
+            target_id=target_id,
+            source_count=len(records),
+            affected=affected,
+            inserted=inserted,
+            updated=updated,
         )
         return affected
     finally:
