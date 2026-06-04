@@ -3797,6 +3797,7 @@ name = "xero-sync"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "serde",
  "serde_json",
  "tokio",
