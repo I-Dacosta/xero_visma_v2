@@ -1,0 +1,101 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_supplier_payment",
+  description: "Supplier (AP) payment documents from Visma. Grain: one row per payment (tenant + refNbr).",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Supplier (AP) payments
+-- Source: visma_supplier_payments
+-- Grain: one row per payment (tenant + refNbr)
+-- NOTE: currency field is a NESTED JSON object {id, description} — differs
+--       from customer_payments which is a plain STRING. We normalize to
+--       extract just the currency ID string.
+-- =============================================================================
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+    SELECT
+        tenantId                                        AS tenant_id,
+        CAST(NULL AS STRING)                            AS raw_business_unit_id,
+        CAST(NULL AS STRING)                            AS business_unit_id,
+        -- Dimension FKs
+    SAFE_CAST(COALESCE(JSON_VALUE(supplier, '$.number'), JSON_VALUE(supplier, '$.id'), JSON_VALUE(supplier, '$.internalId')) AS STRING) AS supplier_id,
+        -- Normalize nested currency object to plain string
+        COALESCE(JSON_VALUE(currency, '$.id'), SAFE_CAST(currency AS STRING)) AS currency_id,
+        branch                                          AS branch_id,
+    SAFE_CAST(COALESCE(JSON_VALUE(location, '$.id'), JSON_VALUE(location, '$.number'), JSON_VALUE(location, '$.internalId'), location) AS STRING) AS location,
+    SAFE_CAST(COALESCE(JSON_VALUE(cashAccount, '$.id'), JSON_VALUE(cashAccount, '$.number'), JSON_VALUE(cashAccount, '$.internalId'), cashAccount) AS STRING) AS cash_account,
+    SAFE_CAST(COALESCE(JSON_VALUE(paymentMethod, '$.id'), JSON_VALUE(paymentMethod, '$.number'), JSON_VALUE(paymentMethod, '$.internalId'), paymentMethod) AS STRING) AS payment_method,
+
+        -- Degenerate dimensions
+        refNbr                                          AS ref_nbr,
+        type                                            AS payment_type,
+        status,
+        COALESCE(
+          SAFE_CAST(applicationDate AS DATE),
+          DATE(SAFE_CAST(applicationDate AS TIMESTAMP))
+        )                                              AS application_date,
+        applicationPeriod                               AS application_period,
+        paymentRef                                      AS payment_ref,
+        description,
+        hold,
+        released                                        AS is_released,
+
+        -- Measures
+        SAFE_CAST(paymentAmount AS NUMERIC)             AS payment_amount,
+        SAFE_CAST(appliedAmount AS NUMERIC)             AS applied_amount,
+        SAFE_CAST(balance AS NUMERIC)                   AS balance,
+        SAFE_CAST(unappliedBalance AS NUMERIC)          AS unapplied_balance,
+        SAFE_CAST(financeCharges AS NUMERIC)            AS finance_charges,
+
+        -- Audit
+        SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+
+    FROM ${ref("visma_supplier_payments")}
+    WHERE isDeleted = false OR isDeleted IS NULL
+),
+enriched AS (
+  SELECT
+    source_data.*,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    CASE
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value = '0' THEN 'segment_zero_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'unresolved'
+    END AS business_unit_resolution_method,
+    ROW_NUMBER() OVER (
+      PARTITION BY source_data.tenant_id, source_data.ref_nbr
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        business_unit_mapping.valid_from DESC
+    ) AS bu_match_rank
+  FROM source_data
+  LEFT JOIN business_unit_mapping
+    ON source_data.tenant_id = business_unit_mapping.tenant_id
+   AND source_data.application_date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = '0'
+   )
+)
+SELECT
+  enriched.* EXCEPT (business_unit_id, mapped_bu_id, mapped_bu_name, bu_match_rank),
+  COALESCE(enriched.mapped_bu_id, enriched.business_unit_id) AS business_unit_id,
+  enriched.mapped_bu_name AS business_unit_name
+FROM enriched
+WHERE bu_match_rank = 1

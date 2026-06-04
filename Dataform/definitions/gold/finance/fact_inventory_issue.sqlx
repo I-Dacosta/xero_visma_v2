@@ -1,0 +1,11 @@
+config {
+  type: "view",
+  schema: "dw_1_gold_finance",
+  name: "fact_inventory_issue",
+  description: "Inventory issue header fact filtered from the unified inventory movement fact.",
+  tags: ["gold", "finance", "fact", "inventory", "issue"]
+}
+
+SELECT *
+FROM ${ref("dw_1_gold_finance", "fact_inventory_movement")}
+WHERE movement_type = 'ISSUE'

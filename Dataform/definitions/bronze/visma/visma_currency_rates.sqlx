@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_currency_rates",
+  description: "Bronze: Foreign exchange rate history from Visma Global API."
+}

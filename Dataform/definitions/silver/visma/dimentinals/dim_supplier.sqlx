@@ -1,0 +1,61 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_supplier",
+  description: "Supplier dimension sourced from Visma suppliers.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- Silver dimension: Supplier master data
+-- Source: visma_suppliers
+-- =============================================================================
+
+WITH source_data AS (
+SELECT
+    tenantId                                    AS tenant_id,
+    SAFE_CAST(number AS STRING)                 AS supplier_id,
+    name                                        AS supplier_name,
+    status,
+    supplierClass                               AS supplier_class,
+    currencyId                                  AS currency_id,
+    creditTerms                                 AS credit_terms,
+    vatZone                                     AS vat_zone,
+    vatRegistrationId                           AS vat_registration_id,
+    corporateId                                 AS corporate_id,
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+
+FROM ${ref("visma_suppliers")}
+WHERE isDeleted = false OR isDeleted IS NULL
+),
+current_tenant_business_unit AS (
+  SELECT
+         tenant_id,
+         business_unit_id,
+         business_unit_name,
+         ROW_NUMBER() OVER (
+           PARTITION BY tenant_id
+           ORDER BY
+             CASE
+               WHEN source_segment_2_value = '0' THEN 1
+               WHEN source_segment_2_value IS NULL THEN 2
+               ELSE 3
+             END,
+             COALESCE(valid_to, DATE '9999-12-31') DESC,
+             valid_from DESC
+         ) AS rn
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+  WHERE CURRENT_DATE() BETWEEN valid_from AND COALESCE(valid_to, DATE '9999-12-31')
+)
+SELECT
+  source_data.*,
+  current_tenant_business_unit.business_unit_id,
+  current_tenant_business_unit.business_unit_name
+FROM source_data
+LEFT JOIN current_tenant_business_unit
+  ON source_data.tenant_id = current_tenant_business_unit.tenant_id
+ AND current_tenant_business_unit.rn = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY source_data.tenant_id, source_data.supplier_id
+  ORDER BY source_data.last_modified_at DESC, source_data.supplier_name DESC
+) = 1

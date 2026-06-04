@@ -1,0 +1,286 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_inventory_item",
+  description: "Inventory item dimension sourced from Visma inventory items at tenant plus inventory grain. Inventory items are tenant-scoped in Visma; any business-unit fields in this model are tenant-level reporting defaults, not item-level ownership. Bronze ingest metadata and raw source helper fields are preserved with explicit source-prefixed names, and raw inventory attributes and availability are unpacked into helper columns where the source consistently provides data.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- Silver dimension: Inventory item master data
+-- Source: visma_inventory_items
+-- =============================================================================
+
+WITH source_data AS (
+SELECT
+    syncId                                      AS sync_id,
+    tenantId                                    AS tenant_id,
+    syncedAt                                    AS synced_at,
+    firstSyncedAt                               AS first_synced_at,
+    refreshedAt                                 AS refreshed_at,
+    seenInFullScopeRuns                         AS seen_in_full_scope_runs,
+    consecutiveMissingFullRuns                  AS consecutive_missing_full_runs,
+    isDeleted                                   AS source_is_deleted,
+    deletedAt                                   AS source_deleted_at,
+    syncBatch                                   AS sync_batch,
+    organizationName                            AS organization_name,
+    `timestamp`                                 AS source_timestamp_raw,
+    inventoryId                                 AS inventory_id,
+    inventoryNumber                             AS inventory_number,
+    CAST(internalId AS STRING)                  AS inventory_internal_id,
+    description                                 AS item_description,
+    itemClass                                   AS item_class,
+    type                                        AS item_type,
+    status                                      AS item_status,
+    stockItem                                   AS is_stock_item,
+    kitItem                                     AS is_kit_item,
+    baseUnit                                    AS base_unit,
+    salesUnit                                   AS sales_unit,
+    purchaseUnit                                AS purchase_unit,
+    SAFE_CAST(defaultPrice AS NUMERIC)          AS default_price,
+    SAFE_CAST(recommendedPrice AS NUMERIC)      AS recommended_price,
+    SAFE_CAST(lastCost AS NUMERIC)              AS last_cost,
+    SAFE_CAST(currentCost AS NUMERIC)           AS current_cost,
+    SAFE_CAST(pendingCost AS NUMERIC)           AS pending_cost,
+    COALESCE(
+      SAFE_CAST(pendingCostDate AS DATE),
+      DATE(SAFE_CAST(pendingCostDate AS DATETIME)),
+      DATE(SAFE_CAST(pendingCostDate AS TIMESTAMP))
+    )                                           AS pending_cost_date,
+    vatCode                                     AS vat_code,
+    postingClass                                AS posting_class,
+    priceClass                                  AS price_class,
+    priceClassID                                AS price_class_id,
+    unspsc                                      AS unspsc,
+    intrastat                                   AS intrastat,
+    defaultWarehouse                            AS default_warehouse_raw,
+    JSON_VALUE(defaultWarehouse, '$.warehouseId') AS default_warehouse_id,
+    JSON_VALUE(defaultWarehouse, '$.description') AS default_warehouse_name,
+    defaultIssueFrom                            AS default_issue_from_raw,
+    defaultReceiptTo                            AS default_receipt_to_raw,
+    lotSerialClass                              AS lot_serial_class_raw,
+    inventoryUnits                              AS inventory_units_raw,
+    availability                                AS availability_raw,
+    attributes                                  AS attributes_raw,
+    JSON_VALUE(attributes, '$.WEBVARE')         AS attribute_webvare,
+    JSON_VALUE(attributes, '$.KATEGORI')        AS attribute_kategori,
+    JSON_VALUE(attributes, '$.UKATPRODTY')      AS attribute_ukatprodty,
+    JSON_VALUE(attributes, '$.ECOONLINE')       AS attribute_ecoonline,
+    JSON_VALUE(attributes, '$.PRISANTALL')      AS attribute_prisantall,
+    JSON_VALUE(attributes, '$.LAGLOK15')        AS attribute_laglok15,
+    JSON_VALUE(attributes, '$.LAGLOK10')        AS attribute_laglok10,
+    JSON_VALUE(attributes, '$.LAGLOK1')         AS attribute_laglok1,
+    JSON_VALUE(attributes, '$.LAGLOK16')        AS attribute_laglok16,
+    JSON_VALUE(attributes, '$.LAGLOK14')        AS attribute_laglok14,
+    JSON_VALUE(attributes, '$.LAGLOK11')        AS attribute_laglok11,
+    JSON_VALUE(attributes, '$.UNSPSC')          AS attribute_unspsc,
+    JSON_VALUE(attributes, '$.EGENVEKT')        AS attribute_egenvekt,
+    JSON_VALUE(attributes, '$.INTERNNR')        AS attribute_internnr,
+    JSON_VALUE(attributes, '$.SHOPLINK')        AS attribute_shoplink,
+    JSON_VALUE(attributes, '$.PARENTSKU')       AS attribute_parentsku,
+    JSON_VALUE(attributes, '$."MÅLENHETER"')    AS attribute_malenheter,
+    JSON_VALUE(attributes, '$.FORPAKNING')      AS attribute_forpakning,
+    JSON_VALUE(attributes, '$.DEKLNR')          AS attribute_deklnr,
+    JSON_VALUE(attributes, '$."INNKJØPSIN"')    AS attribute_innkjopsin,
+    JSON_VALUE(attributes, '$.DOKTYPE')         AS attribute_doktype,
+    JSON_VALUE(attributes, '$.PRODTYPE3')       AS attribute_prodtype3,
+    JSON_VALUE(attributes, '$.UNNR')            AS attribute_unnr,
+    JSON_VALUE(attributes, '$."GRØNTPUNKT"')    AS attribute_grontpunkt,
+    JSON_VALUE(attributes, '$.ADRKL')           AS attribute_adrkl,
+    JSON_VALUE(attributes, '$.EMBGRP')          AS attribute_embgrp,
+    JSON_VALUE(attributes, '$.FARESEDDEL')      AS attribute_fareseddel,
+    JSON_VALUE(attributes, '$.TUNELL')          AS attribute_tunell,
+    JSON_VALUE(attributes, '$.UN')              AS attribute_un,
+    JSON_VALUE(attributes, '$.IMPORTID')        AS attribute_importid,
+    JSON_VALUE(attributes, '$.DSB')             AS attribute_dsb,
+    JSON_VALUE(attributes, '$.NOS')             AS attribute_nos,
+    JSON_VALUE(attributes, '$.PRODKAT')         AS attribute_prodkat,
+    JSON_VALUE(attributes, '$.SIZE')            AS attribute_size,
+    JSON_VALUE(attributes, '$.PRODTYPE')        AS attribute_prodtype,
+    JSON_VALUE(attributes, '$."ERKLÆRING"')     AS attribute_erklaring,
+    JSON_VALUE(attributes, '$."Internal r"')    AS attribute_internal_r,
+    attachments                                 AS attachments_raw,
+    metadata                                    AS metadata_raw,
+    packaging                                   AS packaging_raw,
+    supplierDetails                             AS supplier_details_raw,
+    warehouseDetails                            AS warehouse_details_raw,
+    salesCategories                             AS sales_categories_raw,
+    crossReferences                             AS cross_references_raw,
+    businessUnitId                              AS source_business_unit_id_raw,
+    businessUnitName                            AS source_business_unit_name_raw,
+    ARRAY_LENGTH(JSON_QUERY_ARRAY(COALESCE(inventoryUnits, '[]')))
+                                                AS inventory_unit_count,
+    ARRAY_LENGTH(JSON_QUERY_ARRAY(COALESCE(availability, '[]')))
+                                                AS availability_count,
+    (SELECT COUNT(*)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     WHERE COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) > 0
+        OR COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) > 0
+        OR COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailableForShipment') AS NUMERIC), 0) > 0
+    )                                           AS availability_active_warehouse_count,
+    (SELECT STRING_AGG(JSON_VALUE(a, '$.warehouseId'), ', ' ORDER BY JSON_VALUE(a, '$.warehouseId'))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_warehouse_ids,
+    (SELECT STRING_AGG(JSON_VALUE(a, '$.description'), ', ' ORDER BY JSON_VALUE(a, '$.warehouseId'))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_warehouse_names,
+    (SELECT SUM(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_total_quantity_on_hand,
+    (SELECT SUM(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_total_quantity_available,
+    (SELECT SUM(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailableForShipment') AS NUMERIC))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_total_quantity_available_for_shipment,
+    (SELECT SUM(SAFE_CAST(JSON_VALUE(a, '$.quantityNotAvailable') AS NUMERIC))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_total_quantity_not_available,
+    (SELECT SUM(SAFE_CAST(JSON_VALUE(a, '$.quantityPurchaseOrders') AS NUMERIC))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_total_quantity_purchase_orders,
+    (SELECT SUM(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_total_estimated_cost,
+    (SELECT MAX(SAFE_CAST(JSON_VALUE(a, '$.lastModified') AS TIMESTAMP))
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+    )                                           AS availability_last_modified_at,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.internalWarehouseId') AS INT64)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_internal_warehouse_id,
+    (SELECT JSON_VALUE(a, '$.warehouseId')
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_warehouse_id,
+    (SELECT JSON_VALUE(a, '$.description')
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_warehouse_name,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_quantity_on_hand,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_quantity_available,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.quantityAvailableForShipment') AS NUMERIC)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_quantity_available_for_shipment,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.quantityNotAvailable') AS NUMERIC)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_quantity_not_available,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.quantityPurchaseOrders') AS NUMERIC)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_quantity_purchase_orders,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_estimated_total_cost,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.estimatedUnitCost') AS NUMERIC)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_estimated_unit_cost,
+    (SELECT SAFE_CAST(JSON_VALUE(a, '$.lastModified') AS TIMESTAMP)
+     FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(COALESCE(availability, '[]')))) AS a
+     ORDER BY
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityAvailable') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.quantityOnHand') AS NUMERIC), 0) DESC,
+       COALESCE(SAFE_CAST(JSON_VALUE(a, '$.estimatedTotalCost') AS NUMERIC), 0) DESC,
+       JSON_VALUE(a, '$.warehouseId')
+     LIMIT 1
+    )                                           AS primary_availability_last_modified_at,
+    ARRAY_LENGTH(JSON_QUERY_ARRAY(COALESCE(crossReferences, '[]')))
+                                                AS cross_reference_count,
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+
+FROM ${ref("visma_inventory_items")}
+WHERE isDeleted = false OR isDeleted IS NULL
+),
+current_tenant_reporting_business_unit AS (
+  SELECT
+         tenant_id,
+         business_unit_id,
+         business_unit_name,
+         ROW_NUMBER() OVER (
+           PARTITION BY tenant_id
+           ORDER BY
+             CASE
+               WHEN source_segment_2_value = '0' THEN 1
+               WHEN source_segment_2_value IS NULL THEN 2
+               ELSE 3
+             END,
+             COALESCE(valid_to, DATE '9999-12-31') DESC,
+             valid_from DESC
+         ) AS rn
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+  WHERE CURRENT_DATE() BETWEEN valid_from AND COALESCE(valid_to, DATE '9999-12-31')
+)
+SELECT
+  source_data.*,
+  current_tenant_reporting_business_unit.business_unit_id
+                                                AS tenant_reporting_business_unit_id,
+  current_tenant_reporting_business_unit.business_unit_name
+                                                AS tenant_reporting_business_unit_name
+FROM source_data
+LEFT JOIN current_tenant_reporting_business_unit
+  ON source_data.tenant_id = current_tenant_reporting_business_unit.tenant_id
+ AND current_tenant_reporting_business_unit.rn = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY source_data.tenant_id, source_data.inventory_id
+  ORDER BY source_data.last_modified_at DESC, source_data.inventory_number DESC
+) = 1

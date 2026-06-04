@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_project_tasks",
+  description: "Bronze: WBS project task breakdown with planned/actual dates from Visma Global API."
+}

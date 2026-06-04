@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_vat_zones",
+  description: "Bronze: Tax jurisdiction zone definitions from Visma Global API."
+}

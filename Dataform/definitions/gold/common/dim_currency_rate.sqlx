@@ -1,0 +1,50 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_currency_rate",
+  description: "Conformed currency-rate reference table at currency-pair and date grain.",
+  tags: ["gold", "common", "currency", "reference"]
+}
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(from_currency_id AS STRING), '|',
+    CAST(to_currency_id AS STRING), '|',
+    CAST(rate_date AS STRING), '|',
+    CAST(rate_type AS STRING), '|',
+    CAST(is_inverse_rate AS STRING)
+  ))                                              AS currency_rate_key,
+
+  FARM_FINGERPRINT(CAST(from_currency_id AS STRING))
+                                                  AS from_currency_key,
+  FARM_FINGERPRINT(CAST(to_currency_id AS STRING))
+                                                  AS to_currency_key,
+
+  CAST(NULL AS STRING)                             AS tenant_id,
+  CAST(NULL AS STRING)                             AS organization_name,
+  from_currency_id,
+  to_currency_id,
+  rate_date,
+  exchange_rate,
+  inverse_exchange_rate,
+  rate_type,
+  CAST(NULL AS STRING)                             AS mult_div,
+  source_timestamp,
+  is_inverse_rate,
+  is_latest_rate_for_pair,
+
+  'visma' AS source_system
+
+FROM (
+  SELECT
+    from_currency_id,
+    to_currency_id,
+    rate_date,
+    exchange_rate,
+    inverse_exchange_rate,
+    'market' AS rate_type,
+    source_timestamp,
+    is_inverse_rate,
+    is_latest_rate_for_pair
+  FROM ${ref("dw_1_silver_visma", "dim_currency_market_rate")}
+)

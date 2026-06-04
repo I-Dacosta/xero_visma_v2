@@ -1,0 +1,87 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_fixed_asset_transaction",
+  description: "Fixed asset lifecycle events from Visma. Grain: one row per transaction (tenant + refNo + lineNo).",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Fixed asset transactions (acquisition, depreciation, disposal)
+-- Source: visma_fixed_asset_transactions
+-- Grain: one row per transaction (tenant + refNo + lineNo)
+-- Why: Maps to Power BI fctFixedAssetTransaction. Tracks asset lifecycle
+--      for depreciation schedules and balance sheet fixed asset values.
+-- =============================================================================
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+    SELECT
+        tenantId                                        AS tenant_id,
+        CAST(NULL AS STRING)                            AS raw_business_unit_id,
+        CAST(NULL AS STRING)                            AS business_unit_id,
+        assetID                                         AS asset_id,
+        branchID                                        AS branch_id,
+        bookID                                          AS book_id,
+        refNo                                           AS ref_no,
+        lineNo                                          AS line_no,
+        batchNo                                         AS batch_no,
+        transactionType                                 AS transaction_type,
+        COALESCE(
+          SAFE_CAST(transactionDate AS DATE),
+          DATE(SAFE_CAST(transactionDate AS DATETIME)),
+          DATE(SAFE_CAST(transactionDate AS TIMESTAMP))
+        )                                               AS transaction_date,
+        transactionPeriodID                             AS transaction_period_id,
+        transactionDescription                          AS transaction_description,
+        origin,
+        register,
+        accounts,
+        SAFE_CAST(transactionAmount AS NUMERIC)         AS transaction_amount,
+        SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+
+    FROM ${ref("visma_fixed_asset_transactions")}
+    WHERE isDeleted = false OR isDeleted IS NULL
+),
+enriched AS (
+  SELECT
+    source_data.*,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    CASE
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value = '0' THEN 'segment_zero_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'unresolved'
+    END AS business_unit_resolution_method,
+    ROW_NUMBER() OVER (
+      PARTITION BY source_data.tenant_id, source_data.ref_no, source_data.line_no
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        business_unit_mapping.valid_from DESC
+    ) AS bu_match_rank
+  FROM source_data
+  LEFT JOIN business_unit_mapping
+    ON source_data.tenant_id = business_unit_mapping.tenant_id
+   AND source_data.transaction_date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = '0'
+   )
+)
+SELECT
+  enriched.* EXCEPT (business_unit_id, mapped_bu_id, mapped_bu_name, bu_match_rank),
+  COALESCE(enriched.mapped_bu_id, enriched.business_unit_id) AS business_unit_id,
+  enriched.mapped_bu_name AS business_unit_name
+FROM enriched
+WHERE bu_match_rank = 1

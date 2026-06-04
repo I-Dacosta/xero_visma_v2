@@ -1,0 +1,92 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "customer_price_class_review_shortlist",
+  description: "Ranked shortlist of the best next CustomerPriceClass approval candidates, distilled from the full unmapped review table. Keeps the top reviewable codes first and trims the queue to a smaller manual-review set.",
+  tags: ["silver", "excel", "reference", "customer", "pricing", "review"]
+}
+
+WITH ranked_candidates AS (
+  SELECT
+    source_code,
+    candidate_lookup_name,
+    candidate_lookup_source,
+    salesrestr_label,
+    source_code_has_letters,
+    raw_rows,
+    distinct_items,
+    sample_items,
+    matched_customers_by_name,
+    matched_tenants_by_name,
+    sample_customers_by_name,
+    customer_class_overlap_customers,
+    customer_class_overlap_tenants,
+    customer_class_sample_customers,
+    review_priority,
+    review_signal,
+    CASE
+      WHEN review_priority = 'high' THEN 1
+      WHEN review_priority = 'medium' THEN 2
+      WHEN matched_customers_by_name > 0 THEN 3
+      WHEN candidate_lookup_name IS NOT NULL THEN 4
+      WHEN source_code_has_letters THEN 5
+      WHEN customer_class_overlap_customers > 0 THEN 6
+      ELSE 7
+    END                                             AS shortlist_bucket,
+    CASE
+      WHEN review_priority = 'high'
+        THEN 'Strong signal. Can likely be approved after a quick business check.'
+      WHEN review_priority = 'medium' AND customer_class_overlap_customers > 0
+        THEN 'Has customerClassId overlap. Validate whether this class consistently means one business customer family.'
+      WHEN matched_customers_by_name > 0
+        THEN 'Has customer-name match signal. Review the sample customers and approve if the label is consistent.'
+      WHEN candidate_lookup_name IS NOT NULL
+        THEN 'Has a candidate label. Confirm that the label truly represents a customer price class.'
+      WHEN source_code_has_letters
+        THEN 'Readable source code. Check whether the code itself is the intended business label.'
+      ELSE 'No clear label signal. High-volume code only; requires manual lookup in Visma or business review.'
+    END                                             AS shortlist_reason,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        CASE
+          WHEN review_priority = 'high' THEN 1
+          WHEN review_priority = 'medium' THEN 2
+          WHEN matched_customers_by_name > 0 THEN 3
+          WHEN candidate_lookup_name IS NOT NULL THEN 4
+          WHEN source_code_has_letters THEN 5
+          WHEN customer_class_overlap_customers > 0 THEN 6
+          ELSE 7
+        END,
+        customer_class_overlap_customers DESC,
+        matched_customers_by_name DESC,
+        distinct_items DESC,
+        raw_rows DESC,
+        SAFE_CAST(source_code AS INT64),
+        source_code
+    )                                               AS shortlist_rank
+  FROM ${ref("dw_1_silver_excel", "customer_price_class_unmapped_review")}
+)
+
+SELECT
+  shortlist_rank,
+  shortlist_bucket,
+  shortlist_reason,
+  source_code,
+  candidate_lookup_name,
+  candidate_lookup_source,
+  salesrestr_label,
+  source_code_has_letters,
+  raw_rows,
+  distinct_items,
+  sample_items,
+  matched_customers_by_name,
+  matched_tenants_by_name,
+  sample_customers_by_name,
+  customer_class_overlap_customers,
+  customer_class_overlap_tenants,
+  customer_class_sample_customers,
+  review_priority,
+  review_signal
+FROM ranked_candidates
+WHERE shortlist_rank <= 20
+ORDER BY shortlist_rank

@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_deferral_codes",
+  description: "Bronze: Accrual/deferral schedule rule codes from Visma Global API."
+}

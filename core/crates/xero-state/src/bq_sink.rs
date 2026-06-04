@@ -18,10 +18,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use gcp_bigquery_client::{
-    model::{
-        table_data_insert_all_request::TableDataInsertAllRequest,
-        table_data_insert_all_request_rows::TableDataInsertAllRequestRows,
-    },
+    model::table_data_insert_all_request::TableDataInsertAllRequest,
     Client as BqClient,
 };
 use serde_json::{json, Value};
@@ -112,21 +109,8 @@ impl BigQueryStreamingSink {
     }
 
     fn table_id(entity_type: &str) -> String {
-        // Map snake_case entity to PascalCase Xero path (close enough for BQ).
-        // e.g. "bank_transactions" -> "BankTransactions"
-        let mut out = String::with_capacity(entity_type.len());
-        let mut up = true;
-        for c in entity_type.chars() {
-            if c == '_' {
-                up = true;
-            } else if up {
-                out.push(c.to_ascii_uppercase());
-                up = false;
-            } else {
-                out.push(c);
-            }
-        }
-        out
+        // e.g. "bank_transactions" -> "xero_bank_transactions"
+        format!("xero_{entity_type}")
     }
 }
 
@@ -170,13 +154,7 @@ impl BqSink for BigQueryStreamingSink {
                     "last_run_id":   r.last_run_id.to_string(),
                     "synced_at":     Utc::now().to_rfc3339(),
                 });
-                req.add_row(
-                    Some(insert_id),
-                    TableDataInsertAllRequestRows {
-                        insert_id: None, // set above via add_row arg 1
-                        json: row,
-                    },
-                )
+                req.add_row(Some(insert_id), row)
                 .map_err(|e| BqError::Insert(e.to_string()))?;
             }
 
@@ -249,15 +227,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_id_snake_to_pascal() {
-        assert_eq!(BigQueryStreamingSink::table_id("invoices"), "Invoices");
+    fn table_id_adds_xero_prefix() {
+        assert_eq!(BigQueryStreamingSink::table_id("invoices"), "xero_invoices");
         assert_eq!(
             BigQueryStreamingSink::table_id("bank_transactions"),
-            "BankTransactions"
+            "xero_bank_transactions"
         );
         assert_eq!(
             BigQueryStreamingSink::table_id("tracking_categories"),
-            "TrackingCategories"
+            "xero_tracking_categories"
         );
     }
 

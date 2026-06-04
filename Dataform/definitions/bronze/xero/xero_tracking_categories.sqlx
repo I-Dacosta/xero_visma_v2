@@ -1,0 +1,38 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_xero",
+  name: "xero_tracking_categories",
+  description: "Bronze: Tracking categories (cost centres, projects) from Xero Accounting API."
+}
+
+//schema
+[
+  {
+    "name": "_tenant_id",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "TrackingCategoryID",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "Name",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "Status",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  }
+]

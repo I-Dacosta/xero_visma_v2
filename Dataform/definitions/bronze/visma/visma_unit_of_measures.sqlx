@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_unit_of_measures",
+  description: "Bronze: Unit of measure conversion definitions from Visma Global API."
+}

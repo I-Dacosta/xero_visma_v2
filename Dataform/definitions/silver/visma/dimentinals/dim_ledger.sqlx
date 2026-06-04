@@ -1,0 +1,42 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_ledger",
+  description: "Silver: GL ledger type dimension (actual, budget, statistical). Source: visma_ledgers.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_ledger.sqlx
+-- Silver dimension: General ledger definitions
+-- Source: dw_1_bronze_visma.visma_ledgers
+-- Grain: one row per tenantId + ledger number (latest non-deleted record)
+-- All fields are flat — no JSON extraction required.
+-- =============================================================================
+
+SELECT
+    -- Sync metadata
+    tenantId                                            AS tenant_id,
+    syncedAt                                            AS synced_at,
+    organizationName                                    AS organization_name,
+
+    -- Natural keys
+    number                                              AS ledger_id,
+    CAST(internalId AS STRING)                          AS ledger_internal_id,
+
+    -- Attributes
+    description                                         AS ledger_description,
+    balanceType                                         AS balance_type,
+    currencyId                                          AS currency_id,
+    branchAccounting                                    AS branch_accounting,
+    consolidationSource                                 AS consolidation_source,
+    postInterCompany                                    AS post_inter_company,
+
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)        AS last_modified_at
+
+FROM ${ref("dw_1_bronze_visma", "visma_ledgers")}
+WHERE isDeleted IS DISTINCT FROM TRUE
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, number
+    ORDER BY syncedAt DESC
+) = 1

@@ -1,0 +1,125 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_general_ledger_balance",
+  description: "Silver: Flat GL period balances with historized business unit mapping by accounting period.",
+  tags: ["silver", "visma", "fact"]
+}
+
+WITH subaccount_dim AS (
+  SELECT
+    tenant_id,
+    subaccount_id,
+    subaccount_number,
+    segment2 AS segment2_value
+  FROM ${ref("dw_1_silver_visma", "dim_subaccount")}
+),
+
+business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+base AS (
+  SELECT
+    tenantId AS tenant_id,
+    syncedAt AS synced_at,
+    organizationName AS organization_name,
+
+    COALESCE(JSON_VALUE(account, '$.number'), CAST(account AS STRING)) AS account_cd,
+    JSON_VALUE(account, '$.type') AS account_type,
+    CAST(subaccountId AS STRING) AS subaccount_id,
+    subAccountCd AS subaccount_cd,
+    COALESCE(JSON_VALUE(branch, '$.number'), CAST(branch AS STRING)) AS branch_id,
+    COALESCE(JSON_VALUE(ledger, '$.id'), CAST(ledger AS STRING)) AS ledger,
+    currencyId AS currency_id,
+    balanceType AS balance_type,
+
+    financialPeriod AS financial_period,
+    SAFE.PARSE_DATE('%Y%m', financialPeriod) AS accounting_period_date,
+    yearClosed AS year_closed,
+
+    beginningBalance AS beginning_balance,
+    periodToDateDebit AS ptd_debit,
+    periodToDateCredit AS ptd_credit,
+    yearToDateBalance AS ytd_balance,
+
+    beginningBalanceInCurrency AS beginning_balance_currency,
+    periodToDateDebitInCurrency AS ptd_debit_currency,
+    periodToDateCreditInCurrency AS ptd_credit_currency,
+    yearToDateBalanceInCurrency AS ytd_balance_currency,
+
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+  FROM ${ref("dw_1_bronze_visma", "visma_general_ledger_balances_v2")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+),
+
+enriched AS (
+  SELECT
+    b.*,
+    sd.segment2_value AS source_segment_2_value,
+    bm.business_unit_id AS mapped_business_unit_id,
+    bm.business_unit_name AS mapped_business_unit_name,
+    CASE
+      WHEN bm.business_unit_id IS NULL THEN 'no_mapping'
+      WHEN bm.source_segment_2_value IS NOT NULL THEN 'subaccount_segment2_match'
+      ELSE 'tenant_default_match'
+    END AS business_unit_match_rule,
+    ROW_NUMBER() OVER (
+      PARTITION BY b.tenant_id, b.account_cd, b.subaccount_id, b.branch_id, b.ledger, b.financial_period, b.currency_id
+      ORDER BY
+        CASE WHEN bm.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        bm.valid_from DESC
+    ) AS bu_match_rank
+  FROM base AS b
+  LEFT JOIN subaccount_dim AS sd
+    ON b.tenant_id = sd.tenant_id
+   AND (b.subaccount_id = sd.subaccount_id OR b.subaccount_cd = sd.subaccount_number)
+  LEFT JOIN business_unit_mapping AS bm
+    ON b.tenant_id = bm.tenant_id
+   AND b.accounting_period_date BETWEEN bm.valid_from AND bm.valid_to
+   AND (
+     bm.source_segment_2_value IS NULL
+     OR bm.source_segment_2_value = COALESCE(sd.segment2_value, '0')
+   )
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  organization_name,
+  COALESCE(mapped_business_unit_id, CONCAT(tenant_id, '|UNMAPPED')) AS business_unit_id,
+  COALESCE(mapped_business_unit_name, organization_name) AS business_unit_name,
+
+  account_cd,
+  account_cd AS account_id,
+  account_type,
+  subaccount_id,
+  subaccount_cd,
+  branch_id,
+  ledger,
+  currency_id,
+  balance_type,
+
+  financial_period,
+  year_closed,
+
+  beginning_balance,
+  ptd_debit,
+  ptd_credit,
+  ytd_balance,
+
+  beginning_balance_currency,
+  ptd_debit_currency,
+  ptd_credit_currency,
+  ytd_balance_currency,
+
+  last_modified_at
+FROM enriched
+WHERE bu_match_rank = 1

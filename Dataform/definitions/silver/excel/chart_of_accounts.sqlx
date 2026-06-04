@@ -1,0 +1,197 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "chart_of_accounts",
+  description: "Cleaned and typed Chart of Accounts. Primary source: reference_data.xlsx via bronze (pre-deduplicated via MERGE). Fallback: seed data for bootstrap.",
+  tags: ["silver", "excel", "reference"],
+  assertions: {
+    nonNull: ["account_code_3", "bs_pl"],
+    uniqueKey: ["account_code_3"]
+  }
+}
+
+WITH bronze_raw AS (
+  SELECT
+    NULLIF(TRIM(SAFE_CAST(bs_pl AS STRING)), '') AS bs_pl,
+    NULLIF(TRIM(SAFE_CAST(fsli_1 AS STRING)), '') AS fsli_1,
+    NULLIF(TRIM(SAFE_CAST(fsli_2 AS STRING)), '') AS fsli_2,
+    NULLIF(TRIM(SAFE_CAST(fsli_3 AS STRING)), '') AS fsli_3,
+    CASE WHEN UPPER(TRIM(SAFE_CAST(ebitda_flag AS STRING))) IN ('X', 'TRUE', '1', 'YES') THEN TRUE ELSE FALSE END AS ebitda_flag,
+    CASE WHEN UPPER(TRIM(SAFE_CAST(net_income_flag AS STRING))) IN ('X', 'TRUE', '1', 'YES') THEN TRUE ELSE FALSE END AS net_income_flag,
+    NULLIF(TRIM(SAFE_CAST(cf1 AS STRING)), '') AS cf1,
+    NULLIF(TRIM(SAFE_CAST(cf2 AS STRING)), '') AS cf2,
+    NULLIF(TRIM(SAFE_CAST(cf3 AS STRING)), '') AS cf3,
+    NULLIF(TRIM(SAFE_CAST(nwc AS STRING)), '') AS nwc,
+    NULLIF(TRIM(SAFE_CAST(capex AS STRING)), '') AS capex,
+    CASE WHEN UPPER(TRIM(SAFE_CAST(intercompany_flag AS STRING))) IN ('X', 'TRUE', '1', 'YES') THEN TRUE ELSE FALSE END AS intercompany_flag,
+    SAFE_CAST(account_code_1 AS INT64) AS account_code_1,
+    SAFE_CAST(account_code_2 AS INT64) AS account_code_2,
+    SAFE_CAST(account_code_3 AS INT64) AS account_code_3,
+    'bronze' AS _source
+  FROM ${ref("dw_1_bronze_excel", "raw_charts_of_accounts")}
+  WHERE account_code_3 IS NOT NULL AND TRIM(account_code_3) != ''
+),
+
+bronze_valid AS (
+  SELECT *
+  FROM bronze_raw
+  WHERE bs_pl IS NOT NULL
+),
+
+seed_data AS (
+  SELECT
+    bs_pl,
+    fsli_1,
+    fsli_2,
+    fsli_3,
+    ebitda_flag,
+    net_income_flag,
+    cf1,
+    cf2,
+    cf3,
+    nwc,
+    capex,
+    FALSE AS intercompany_flag,
+    account_code_1,
+    account_code_2,
+    account_code_3,
+    'seed' AS _source
+  FROM ${ref("dw_1_silver_excel", "seed_chart_of_accounts")}
+),
+
+seed_available_codes AS (
+  SELECT DISTINCT account_code_3
+  FROM seed_data
+),
+
+preferred_seed_codes AS (
+  SELECT code AS account_code_3
+  FROM UNNEST([
+    5000,
+    5200
+  ]) AS code
+),
+
+low_quality_bronze_codes AS (
+  SELECT DISTINCT account_code_3
+  FROM bronze_valid
+  WHERE
+    fsli_1 IS NULL
+    OR fsli_2 IS NULL
+    OR fsli_3 IS NULL
+    OR REGEXP_CONTAINS(COALESCE(fsli_1, ''), r'^\d+$')
+    OR REGEXP_CONTAINS(COALESCE(fsli_2, ''), r'^\d+$')
+    OR REGEXP_CONTAINS(COALESCE(fsli_3, ''), r'^\d+$')
+),
+
+duplicate_bronze_codes AS (
+  SELECT account_code_3
+  FROM bronze_valid
+  GROUP BY 1
+  HAVING COUNT(*) > 1
+),
+
+bronze_unique_codes AS (
+  SELECT *
+  FROM bronze_valid
+  WHERE account_code_3 NOT IN (SELECT account_code_3 FROM duplicate_bronze_codes)
+    AND account_code_3 NOT IN (SELECT account_code_3 FROM preferred_seed_codes)
+    AND NOT (
+      account_code_3 IN (SELECT account_code_3 FROM low_quality_bronze_codes)
+      AND account_code_3 IN (SELECT account_code_3 FROM seed_available_codes)
+    )
+),
+
+bronze_duplicate_fallbacks AS (
+  SELECT *
+  FROM (
+    SELECT
+      b.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY b.account_code_3
+        ORDER BY
+          CASE WHEN b.fsli_3 IS NOT NULL THEN 0 ELSE 1 END,
+          CASE WHEN b.fsli_2 IS NOT NULL THEN 0 ELSE 1 END,
+          CASE WHEN b.fsli_1 IS NOT NULL THEN 0 ELSE 1 END,
+          LENGTH(COALESCE(b.fsli_3, '')) DESC,
+          LENGTH(COALESCE(b.fsli_2, '')) DESC,
+          LENGTH(COALESCE(b.fsli_1, '')) DESC
+      ) AS duplicate_rank
+    FROM bronze_valid AS b
+    WHERE b.account_code_3 IN (SELECT account_code_3 FROM duplicate_bronze_codes)
+      AND b.account_code_3 NOT IN (SELECT account_code_3 FROM seed_available_codes)
+      AND b.account_code_3 NOT IN (SELECT account_code_3 FROM preferred_seed_codes)
+  )
+  WHERE duplicate_rank = 1
+),
+
+resolved_bronze_data AS (
+  SELECT * FROM bronze_unique_codes
+  UNION ALL
+  SELECT
+    bs_pl,
+    fsli_1,
+    fsli_2,
+    fsli_3,
+    ebitda_flag,
+    net_income_flag,
+    cf1,
+    cf2,
+    cf3,
+    nwc,
+    capex,
+    intercompany_flag,
+    account_code_1,
+    account_code_2,
+    account_code_3,
+    _source
+  FROM bronze_duplicate_fallbacks
+),
+
+final_seed_data AS (
+  SELECT *
+  FROM seed_data
+  WHERE account_code_3 NOT IN (SELECT account_code_3 FROM resolved_bronze_data)
+)
+
+SELECT
+  bs_pl,
+  fsli_1,
+  fsli_2,
+  fsli_3,
+  ebitda_flag,
+  net_income_flag,
+  cf1,
+  cf2,
+  cf3,
+  nwc,
+  capex,
+  intercompany_flag,
+  account_code_1,
+  account_code_2,
+  account_code_3,
+  CURRENT_TIMESTAMP() AS _loaded_at,
+  _source
+FROM resolved_bronze_data
+
+UNION ALL
+
+SELECT
+  bs_pl,
+  fsli_1,
+  fsli_2,
+  fsli_3,
+  ebitda_flag,
+  net_income_flag,
+  cf1,
+  cf2,
+  cf3,
+  nwc,
+  capex,
+  intercompany_flag,
+  account_code_1,
+  account_code_2,
+  account_code_3,
+  CURRENT_TIMESTAMP() AS _loaded_at,
+  _source
+FROM final_seed_data

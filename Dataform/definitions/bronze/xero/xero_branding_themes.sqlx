@@ -1,0 +1,52 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_xero",
+  name: "xero_branding_themes",
+  description: "Bronze: Invoice branding themes from Xero Accounting API."
+}
+
+//schema
+[
+  {
+    "name": "_tenant_id",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "BrandingThemeID",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "Name",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "Type",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "SortOrder",
+    "mode": "",
+    "type": "INTEGER",
+    "description": "",
+    "fields": []
+  },
+  {
+    "name": "CreatedDateUTC",
+    "mode": "",
+    "type": "STRING",
+    "description": "",
+    "fields": []
+  }
+]

@@ -1,0 +1,32 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_warehouse",
+  description: "Conformed warehouse dimension with surrogate key.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+-- =============================================================================
+-- Conformed warehouse dimension
+-- Source: dw_1_silver_visma.dim_warehouse
+-- Why: Shared across sales orders, purchase orders, shipments, receipts,
+--      and inventory movements. Central to all logistics reporting.
+-- =============================================================================
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(business_unit_id AS STRING), '|',
+        CAST(warehouse_id AS STRING)
+    ))                                          AS warehouse_key,
+    tenant_id,
+    business_unit_id,
+    warehouse_id,
+    warehouse_name,
+    is_active,
+    branch,
+    receipt_location,
+    ship_location,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_warehouse")}

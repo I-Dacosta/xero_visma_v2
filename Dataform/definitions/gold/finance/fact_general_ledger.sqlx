@@ -1,0 +1,141 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_general_ledger",
+  description: "General ledger transaction fact at journal-line grain. Includes company, business unit, account, currency, accounting segments, project where source-backed, and both local-currency and NOK measures for finance reporting.",
+  tags: ["gold", "finance", "fact"]
+}
+
+-- =============================================================================
+-- Gold finance fact: General ledger transaction lines
+-- Source: dw_1_silver_visma.fact_general_ledger
+-- Grain: one row per GL transaction line
+-- Key rule: account_key is the readable tenant|account_cd key used in Power BI
+-- =============================================================================
+
+WITH fact_source AS (
+  SELECT
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+    FARM_FINGERPRINT(CAST(f.transaction_date AS STRING))
+                                                  AS date_key,
+    FARM_FINGERPRINT(CONCAT(
+      CAST(f.currency_id AS STRING)
+    ))                                            AS currency_key,
+    CASE
+      WHEN COALESCE(f.account_cd, f.account_id) IS NOT NULL THEN CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(COALESCE(f.account_cd, f.account_id) AS STRING)
+      )
+    END                                           AS account_key,
+    f.*
+  FROM ${ref("dw_1_silver_visma", "fact_general_ledger")} AS f
+),
+enriched AS (
+  SELECT
+    f.*,
+    CASE
+      WHEN f.business_unit_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING)
+      ))
+    END                                           AS business_unit_key,
+    bu.entity_code,
+    bu.business_unit_name                         AS dim_business_unit_name,
+    bu.group_name,
+    mr.currency_market_rate_daily_key,
+    mr.market_currency_rate_key,
+    mr.market_rate_date,
+    mr.market_exchange_rate_to_nok,
+    mr.market_inverse_exchange_rate_from_nok,
+    mr.market_rate_source,
+    COALESCE(mr.has_market_rate, FALSE)           AS has_market_rate_to_nok,
+    COALESCE(mr.is_rate_filled_forward, FALSE)    AS is_market_rate_filled_forward,
+    -- Tenant's functional currency (Visma `baseCurrency`). Drives the
+    -- amount_nok logic downstream — see BI_FinanceTable comments. For
+    -- AQ AS / Group / Sense / Consult / Sensilist / Aqua Pharma /
+    -- AQ Hygiene / AQ Food Factory this is 'NOK'. For AQ AB it is 'SEK',
+    -- for AQ Aps / AQ Food Automation ApS it is 'DKK'.
+    COALESCE(co.base_currency, 'NOK')             AS base_currency,
+    -- Daily FX rate for the tenant's base currency → NOK. NULL on dates
+    -- where the rate is missing; downstream COALESCE-chain handles the
+    -- fallback. Equals 1.0 for NOK-functional tenants (self-rate row in
+    -- dim_currency_market_rate_to_nok_daily).
+    bc_mr.market_exchange_rate_to_nok             AS base_currency_market_rate_to_nok
+  FROM fact_source AS f
+  LEFT JOIN ${ref("dw_1_silver_visma", "dim_business_unit")} AS bu
+    ON  bu.tenant_id        = f.tenant_id
+    AND bu.business_unit_id = f.business_unit_id
+    AND f.transaction_date >= bu.bu_valid_from
+    AND (bu.bu_valid_to IS NULL OR f.transaction_date <= bu.bu_valid_to)
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS mr
+    ON mr.date_key = f.date_key
+   AND mr.currency_key = f.currency_key
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_company")} AS co
+    ON co.tenant_id = f.tenant_id
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS bc_mr
+    ON bc_mr.calendar_date    = f.transaction_date
+   AND bc_mr.from_currency_id = COALESCE(co.base_currency, 'NOK')
+   AND bc_mr.to_currency_id   = 'NOK'
+)
+
+SELECT
+  company_key,
+  date_key,
+  currency_key,
+  account_key,
+  tenant_id,
+  business_unit_id,
+  COALESCE(account_cd, account_id)                AS account_cd,
+  account_type,
+  currency_id,
+  batch_number,
+  ref_number,
+  module,
+  line_number,
+  transaction_date,
+  financial_period,
+  ledger,
+  subaccount_id,
+  branch_id,
+  description,
+  project_id,
+  department_id,
+  department_key,
+  debit_amount,
+  credit_amount,
+  debit_amount_currency,
+  credit_amount_currency,
+  beginning_balance,
+  ending_balance,
+  beginning_balance_currency,
+  ending_balance_currency,
+  currency_market_rate_daily_key,
+  market_currency_rate_key,
+  market_rate_date,
+  market_exchange_rate_to_nok,
+  market_inverse_exchange_rate_from_nok,
+  market_rate_source,
+  has_market_rate_to_nok,
+  is_market_rate_filled_forward,
+  SAFE_MULTIPLY(debit_amount_currency, market_exchange_rate_to_nok)
+                                                  AS debit_amount_currency_market_nok,
+  SAFE_MULTIPLY(credit_amount_currency, market_exchange_rate_to_nok)
+                                                  AS credit_amount_currency_market_nok,
+  SAFE_MULTIPLY(beginning_balance_currency, market_exchange_rate_to_nok)
+                                                  AS beginning_balance_currency_market_nok,
+  SAFE_MULTIPLY(ending_balance_currency, market_exchange_rate_to_nok)
+                                                  AS ending_balance_currency_market_nok,
+  business_unit_key,
+  entity_code,
+  COALESCE(dim_business_unit_name, business_unit_name)
+                                                  AS business_unit_name,
+  group_name,
+  -- Functional-currency context. base_currency = the tenant's books
+  -- currency from Visma's organization profile (NOK for Norwegian tenants,
+  -- SEK for AQ AB, DKK for AQ Aps / AQ Food Automation ApS).
+  -- base_currency_market_rate_to_nok is the daily FX rate from
+  -- base_currency to NOK. Both fields drive BI_FinanceTable.amount_nok.
+  base_currency,
+  base_currency_market_rate_to_nok,
+  'visma' AS source_system
+FROM enriched

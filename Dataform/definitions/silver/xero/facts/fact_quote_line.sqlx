@@ -1,0 +1,71 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_quote_line",
+  description: "Silver: Quote line items from Xero Accounting API. Grain: one row per tenant_id + quote_id + line_item_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_quote_line.sqlx
+-- Silver fact: Quote line items (Xero)
+-- Source:  dw_1_bronze_xero.xero_quotes (LineItems[] unnested)
+-- Grain:   one row per tenant_id + quote_id + line_item_id
+-- Note:    Quote lines may not carry AccountCode or AccountID (not in payload).
+--          DiscountAmount appears on quote lines (not DiscountRate).
+--          Tracking[] flattened inline (Xero max 2 per line).
+-- FK refs: quote_id → dw_1_silver_xero.fact_quote
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_quotes")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS quote_id,
+    line
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.LineItems')) AS line
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  quote_id,
+
+  JSON_VALUE(line, '$.LineItemID')                                    AS line_item_id,
+
+  JSON_VALUE(line, '$.Description')                                   AS description,
+  SAFE_CAST(JSON_VALUE(line, '$.Quantity')        AS FLOAT64)         AS quantity,
+  SAFE_CAST(JSON_VALUE(line, '$.UnitAmount')      AS FLOAT64)         AS unit_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.LineAmount')      AS FLOAT64)         AS line_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.TaxAmount')       AS FLOAT64)         AS tax_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.DiscountAmount')  AS FLOAT64)         AS discount_amount,
+
+  -- Tracking category 1
+  JSON_VALUE(line, '$.Tracking[0].TrackingCategoryID')                AS tracking_category_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Name')                              AS tracking_category_1_name,
+  JSON_VALUE(line, '$.Tracking[0].TrackingOptionID')                  AS tracking_option_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Option')                            AS tracking_option_1_name,
+
+  -- Tracking category 2
+  JSON_VALUE(line, '$.Tracking[1].TrackingCategoryID')                AS tracking_category_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Name')                              AS tracking_category_2_name,
+  JSON_VALUE(line, '$.Tracking[1].TrackingOptionID')                  AS tracking_option_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Option')                            AS tracking_option_2_name,
+
+  'xero'                                                              AS _source
+
+FROM unnested

@@ -1,0 +1,34 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_sales_person",
+  description: "Conformed salesperson dimension at tenant plus salesperson grain. Includes directory email and phone enrichment for Power BI and salesperson row-level security.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(sales_person_id AS STRING)
+    ))                                          AS sales_person_key,
+    tenant_id,
+    sales_person_id,
+    sales_person_name,
+    employee_id,
+    phone,
+    email,
+    LOWER(email)                                 AS user_principal_name,
+    legacy_sales_person_id,
+    directory_match_rule,
+    home_business_unit_id,
+    home_business_unit_name,
+    home_business_unit_match_rule,
+    sales_sub_account,
+    sales_sub_account_segment_1,
+    sales_sub_account_segment_2,
+    sales_sub_account_segment_3,
+    commission_pct,
+    is_active,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_sales_person")}

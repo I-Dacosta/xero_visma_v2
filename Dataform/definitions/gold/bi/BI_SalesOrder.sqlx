@@ -1,0 +1,178 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_bi",
+  name: "BI_SalesOrder",
+  description: "Power BI sales-order fact at sales-line grain. Includes date, entity, business unit, customer (id, description, display), supplier, product, salesperson, quantities, local-currency price amounts, NOK amounts, and segment-based department and IC fields. Customer price class fields flow from dim_customer and can be populated by approved seed mapping.",
+  tags: ["gold", "bi", "sales"]
+}
+
+WITH sales_enriched AS (
+  SELECT
+    f.*,
+    d.year,
+    d.quarter,
+    d.month,
+    d.day_of_month                                  AS day,
+    h.status                                        AS order_status,
+    h.customer_id                                   AS header_customer_id,
+    h.customer_name                                 AS header_customer_name,
+    h.order_no                                      AS header_order_no,
+    h.order_date                                    AS header_order_date,
+    e.entity_key,
+    c.entity_code                                   AS company_entity_code,
+    c.group_name                                    AS company_group_name,
+    e.entity_name,
+    e.group_name                                    AS entity_group_name,
+    bu.business_unit_key                            AS dim_business_unit_key,
+    bu.business_unit_code,
+    COALESCE(bu.business_unit_name, f.business_unit_name) AS dim_business_unit_name,
+    bu.group_name                                   AS bu_group_name,
+    p.project_name,
+    cust.price_class_id                             AS customer_price_class_id,
+    cust.price_class_description                    AS customer_price_class_description,
+    s.segment1                                      AS ic_code_dim,
+    s.segment1_value_description                    AS ic_name,
+    s.segment3                                      AS department_code_dim,
+    s.segment3_value_description                    AS department_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY f.sales_order_key, f.line_nbr
+      ORDER BY
+        CASE WHEN s.subaccount_number = f.subaccount_id THEN 0 ELSE 1 END,
+        s.last_modified_at DESC,
+        s.subaccount_id
+    )                                               AS subaccount_match_rank
+  FROM ${ref("dw_1_gold_sales", "fact_sales_order_line")} AS f
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_date")} AS d
+    ON d.date_key = f.date_key
+  LEFT JOIN ${ref("dw_1_gold_sales", "dim_sales_order")} AS h
+    ON h.sales_order_key = f.sales_order_key
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_company")} AS c
+    ON c.company_key = f.company_key
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_entity")} AS e
+    ON e.entity_code = c.entity_code
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_business_unit")} AS bu
+    ON bu.tenant_id = f.tenant_id
+   AND bu.business_unit_id = f.business_unit_id
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_project")} AS p
+    ON p.tenant_id = f.tenant_id
+   AND p.business_unit_id = f.business_unit_id
+   AND p.project_id = f.project_id
+  LEFT JOIN ${ref("dw_1_gold_finance", "dim_customer")} AS cust
+    ON cust.tenant_id = f.tenant_id
+   AND cust.customer_id = h.customer_id
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_subaccount")} AS s
+    ON s.tenant_id = f.tenant_id
+   AND (
+     s.subaccount_id = f.subaccount_id
+     OR s.subaccount_number = f.subaccount_id
+   )
+)
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(tenant_id AS STRING), '|',
+    CAST(order_id AS STRING), '|',
+    CAST(line_nbr AS STRING)
+  ))                                                AS sales_order_line_bi_key,
+  sales_order_key,
+  customer_key,
+  item_key,
+  date_key,
+  header_order_date                                 AS date,
+  year,
+  quarter,
+  month,
+  day,
+  entity_key,
+  company_key,
+  currency_key,
+  dim_business_unit_key                            AS business_unit_key,
+  sales_person_key,
+  tenant_id,
+  company_entity_code                               AS entity_code,
+  entity_name,
+  COALESCE(
+    CONCAT(company_entity_code, ' - ', entity_name),
+    company_entity_code,
+    entity_name
+  )                                                 AS entity,
+  business_unit_id,
+  business_unit_code,
+  dim_business_unit_name                            AS business_unit_name,
+  COALESCE(
+    CONCAT(business_unit_code, ' - ', dim_business_unit_name),
+    dim_business_unit_name,
+    business_unit_code
+  )                                                 AS bu,
+  COALESCE(company_group_name, bu_group_name, entity_group_name) AS group_name,
+  inventory_id                                      AS product_number,
+  COALESCE(inventory_description, line_description) AS product_name,
+  CAST(NULL AS STRING)                              AS product_category,
+  customer_price_class_id                           AS price_class_id,
+  customer_price_class_description                  AS price_class_description,
+  COALESCE(
+    CONCAT(customer_price_class_id, ' - ', customer_price_class_description),
+    customer_price_class_description,
+    customer_price_class_id
+  )                                                 AS price_class,
+  order_qty                                         AS quantity,
+  order_type,
+  COALESCE(
+    CONCAT(resolved_sales_person_id, ' - ', resolved_sales_person_name),
+    resolved_sales_person_name,
+    resolved_sales_person_id
+  )                                                 AS sales_person,
+  order_status                                      AS status,
+  amount                                            AS amount_price,
+  COALESCE(
+    amount_market_nok,
+    CASE WHEN currency_id = 'NOK' THEN amount END
+  )                                                 AS amount_price_nok,
+  header_customer_id                                AS customer_id,
+  header_customer_name                              AS customer_description,
+  COALESCE(
+    CONCAT(header_customer_id, ' - ', header_customer_name),
+    header_customer_name,
+    header_customer_id
+  )                                                 AS customer,
+  COALESCE(
+    CONCAT(supplier_id, ' - ', supplier_name),
+    supplier_name,
+    supplier_id
+  )                                                 AS supplier,
+  COALESCE(department_code_dim, subaccount_segment_3)
+                                                    AS department_code_id,
+  department_name,
+  COALESCE(
+    CONCAT(COALESCE(department_code_dim, subaccount_segment_3), ' - ', department_name),
+    COALESCE(department_code_dim, subaccount_segment_3),
+    department_name
+  )                                                 AS department_code,
+  COALESCE(ic_code_dim, subaccount_segment_1)       AS ic_code_id,
+  ic_name,
+  COALESCE(
+    CONCAT(COALESCE(ic_code_dim, subaccount_segment_1), ' - ', ic_name),
+    COALESCE(ic_code_dim, subaccount_segment_1),
+    ic_name
+  )                                                 AS ic,
+  project_id,
+  project_name,
+  COALESCE(
+    CONCAT(project_id, ' - ', project_name),
+    project_name,
+    project_id
+  )                                                 AS project,
+  SAFE_MULTIPLY(order_qty, COALESCE(unit_cost, average_cost))
+                                                    AS amount_cost_price,
+  COALESCE(
+    cost_amount_market_nok,
+    CASE
+      WHEN currency_id = 'NOK' THEN SAFE_MULTIPLY(order_qty, COALESCE(unit_cost, average_cost))
+    END
+  )                                                 AS amount_cost_price_nok,
+  currency_id,
+  line_type,
+  line_business_unit_strategy,
+  source_system
+FROM sales_enriched
+WHERE subaccount_match_rank = 1

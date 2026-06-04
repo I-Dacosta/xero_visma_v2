@@ -1,0 +1,45 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "source_gap_procurement_line_summary",
+  description: "Tenant-level summary of source gaps for procurement lines, aggregated from supplier invoice line and purchase order line source gap tables.",
+  tags: ["gold", "common", "qa", "exception", "procurement", "source-gap", "summary"]
+}
+
+WITH supplier_invoice_gap_summary AS (
+  SELECT
+    'supplier_invoice_line'                                 AS source_model,
+    tenant_id,
+    organization_name,
+    source_gap_reason,
+    source_gap_severity,
+    COUNT(*)                                                AS gap_row_count,
+    COUNTIF(missing_inventory_id)                           AS missing_inventory_id_count,
+    COUNTIF(missing_line_description)                       AS missing_line_description_count,
+    COUNTIF(missing_amount)                                 AS missing_amount_count
+  FROM ${ref("dw_1_gold_common", "source_gap_supplier_invoice_line")}
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+purchase_order_gap_summary AS (
+  SELECT
+    'purchase_order_line'                                   AS source_model,
+    tenant_id,
+    organization_name,
+    source_gap_reason,
+    source_gap_severity,
+    COUNT(*)                                                AS gap_row_count,
+    COUNTIF(missing_inventory_id)                           AS missing_inventory_id_count,
+    COUNTIF(missing_line_description)                       AS missing_line_description_count,
+    COUNTIF(missing_amount)                                 AS missing_amount_count
+  FROM ${ref("dw_1_gold_common", "source_gap_purchase_order_line")}
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT *
+FROM supplier_invoice_gap_summary
+
+UNION ALL
+
+SELECT *
+FROM purchase_order_gap_summary

@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_excel",
+  name: "raw_charts_of_accounts",
+  description: "Raw Chart of Accounts data ingested from reference_data.xlsx (ChartOfAccounts sheet). Deduplicated via MERGE on (account_code_3), all STRING types."
+}

@@ -1,0 +1,106 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_contact",
+  description: "Silver: Contact (customer/supplier) dimension from Xero Accounting API. Grain: one row per tenant_id + contact_id (latest record by last_seen_at).",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_contact.sqlx
+-- Silver dimension: Contacts (Xero)
+-- Source:  dw_1_bronze_xero.xero_contacts
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + contact_id (latest by last_seen_at)
+-- Note:    UpdatedDateUTC uses Xero's /Date(ms±offset)/ format.
+-- Note:    Addresses[]  → dim_contact_address
+--          Phones[]     → dim_contact_phone
+--          Group links  → dim_contact_group_member (sourced from both endpoints)
+-- Note:    Balances are point-in-time snapshots as of last sync.
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_contacts")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  -- Natural key
+  JSON_VALUE(payload, '$.ContactID')                                  AS contact_id,
+  record_id                                                            AS contact_internal_id,
+
+  -- Reference numbers
+  JSON_VALUE(payload, '$.ContactNumber')                              AS contact_number,
+  JSON_VALUE(payload, '$.AccountNumber')                              AS account_number,
+
+  -- Identity
+  JSON_VALUE(payload, '$.Name')                                       AS contact_name,
+  JSON_VALUE(payload, '$.FirstName')                                  AS first_name,
+  JSON_VALUE(payload, '$.LastName')                                   AS last_name,
+  JSON_VALUE(payload, '$.EmailAddress')                               AS email_address,
+  JSON_VALUE(payload, '$.Website')                                    AS website,
+
+  -- Status & role flags
+  JSON_VALUE(payload, '$.ContactStatus')                              AS status,
+  JSON_VALUE(payload, '$.ContactStatus') = 'ACTIVE'                  AS is_active,
+  SAFE_CAST(JSON_VALUE(payload, '$.IsCustomer')  AS BOOL)             AS is_customer,
+  SAFE_CAST(JSON_VALUE(payload, '$.IsSupplier')  AS BOOL)             AS is_supplier,
+
+  -- Financial defaults
+  JSON_VALUE(payload, '$.DefaultCurrency')                            AS default_currency,
+  SAFE_CAST(JSON_VALUE(payload, '$.Discount') AS FLOAT64)             AS default_discount_pct,
+  JSON_VALUE(payload, '$.TaxNumber')                                  AS tax_number,
+  JSON_VALUE(payload, '$.AccountsReceivableTaxType')                  AS ar_tax_type,
+  JSON_VALUE(payload, '$.AccountsPayableTaxType')                     AS ap_tax_type,
+
+  -- Branding FK
+  JSON_VALUE(payload, '$.BrandingTheme.BrandingThemeID')              AS branding_theme_id,
+
+  -- AR balance snapshot (as of last sync)
+  SAFE_CAST(JSON_VALUE(payload, '$.Balances.AccountsReceivable.Outstanding') AS FLOAT64)
+                                                                       AS ar_outstanding,
+  SAFE_CAST(JSON_VALUE(payload, '$.Balances.AccountsReceivable.Overdue') AS FLOAT64)
+                                                                       AS ar_overdue,
+
+  -- AP balance snapshot (as of last sync)
+  SAFE_CAST(JSON_VALUE(payload, '$.Balances.AccountsPayable.Outstanding') AS FLOAT64)
+                                                                       AS ap_outstanding,
+  SAFE_CAST(JSON_VALUE(payload, '$.Balances.AccountsPayable.Overdue') AS FLOAT64)
+                                                                       AS ap_overdue,
+
+  -- Flags
+  SAFE_CAST(JSON_VALUE(payload, '$.HasAttachments')     AS BOOL)      AS has_attachments,
+  SAFE_CAST(JSON_VALUE(payload, '$.HasValidationErrors') AS BOOL)     AS has_validation_errors,
+
+  -- Date — Xero /Date(ms±offset)/ format
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(
+      REGEXP_EXTRACT(
+        JSON_VALUE(payload, '$.UpdatedDateUTC'),
+        r'/Date\((\d+)[+-]\d{4}\)/'
+      )
+    AS INT64)
+  )                                                                    AS updated_at,
+
+  -- Summary counts (detail in child tables)
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.Addresses'))              AS address_count,
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.Phones'))                 AS phone_count,
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.ContactGroups'))          AS group_count,
+
+  'xero'                                                               AS _source
+
+FROM raw

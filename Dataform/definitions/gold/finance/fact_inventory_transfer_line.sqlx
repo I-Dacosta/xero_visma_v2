@@ -1,0 +1,11 @@
+config {
+  type: "view",
+  schema: "dw_1_gold_finance",
+  name: "fact_inventory_transfer_line",
+  description: "Inventory transfer line fact filtered from the unified inventory movement line fact.",
+  tags: ["gold", "finance", "fact", "inventory", "transfer"]
+}
+
+SELECT *
+FROM ${ref("dw_1_gold_finance", "fact_inventory_movement_line")}
+WHERE movement_type = 'TRANSFER'

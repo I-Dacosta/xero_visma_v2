@@ -1,0 +1,138 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "source_gap_procurement_line_backlog",
+  description: "Prioritized source-gap backlog for procurement lines, aggregated per tenant and supplier across supplier invoice lines and purchase order lines.",
+  tags: ["gold", "common", "qa", "exception", "procurement", "source-gap", "backlog"]
+}
+
+WITH supplier_invoice_gap_base AS (
+  SELECT
+    'supplier_invoice_line'                                 AS source_model,
+    tenant_id,
+    organization_name,
+    supplier_id,
+    supplier_name,
+    reference_number                                        AS document_reference,
+    document_type                                           AS document_type,
+    document_date                                           AS document_date,
+    line_number                                             AS line_number,
+    line_description,
+    amount,
+    source_gap_reason,
+    source_gap_severity,
+    missing_inventory_id,
+    missing_line_description,
+    missing_amount
+  FROM ${ref("dw_1_gold_common", "source_gap_supplier_invoice_line")}
+),
+
+purchase_order_gap_base AS (
+  SELECT
+    'purchase_order_line'                                   AS source_model,
+    tenant_id,
+    organization_name,
+    supplier_id,
+    supplier_name,
+    order_nbr                                               AS document_reference,
+    order_type                                              AS document_type,
+    order_date                                              AS document_date,
+    line_nbr                                                AS line_number,
+    line_description,
+    amount,
+    source_gap_reason,
+    source_gap_severity,
+    missing_inventory_id,
+    missing_line_description,
+    missing_amount
+  FROM ${ref("dw_1_gold_common", "source_gap_purchase_order_line")}
+),
+
+all_gaps AS (
+  SELECT * FROM supplier_invoice_gap_base
+  UNION ALL
+  SELECT * FROM purchase_order_gap_base
+),
+
+aggregated AS (
+  SELECT
+    source_model,
+    tenant_id,
+    organization_name,
+    supplier_id,
+    supplier_name,
+    COUNT(*)                                                AS gap_row_count,
+    COUNT(DISTINCT document_reference)                      AS distinct_document_count,
+    MIN(document_date)                                      AS first_gap_date,
+    MAX(document_date)                                      AS latest_gap_date,
+    SUM(COALESCE(amount, 0))                                AS total_gap_amount_source,
+    COUNTIF(source_gap_severity = 'high')                   AS high_severity_gap_count,
+    COUNTIF(source_gap_severity = 'medium')                 AS medium_severity_gap_count,
+    COUNTIF(source_gap_severity = 'low')                    AS low_severity_gap_count,
+    COUNTIF(source_gap_reason = 'missing_inventory_id_unexpected')
+                                                            AS unexpected_inventory_gap_count,
+    COUNTIF(source_gap_reason IN (
+      'missing_inventory_id_expected_non_item_charge',
+      'missing_inventory_id_expected_service_or_charge'
+    ))                                                      AS expected_charge_or_service_gap_count,
+    COUNTIF(source_gap_reason = 'missing_inventory_id_and_description')
+                                                            AS inventory_and_description_gap_count,
+    COUNTIF(source_gap_reason = 'missing_line_description') AS missing_description_gap_count,
+    COUNTIF(source_gap_reason = 'missing_amount')           AS missing_amount_gap_count,
+    STRING_AGG(
+      DISTINCT CONCAT(document_reference, ':', COALESCE(line_number, '?')),
+      ' | '
+      ORDER BY CONCAT(document_reference, ':', COALESCE(line_number, '?'))
+      LIMIT 8
+    )                                                       AS sample_document_lines,
+    STRING_AGG(
+      DISTINCT COALESCE(line_description, '<missing description>'),
+      ' | '
+      ORDER BY COALESCE(line_description, '<missing description>')
+      LIMIT 8
+    )                                                       AS sample_line_descriptions
+  FROM all_gaps
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  source_model,
+  tenant_id,
+  organization_name,
+  supplier_id,
+  supplier_name,
+  gap_row_count,
+  distinct_document_count,
+  first_gap_date,
+  latest_gap_date,
+  total_gap_amount_source,
+  high_severity_gap_count,
+  medium_severity_gap_count,
+  low_severity_gap_count,
+  unexpected_inventory_gap_count,
+  expected_charge_or_service_gap_count,
+  inventory_and_description_gap_count,
+  missing_description_gap_count,
+  missing_amount_gap_count,
+  CASE
+    WHEN high_severity_gap_count > 0 THEN 'critical'
+    WHEN unexpected_inventory_gap_count >= 250 THEN 'critical'
+    WHEN unexpected_inventory_gap_count >= 100 THEN 'high'
+    WHEN total_gap_amount_source >= 100000 THEN 'high'
+    WHEN unexpected_inventory_gap_count >= 25 THEN 'medium'
+    WHEN gap_row_count >= 50 THEN 'medium'
+    ELSE 'low'
+  END                                                       AS backlog_priority,
+  CASE
+    WHEN high_severity_gap_count > 0 THEN 'missing_amount_present'
+    WHEN unexpected_inventory_gap_count >= 250 THEN 'large_unexpected_inventory_gap_volume'
+    WHEN unexpected_inventory_gap_count >= 100 THEN 'high_unexpected_inventory_gap_volume'
+    WHEN total_gap_amount_source >= 100000 THEN 'high_gap_amount'
+    WHEN unexpected_inventory_gap_count >= 25 THEN 'moderate_unexpected_inventory_gap_volume'
+    WHEN gap_row_count >= 50 THEN 'moderate_total_gap_volume'
+    ELSE 'small_gap_backlog'
+  END                                                       AS backlog_reason,
+  sample_document_lines,
+  sample_line_descriptions,
+  'visma'                                                   AS source_system
+FROM aggregated

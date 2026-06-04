@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_carriers",
+  description: "Bronze: Shipping carrier and freight method master data from Visma Global API."
+}

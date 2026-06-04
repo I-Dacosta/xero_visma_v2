@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_sales_orders_v2",
+  description: "Bronze: Sales order data (V2 compatibility alias, sourced from V3) from Visma Global API."
+}

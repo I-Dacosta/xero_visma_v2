@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_fixed_assets",
+  description: "Bronze: Fixed asset register (asset ID, class, cost, depreciation) from Visma Global API."
+}

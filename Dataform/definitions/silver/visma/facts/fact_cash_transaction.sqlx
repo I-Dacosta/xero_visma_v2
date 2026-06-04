@@ -1,0 +1,133 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_cash_transaction",
+  description: "Silver: Cash account transaction entries with historized business unit mapping by transaction date.",
+  tags: ["silver", "visma", "fact"]
+}
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+base AS (
+  SELECT
+    tenantId AS tenant_id,
+    syncedAt AS synced_at,
+    organizationName AS organization_name,
+    COALESCE(JSON_VALUE(businessUnitId, '$.id'), CAST(businessUnitId AS STRING)) AS source_business_unit_id,
+    businessUnitName AS source_business_unit_name,
+
+    referenceNbr AS reference_nbr,
+    tranType AS tran_type,
+    disbReceipt AS disb_receipt,
+    status,
+
+    COALESCE(
+      JSON_VALUE(cashAccount, '$.cashAccountId'),
+      JSON_VALUE(cashAccount, '$.id'),
+      cashAccount
+    ) AS cash_account_number,
+    COALESCE(JSON_VALUE(entryType, '$.id'), entryType) AS entry_type_id,
+    COALESCE(JSON_VALUE(currency, '$.id'), currency) AS currency_id,
+    COALESCE(JSON_VALUE(owner, '$.id'), owner) AS owner_id,
+    JSON_VALUE(documentRef, '$.type') AS document_ref_type,
+    JSON_VALUE(documentRef, '$.referenceNumber') AS document_ref_number,
+
+    COALESCE(
+      SAFE_CAST(tranDate AS DATE),
+      DATE(SAFE_CAST(tranDate AS DATETIME)),
+      DATE(SAFE_CAST(tranDate AS TIMESTAMP))
+    ) AS transaction_date,
+    financialPeriod AS financial_period,
+    finPeriod AS fin_period,
+
+    description,
+    hold,
+
+    amount,
+    controlTotal AS control_total,
+    taxAmount AS tax_amount,
+    taxTotal AS tax_total,
+    vatExemptTotal AS vat_exempt_total,
+    vatTaxableTotal AS vat_taxable_total,
+
+    financialsDetail AS financials_detail_json,
+    transactionDetails AS transaction_details_json,
+    taxDetails AS tax_details_json,
+
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+  FROM ${ref("dw_1_bronze_visma", "visma_cash_transactions")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+),
+
+enriched AS (
+  SELECT
+    b.*,
+    bm.business_unit_id AS mapped_business_unit_id,
+    bm.business_unit_name AS mapped_business_unit_name,
+    CASE
+      WHEN bm.business_unit_id IS NULL THEN 'no_mapping'
+      WHEN bm.source_segment_2_value IS NOT NULL THEN 'segment_zero_match'
+      ELSE 'tenant_default_match'
+    END AS business_unit_match_rule,
+    ROW_NUMBER() OVER (
+      PARTITION BY b.tenant_id, b.reference_nbr, b.tran_type
+      ORDER BY
+        CASE WHEN bm.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        bm.valid_from DESC
+    ) AS bu_match_rank
+  FROM base AS b
+  LEFT JOIN business_unit_mapping AS bm
+    ON b.tenant_id = bm.tenant_id
+   AND b.transaction_date BETWEEN bm.valid_from AND bm.valid_to
+   AND (
+     bm.source_segment_2_value IS NULL
+     OR bm.source_segment_2_value = '0'
+   )
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  organization_name,
+  source_business_unit_id,
+  source_business_unit_name,
+  COALESCE(mapped_business_unit_id, source_business_unit_id) AS business_unit_id,
+  COALESCE(mapped_business_unit_name, source_business_unit_name, organization_name) AS business_unit_name,
+  business_unit_match_rule,
+
+  reference_nbr,
+  tran_type,
+  disb_receipt,
+  status,
+  cash_account_number,
+  entry_type_id,
+  currency_id,
+  owner_id,
+  document_ref_type,
+  document_ref_number,
+  transaction_date,
+  financial_period,
+  fin_period,
+  description,
+  hold,
+  amount,
+  control_total,
+  tax_amount,
+  tax_total,
+  vat_exempt_total,
+  vat_taxable_total,
+  financials_detail_json,
+  transaction_details_json,
+  tax_details_json,
+  last_modified_at
+FROM enriched
+WHERE bu_match_rank = 1

@@ -1,0 +1,170 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "customer_price_class_unmapped_review",
+  description: "Focused review table for CustomerPriceClass codes observed in bronze but not yet approved into the codebook. Includes code-level usage, readable-label heuristics, customer-name match signals, and customerClassId overlap to support safer approval decisions.",
+  tags: ["silver", "excel", "reference", "customer", "pricing", "review"]
+}
+
+WITH approved_codebook AS (
+  SELECT DISTINCT
+    source_code
+  FROM ${ref("dw_1_silver_excel", "customer_price_class_mapping")}
+  WHERE source_field = 'customer_sales_prices.CustomerPriceClass'
+),
+
+price_class_code_universe AS (
+  SELECT
+    p.priceCode                                      AS source_code,
+    COUNT(*)                                         AS raw_rows,
+    COUNT(DISTINCT p.inventoryId)                    AS distinct_items,
+    ARRAY_TO_STRING(
+      ARRAY_AGG(DISTINCT p.inventoryId IGNORE NULLS ORDER BY p.inventoryId LIMIT 10),
+      ' | '
+    )                                                AS sample_items
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")} AS p
+  WHERE p.priceType = 'CustomerPriceClass'
+    AND p.priceCode IS NOT NULL
+  GROUP BY 1
+),
+
+salesrestr_lookup AS (
+  SELECT
+    JSON_VALUE(item, '$.valueId')                    AS source_code,
+    STRING_AGG(
+      DISTINCT JSON_VALUE(item, '$.description'),
+      ' | '
+      ORDER BY JSON_VALUE(item, '$.description')
+    )                                                AS salesrestr_label
+  FROM ${ref("dw_1_bronze_visma", "visma_attributes")},
+    UNNEST(JSON_EXTRACT_ARRAY(details)) AS item
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND attributeID = 'SALESRESTR'
+    AND JSON_VALUE(item, '$.valueId') IS NOT NULL
+  GROUP BY 1
+),
+
+candidate_labels AS (
+  SELECT
+    u.source_code,
+    s.salesrestr_label,
+    COALESCE(
+      s.salesrestr_label,
+      CASE
+        WHEN REGEXP_CONTAINS(u.source_code, r'[A-Za-zÆØÅæøå]')
+          THEN CONCAT(
+            UPPER(SUBSTR(u.source_code, 1, 1)),
+            LOWER(SUBSTR(u.source_code, 2))
+          )
+        ELSE NULL
+      END
+    )                                                AS candidate_review_label,
+    COALESCE(
+      IF(s.salesrestr_label IS NOT NULL, 'visma_attributes.SALESRESTR', NULL),
+      CASE
+        WHEN REGEXP_CONTAINS(u.source_code, r'[A-Za-zÆØÅæøå]')
+          THEN 'customer_sales_prices.priceCode'
+        ELSE NULL
+      END
+    )                                                AS candidate_label_source,
+    REGEXP_CONTAINS(u.source_code, r'[A-Za-zÆØÅæøå]')
+                                                     AS source_code_has_letters
+  FROM price_class_code_universe AS u
+  LEFT JOIN salesrestr_lookup AS s
+    USING (source_code)
+),
+
+name_match_signals AS (
+  SELECT
+    c.source_code,
+    COUNT(DISTINCT CONCAT(d.tenant_id, '|', d.customer_id))
+                                                     AS matched_customers_by_name,
+    COUNT(DISTINCT d.tenant_id)                      AS matched_tenants_by_name,
+    ARRAY_TO_STRING(
+      ARRAY_AGG(
+        DISTINCT CONCAT(d.organization_name, ': ', d.customer_name)
+        ORDER BY CONCAT(d.organization_name, ': ', d.customer_name)
+        LIMIT 10
+      ),
+      ' | '
+    )                                                AS sample_customers_by_name
+  FROM candidate_labels AS c
+  JOIN ${ref("dw_1_silver_visma", "dim_customer")} AS d
+    ON c.candidate_review_label IS NOT NULL
+   AND REGEXP_CONTAINS(
+     TRIM(REGEXP_REPLACE(LOWER(d.customer_name), r'[^a-z0-9]+', ' ')),
+     CONCAT(
+       r'(^| )',
+       TRIM(REGEXP_REPLACE(LOWER(c.candidate_review_label), r'[^a-z0-9]+', ' ')),
+       r'( |$)'
+     )
+   )
+  GROUP BY 1
+),
+
+customer_class_overlap AS (
+  SELECT
+    c.customerClassId                                AS source_code,
+    COUNT(DISTINCT c.number)                         AS customer_class_overlap_customers,
+    COUNT(DISTINCT c.tenantId)                       AS customer_class_overlap_tenants,
+    ARRAY_TO_STRING(
+      ARRAY_AGG(DISTINCT c.name IGNORE NULLS ORDER BY c.name LIMIT 10),
+      ' | '
+    )                                                AS customer_class_sample_customers
+  FROM ${ref("dw_1_bronze_visma", "visma_customers")} AS c
+  WHERE c.isDeleted IS DISTINCT FROM TRUE
+    AND c.customerClassId IS NOT NULL
+  GROUP BY 1
+)
+
+SELECT
+  u.source_code,
+  l.candidate_review_label                           AS candidate_lookup_name,
+  l.candidate_label_source                           AS candidate_lookup_source,
+  l.salesrestr_label,
+  l.source_code_has_letters,
+  u.raw_rows,
+  u.distinct_items,
+  u.sample_items,
+  COALESCE(n.matched_customers_by_name, 0)          AS matched_customers_by_name,
+  COALESCE(n.matched_tenants_by_name, 0)            AS matched_tenants_by_name,
+  n.sample_customers_by_name,
+  COALESCE(cc.customer_class_overlap_customers, 0)  AS customer_class_overlap_customers,
+  COALESCE(cc.customer_class_overlap_tenants, 0)    AS customer_class_overlap_tenants,
+  cc.customer_class_sample_customers,
+  CASE
+    WHEN COALESCE(n.matched_customers_by_name, 0) >= 20 THEN 'high'
+    WHEN COALESCE(n.matched_customers_by_name, 0) > 0 THEN 'medium'
+    WHEN l.source_code_has_letters THEN 'medium'
+    WHEN COALESCE(cc.customer_class_overlap_customers, 0) > 0 THEN 'medium'
+    ELSE 'low'
+  END                                               AS review_priority,
+  CASE
+    WHEN COALESCE(n.matched_customers_by_name, 0) >= 20 THEN 'safe_name_match_candidate'
+    WHEN COALESCE(n.matched_customers_by_name, 0) > 0 THEN 'limited_name_match_candidate'
+    WHEN l.source_code_has_letters THEN 'readable_code_candidate'
+    WHEN COALESCE(cc.customer_class_overlap_customers, 0) > 0 THEN 'customer_class_overlap_candidate'
+    ELSE 'needs_manual_lookup'
+  END                                               AS review_signal
+FROM price_class_code_universe AS u
+LEFT JOIN approved_codebook AS a
+  USING (source_code)
+LEFT JOIN candidate_labels AS l
+  USING (source_code)
+LEFT JOIN name_match_signals AS n
+  USING (source_code)
+LEFT JOIN customer_class_overlap AS cc
+  USING (source_code)
+WHERE a.source_code IS NULL
+ORDER BY
+  CASE
+    WHEN COALESCE(n.matched_customers_by_name, 0) >= 20 THEN 1
+    WHEN COALESCE(n.matched_customers_by_name, 0) > 0 THEN 2
+    WHEN l.source_code_has_letters THEN 3
+    WHEN COALESCE(cc.customer_class_overlap_customers, 0) > 0 THEN 4
+    ELSE 5
+  END,
+  matched_customers_by_name DESC,
+  distinct_items DESC,
+  SAFE_CAST(source_code AS INT64),
+  source_code

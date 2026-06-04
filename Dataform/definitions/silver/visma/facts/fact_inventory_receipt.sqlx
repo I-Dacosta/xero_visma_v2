@@ -1,0 +1,11 @@
+config {
+  type: "view",
+  schema: "dw_1_silver_visma",
+  name: "fact_inventory_receipt",
+  description: "Inventory receipt headers filtered from the unified inventory movement fact.",
+  tags: ["silver", "visma", "fact", "inventory", "receipt"]
+}
+
+SELECT *
+FROM ${ref("dw_1_silver_visma", "fact_inventory_movement")}
+WHERE movement_type = 'RECEIPT'

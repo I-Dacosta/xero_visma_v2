@@ -1,0 +1,205 @@
+
+
+WITH finance_base AS (
+  SELECT
+    f.*,
+    COALESCE(f.debit_amount_currency, 0) - COALESCE(f.credit_amount_currency, 0)
+                                                    AS amount_local_currency,
+    -- amount_nok now respects each tenant's functional (base) currency.
+    --
+    -- Visma's `debit_amount` / `credit_amount` are denominated in the
+    -- TENANT'S base currency (Visma `baseCurrency`, surfaced as
+    -- `base_currency` on the gold fact), NOT NOK universally:
+    --   * NOK-functional tenants (AQ AS, Group, Sense, Consult, …) —
+    --     debit_amount IS in NOK; trust it as-is. This matches Visma's
+    --     Trial Balance, including agio/disagio postings on 8060/8160
+    --     where the currency-side amounts are 0 but Visma populates the
+    --     NOK gain/loss directly.
+    --   * Non-NOK functional tenants (AQ AB → SEK, AQ Aps + Food
+    --     Automation ApS → DKK) — debit_amount is in the local books
+    --     currency; we MUST FX-convert it via
+    --     `base_currency_market_rate_to_nok`. Skipping this is the v1
+    --     bug fixed here: AQ AB SEK postings were summed as NOK,
+    --     under-stating consolidated NOK reporting by ~5-9 % during
+    --     2026.
+    --
+    -- Fallback chain when both Visma NOK fields are zero/NULL:
+    --   * currency-side × transaction-currency market rate (FX of the
+    --     posting currency, not the base currency)
+    --   * raw local-currency delta (last resort for NOK rows where the
+    --     rate is missing)
+    COALESCE(
+      CASE
+        WHEN COALESCE(f.base_currency, 'NOK') = 'NOK'
+         AND (COALESCE(f.debit_amount, 0) <> 0 OR COALESCE(f.credit_amount, 0) <> 0)
+          THEN COALESCE(f.debit_amount, 0) - COALESCE(f.credit_amount, 0)
+        WHEN COALESCE(f.base_currency, 'NOK') <> 'NOK'
+         AND (COALESCE(f.debit_amount, 0) <> 0 OR COALESCE(f.credit_amount, 0) <> 0)
+          THEN SAFE_MULTIPLY(
+                 COALESCE(f.debit_amount, 0) - COALESCE(f.credit_amount, 0),
+                 f.base_currency_market_rate_to_nok
+               )
+      END,
+      SAFE_MULTIPLY(
+        COALESCE(f.debit_amount_currency, 0) - COALESCE(f.credit_amount_currency, 0),
+        f.market_exchange_rate_to_nok
+      ),
+      COALESCE(f.debit_amount_currency, 0) - COALESCE(f.credit_amount_currency, 0)
+    )                                               AS amount_nok
+  FROM `prj-dw-dev.dw_1_gold_finance.fact_general_ledger` AS f
+),
+finance_enriched AS (
+  SELECT
+    f.*,
+    d.year,
+    d.quarter,
+    d.month,
+    d.day_of_month                                  AS day,
+    e.entity_key,
+    c.entity_code                                   AS company_entity_code,
+    c.group_name                                    AS company_group_name,
+    e.entity_name,
+    e.group_name                                    AS entity_group_name,
+    bu.business_unit_key                            AS dim_business_unit_key,
+    bu.business_unit_code,
+    bu.business_unit_name                           AS dim_business_unit_name,
+    bu.group_name                                   AS bu_group_name,
+    a.account_description,
+    a.fsli_1,
+    a.fsli_2,
+    a.fsli_3,
+    s.segment1                                      AS ic_code_raw,
+    s.segment1_value_description                    AS ic_name,
+    s.segment3                                      AS department_code_raw,
+    s.segment3_value_description                    AS department_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY f.tenant_id, f.batch_number, f.ref_number, f.line_number
+      ORDER BY
+        CASE WHEN s.subaccount_number = f.subaccount_id THEN 0 ELSE 1 END,
+        s.last_modified_at DESC,
+        s.subaccount_id
+    )                                               AS subaccount_match_rank
+  FROM finance_base AS f
+  LEFT JOIN `prj-dw-dev.dw_1_gold_common.dim_date` AS d
+    ON d.date_key = f.date_key
+  LEFT JOIN `prj-dw-dev.dw_1_gold_common.dim_company` AS c
+    ON c.company_key = f.company_key
+  LEFT JOIN `prj-dw-dev.dw_1_gold_common.dim_entity` AS e
+    ON e.entity_code = c.entity_code
+  LEFT JOIN `prj-dw-dev.dw_1_gold_common.dim_business_unit` AS bu
+    ON bu.tenant_id = f.tenant_id
+   AND bu.business_unit_id = f.business_unit_id
+  LEFT JOIN `prj-dw-dev.dw_1_gold_finance.dim_account` AS a
+    ON a.account_key = f.account_key
+  LEFT JOIN `prj-dw-dev.dw_1_gold_common.dim_subaccount` AS s
+    ON s.tenant_id = f.tenant_id
+   AND (
+     s.subaccount_id = f.subaccount_id
+     OR s.subaccount_number = f.subaccount_id
+   )
+)
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(tenant_id AS STRING), '|',
+    CAST(batch_number AS STRING), '|',
+    CAST(ref_number AS STRING), '|',
+    CAST(line_number AS STRING)
+  ))                                                AS finance_row_key,
+  date_key,
+  transaction_date                                  AS date,
+  year,
+  quarter,
+  month,
+  day,
+  -- Fiscal-period assignment from Visma (YYYYMM). Use this for reconciliation
+  -- against Visma's generalLedgerBalance / TB reports — they bucket by
+  -- financial_period, not by tranDate. Cross-period accruals (e.g. an asset
+  -- sale with tranDate=2026-04-20 but period=202603) reconcile to zero only
+  -- when grouped by financial_period.
+  financial_period,
+  SAFE_CAST(SUBSTR(financial_period, 1, 4) AS INT64) AS financial_year,
+  SAFE_CAST(SUBSTR(financial_period, 5, 2) AS INT64) AS financial_month,
+  entity_key,
+  company_key,
+  currency_key,
+  dim_business_unit_key                            AS business_unit_key,
+  tenant_id,
+  company_entity_code                               AS entity_code,
+  entity_name,
+  COALESCE(
+    CONCAT(company_entity_code, ' - ', entity_name),
+    company_entity_code,
+    entity_name
+  )                                                 AS entity,
+  business_unit_id,
+  business_unit_code,
+  dim_business_unit_name                            AS business_unit_name,
+  COALESCE(
+    CONCAT(business_unit_code, ' - ', dim_business_unit_name),
+    dim_business_unit_name,
+    business_unit_code
+  )                                                 AS bu,
+  COALESCE(company_group_name, bu_group_name, entity_group_name) AS group_name,
+  account_key,
+  account_cd,
+  account_description,
+  COALESCE(
+    CONCAT(account_cd, ' - ', account_description),
+    account_cd,
+    account_description
+  )                                                 AS accounts,
+  fsli_1,
+  fsli_2,
+  fsli_3,
+  amount_local_currency,
+  currency_id                                       AS local_currency_id,
+  amount_nok,
+  CAST(NULL AS STRING)                              AS customer,
+  CAST(NULL AS STRING)                              AS supplier,
+  department_code_raw                               AS department_code_id,
+  department_name,
+  COALESCE(
+    CONCAT(department_code_raw, ' - ', department_name),
+    department_code_raw,
+    department_name
+  )                                                 AS department_code,
+  -- FK to dw_1_gold_common.dim_department for efficient BI joins.
+  -- Calculated the same way as silver fact_general_ledger.department_key:
+  --   FARM_FINGERPRINT(tenant_id | department_code_id)
+  -- Note: dim_department now includes "Uspesifisert" sentinel rows for
+  -- Visma's no-department placeholder (segment3 = '000' / '0000' / '0'),
+  -- so this key resolves to a real dim row for all GL rows.
+  CASE
+    WHEN department_code_raw IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(tenant_id AS STRING), '|',
+      CAST(department_code_raw AS STRING)
+    ))
+  END                                               AS department_key,
+  ic_code_raw                                       AS ic_code_id,
+  ic_name,
+  COALESCE(
+    CONCAT(ic_code_raw, ' - ', ic_name),
+    ic_code_raw,
+    ic_name
+  )                                                 AS ic,
+  -- Bug C (tracked separately): upstream fact_general_ledger does not carry a
+  -- project dimension. Stubbed to NULL until project_id is added to silver/gold.
+  CAST(NULL AS STRING)                              AS project,
+  batch_number,
+  ref_number,
+  line_number,
+  module,
+  ledger,
+  description,
+  subaccount_id,
+  branch_id,
+  market_exchange_rate_to_nok,
+  has_market_rate_to_nok,
+  is_market_rate_filled_forward,
+  source_system
+FROM finance_enriched
+WHERE subaccount_match_rank = 1
+
+
+LIMIT 10

@@ -1,0 +1,7 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_currencies",
+  description: "Bronze: Currency reference data from Visma Global API."
+}
+

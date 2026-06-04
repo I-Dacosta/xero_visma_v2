@@ -1,0 +1,79 @@
+Relationship Name,From Table,From Column,To Table,To Column,Is Active,Type,Cross Filtering
+016b91e0-b50d-0933-b6c4-c2ad6df7c5b8,dimSalesOrder,Date,dimDate,Date,TRUE,1,1
+04f0236c-023f-4906-8d12-b31f931ad062,fctSupplierInvoiceLineExt,FK SupplierInvoice,dimSupplierInvoice,PK SupplierInvoice,TRUE,1,1
+05a0012e-934f-ba24-e106-bf772bb7d66f,fctSalesOrderLineExt,FK InventoryNumber,dimInventory,PK InventoryNumber,TRUE,1,1
+05da8e38-b486-d2a6-c1e9-44655305db38,dimShipment,Shipment,dimDate,Date,FALSE,1,1
+0a0cd145-e9d6-42fc-a688-cc851abf4682,dimSupplierInvoice,Date,dimDate,Date,TRUE,1,1
+0f3e6b1e-8878-4bdf-89a4-89c1c17eb767,fctCustomerInvoiceLineExt,FKSegment1ID,dimSegment 1,PK Segment 1 (CD),TRUE,1,1
+0f9b54bd-be3d-90f5-6b4a-ebf128ffac57,dimSalesPerson_Customers,FK SalespersonID,dimSalesPerson,PK salespersonID,TRUE,1,1
+0f9dfcb9-266e-4b72-a422-f1ed1d3c4357,dimSupplierInvoice_Attachment,PK SupplierInvoiceAttachment,dimSupplierInvoice,PK SupplierInvoice,TRUE,1,2
+126d1132-d652-cb8c-da54-d6e52a26f3d4,fctShipmentDetailLines,FK ShipmentNumber,dimShipment,PK shipmentNumber,TRUE,1,1
+134fcef5-eb36-4b4b-ae7b-e05bb56d05f2,fctCustomerInvoiceLineExt,FKSegment8ID,dimSegment 8,PK Segment 8 (CD),TRUE,1,1
+144472be-8741-361c-7cbc-b35dd27c4f30,dimCustomerCreditNote,FK SalespersonID,SalesPersonCustomerInvoice,PK SalespersonID_CustomerInvoice,FALSE,1,1
+1860abc1-c18e-2abb-d4fd-cab641272ffa,dimSupplier,FK Address,dimAddress,PK Address (ID),FALSE,1,1
+1a1c64d0-9dfe-1922-6674-bd4baf05359d,fctSalesOrderLineExt,FKSegment3ID,dimSegment 3,PK Segment 3 (CD),TRUE,1,1
+1b153c5e-7630-9de2-07ca-138c369e4370,dimPurchaseOrder,Date,dimDate,Date,TRUE,1,1
+1b7c9886-5911-aef9-f410-c208685be9a4,dimCustomerCreditNote,FK Customer,dimCustomer,PK Customer (CD),TRUE,1,1
+1ba4d804-d7e8-c81c-5761-3989ce06f1b5,dimCustomer,FK Delivery Address,dimAddress,PK Address (ID),FALSE,1,1
+23842680-2c0a-b513-a2cc-52bb213643c3,dimCustomer,FK BranchID,dimBranch,PK Branch (ID),TRUE,1,1
+25a323d5-666e-6f09-cbbe-49b0df791275,fctShipmentDetailLines,FK OrderLineNumber,fctSalesOrderLineExt,PK SalesOrderLine,TRUE,1,1
+29095f7c-60b1-9a72-a8f5-a263e1411343,fctCustomerInvoiceLineExt,FK Inventory (CD),dimInventory,PK InventoryNumber,TRUE,1,1
+2acd39c5-8e7e-fb74-c3ff-fd99fa6db976,fctSalesOrderLineExt,FKSegment8ID,dimSegment 8,PK Segment 8 (CD),TRUE,1,1
+2b081500-f0be-ff9e-5e7b-383515e06101,dimCustomer,FK Customer (ID),dimSalesPerson_Customers,FK Customer InternalID,TRUE,1,1
+2fb0b290-b399-d260-8cfa-601c3e26d6e9,fctPurchaseOrderLineExt,FK PurchaseOrder,dimPurchaseOrder,PK PurchaseOrder,TRUE,1,1
+35208d17-2ab2-47d4-8575-9e68b70b8637,fctCustomerInvoiceLineExt,FKSegment5ID,dimSegment 5,PK Segment 5 (CD),TRUE,1,1
+3fa69a5a-2871-467e-d6ab-fc4a82777ff7,dimSupplier,FK BranchID,dimBranch,PK Branch (ID),TRUE,1,1
+4331ef18-0651-470e-ad98-af6fbe5f012a,fctSupplierInvoiceLineExt,FKSegment2ID,dimSegment 2,PK Segment 2 (CD),TRUE,1,1
+48b4ffef-64c2-df1c-eb00-b48d393f871d,dimWarehouseDetail,FK WarehouseID,dimWarehouse,PK warehouseID,TRUE,1,1
+4c37d3f3-c85e-415a-b7a1-2cd2fa163ad2,fctCustomerInvoiceLineExt,FKSegment9ID,dimSegment 9,PK Segment 9 (CD),TRUE,1,1
+56684f26-083e-d42d-05e0-a11046fea152,dimSupplierInvoice,DueDate,dimDate,Date,FALSE,1,1
+5e5e39a4-b0a2-4fea-ac15-e506d0e99da0,fctCustomerInvoiceLineExt,FKSegment7ID,dimSegment 7,PK Segment 7 (CD),TRUE,1,1
+61b71576-2058-4b64-969d-2ba3c22781bc,dimCompany,PK Company (ID),dimBranch,CompanyID,TRUE,1,2
+65b176e5-31a8-4889-b696-18509a8856b0,fctCustomerInvoiceLineExt,FKSegment2ID,dimSegment 2,PK Segment 2 (CD),TRUE,1,1
+689827f8-1c28-40df-b29c-77fcf107c93a,fctCustomerInvoiceLineExt,FKSegment10ID,dimSegment 10,PK Segment 10 (CD),TRUE,1,1
+6a652ce2-360d-cca6-93b5-55a73072d402,fctSalesOrderLineExt,FKSegment6ID,dimSegment 6,PK Segment 6 (CD),TRUE,1,1
+6bff5b2b-7389-4de1-b5a6-0719321d3414,fctSupplierInvoiceLineExt,FKSegment4ID,dimSegment 4,PK Segment 4 (CD),TRUE,1,1
+6cee4613-6ff3-45d2-ab76-e6a280a4083c,dimCustomerInvoice,DocumentDate,dimDate,Date,TRUE,1,1
+73993ee1-ed93-494b-88f5-f985facbd6bd,dimCustomerInvoice,FK Customer (CD),dimCustomer,PK Customer (CD),TRUE,1,1
+748e4113-90c4-94ed-1822-e47f6aaf01ac,fctCustomerInvoiceLineExt,FK SalesOrder,dimSalesOrder,PK SalesOrder,FALSE,1,1
+74c0a81d-fa4c-4481-ce5c-fb4f286a7fd9,dimInventory,InventoryNumber,Gebyr_chem,Produktnummer,TRUE,1,1
+788f8f79-69b3-e3b0-97f9-b925f2f01a88,fctSalesOrderLineExt,FKSegment4ID,dimSegment 4,PK Segment 4 (CD),TRUE,1,1
+78992101-140d-ea0b-0f59-1a50a461f4e8,fctSalesOrderLineExt,FKSegment10ID,dimSegment 10,PK Segment 10 (CD),TRUE,1,1
+7d7ce5f0-6a38-66ae-d251-6b78dc3338ce,fctSalesOrderLineExt,FKSegment9ID,dimSegment 9,PK Segment 9 (CD),TRUE,1,1
+7e0bb4e9-7650-b654-eb4a-55abafd5ea91,fctShipmentOrderLines,FK ShipmentNumber,dimShipment,PK shipmentNumber,TRUE,1,1
+8052d01a-7977-69b0-52df-19b4b535c526,fctSalesOrderLineExt,FK SalespersonID,dimSalesPerson,PK salespersonID,FALSE,1,1
+858a2c19-3cfb-f2fa-c737-e4391d34f5d9,fctSalesOrderLineExt,FKSegment7ID,dimSegment 7,PK Segment 7 (CD),TRUE,1,1
+864fe8d2-1a6e-25d9-c76c-41e119ffbb5c,fctCustomerInvoiceLineExt,FK Salesperson (CD),dimSalesPerson,PK salespersonID,FALSE,1,1
+8cbaacb7-9d9c-c03d-58fe-e8877cf9db42,dimAddress,FK Country,dimCountry,PK Country,TRUE,1,1
+8ee659f4-dd6b-5676-afc8-ac182a11d600,SalesPersonCustomerInvoice,FK SalespersonID,dimSalesPerson,PK salespersonID,TRUE,1,1
+8f09ac68-c004-444f-94ec-53e3fd0089cc,fctSupplierInvoiceLineExt,FKSegment9ID,dimSegment 9,PK Segment 9 (CD),TRUE,1,1
+93bee6c6-e1ca-238f-8285-d4861d9b4623,dimCustomer,Custom Priceclass,dimPriceClass,PG_FK,TRUE,1,2
+a2ef987f-6777-1d62-d24c-208501763ea6,dimCustomerInvoice,DocumentDueDate,dimDate,Date,FALSE,1,1
+a5279b88-99b7-72f8-d392-d5c15d11ec0b,fctSalesOrderLineExt,FKSegment2ID,dimSegment 2,PK Segment 2 (CD),TRUE,1,1
+a918b1e3-0a11-4ac4-8ec2-1c1a33b02c8d,fctCustomerInvoiceLineExt,FKSegment6ID,dimSegment 6,PK Segment 6 (CD),TRUE,1,1
+ab265ab6-f261-449c-a707-6208cc92d5a0,fctSupplierInvoiceLineExt,FKSegment8ID,dimSegment 8,PK Segment 8 (CD),TRUE,1,1
+ab8c1289-ca24-4780-b4ba-3e6c3a1009ca,fctSupplierInvoiceLineExt,FKSegment5ID,dimSegment 5,PK Segment 5 (CD),TRUE,1,1
+af94244f-bd9d-4f12-b252-2f0b80f6b60f,fctCustomerInvoiceLineExt,FKSegment4ID,dimSegment 4,PK Segment 4 (CD),TRUE,1,1
+b22f7838-6c03-491c-ed5b-aa48c75bab81,fctSalesOrderLineExt,FK SalesOrder,dimSalesOrder,PK SalesOrder,TRUE,1,1
+b99f0022-c285-0cf0-bc8a-44f31566d154,dimCustomerInvoice,FK Salesperson (ID),SalesPersonCustomerInvoice,PK SalespersonID_CustomerInvoice,FALSE,1,1
+bd845d80-54ec-afa7-e302-78b2976c6a1f,dimSalesOrder,FK CustomerNumber,dimCustomer,PK Customer (CD),TRUE,1,1
+bdf9cce1-8bb6-6700-6284-926682ed9760,fctPurchaseOrderLineExt,Promised,dimDate,Date,FALSE,1,1
+c0dd56d4-cb0f-6f82-fd83-28eb3c4dc1a9,dimWarehouseDetail,FK InventoryNumber,dimInventory,PK InventoryNumber,TRUE,1,1
+c139f855-ab89-9c3c-522c-0f4b13d83128,dimCustomerCreditNote,DocumentDate,dimDate,Date,TRUE,1,1
+ca075245-f86f-c04c-d132-f2dc54a241b1,fctShipmentOrderLines,FK OrderNumber,dimSalesOrder,PK SalesOrder,TRUE,1,1
+d0f4cfe7-a39d-1dd4-bb11-777679f26c90,fctSalesOrderLineExt,FKSegment1ID,dimSegment 1,PK Segment 1 (CD),TRUE,1,1
+d1cad190-f84a-2aea-72e6-73cdeb875a40,dimSegments,FK BranchID,dimBranch,PK Branch (ID),TRUE,1,1
+d467c903-92b1-19c0-a58c-f793af340010,dimPurchaseOrder,promisedOn,dimDate,Date,FALSE,1,1
+d52316d3-3de3-4ecc-8e90-3082af798f78,fctSupplierInvoiceLineExt,FKSegment3ID,dimSegment 3,PK Segment 3 (CD),TRUE,1,1
+dd18743d-eaa7-e06f-01c3-827aa9836449,dimSalesOrder,FK AddressId,dimAddress,PK Address (ID),TRUE,1,1
+dde5f2cc-217d-d23a-2ef9-6c995d712c5a,dimPurchaseOrder,FK Supplier,dimSupplier,PK Supplier (CD),TRUE,1,1
+e0757004-96ad-432a-af89-88e72fc223ba,fctSupplierInvoiceLineExt,FKSegment1ID,dimSegment 1,PK Segment 1 (CD),TRUE,1,1
+e293a34e-c6e7-41e5-815c-6159a5e05215,dimSupplierInvoice,FK Supplier (CD),dimSupplier,PK Supplier (CD),TRUE,1,1
+e74cc91c-8656-4bf9-b031-04411520e19a,fctSupplierInvoiceLineExt,FKSegment10ID,dimSegment 10,PK Segment 10 (CD),TRUE,1,1
+ea061146-a00d-4d78-baa9-9175ee02266f,fctSupplierInvoiceLineExt,FKSegment7ID,dimSegment 7,PK Segment 7 (CD),TRUE,1,1
+ea88adfd-4a12-437c-b2c7-bdc0f39d0ef4,fctCustomerInvoiceLineExt,FK CustomerInvoice,dimCustomerInvoice,PK CustomerInvoice,TRUE,1,1
+edfa81c8-9b99-928c-6c03-458d189d9b4c,fctSalesOrderLineExt,FKSegment5ID,dimSegment 5,PK Segment 5 (CD),TRUE,1,1
+f1016a7c-fe72-4f64-9f44-409017449d72,fctSupplierInvoiceLineExt,FKSegment6ID,dimSegment 6,PK Segment 6 (CD),TRUE,1,1
+f3a92fe4-4222-4bf3-8cee-8b0e394b4bba,dimCustomerInvoice_Attachment,PK CustomerInvoiceAttachment,dimCustomerInvoice,PK CustomerInvoice,TRUE,1,2
+f5fe61e8-3357-45ef-8fb9-e2ce0f3cb144,fctCustomerInvoiceLineExt,FKSegment3ID,dimSegment 3,PK Segment 3 (CD),TRUE,1,1
+ff5fc6eb-52f9-0619-5590-d42890c5d04d,fctPurchaseOrderLineExt,FK InventoryNumber,dimInventory,PK InventoryNumber,TRUE,1,1

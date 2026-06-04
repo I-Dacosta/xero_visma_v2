@@ -1,0 +1,40 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "global_account_mapping",
+  description: "Resolved NO/SE/DK breakpoint-based account mapping. Accounts between two breakpoints inherit the previous breakpoint within the same account-length bucket. The final breakpoint remains exact-only.",
+  tags: ["silver", "excel", "finance", "reference"],
+  assertions: {
+    nonNull: ["mapping_scope", "local_account_digits", "range_start_account_code", "range_end_account_code", "mapped_account_code_3"],
+    uniqueKey: ["mapping_scope", "local_account_digits", "range_start_account_code"]
+  }
+}
+
+WITH normalized AS (
+  SELECT
+    mapping_scope,
+    local_account_digits,
+    range_start_account_code,
+    mapped_account_code_3,
+    mapped_account_description,
+    LEAD(range_start_account_code) OVER (
+      PARTITION BY mapping_scope, local_account_digits
+      ORDER BY range_start_account_code
+    )                                               AS next_range_start_account_code
+  FROM ${ref("dw_1_silver_excel", "seed_global_account_range_mapping")}
+)
+
+SELECT
+  mapping_scope,
+  local_account_digits,
+  range_start_account_code,
+  CASE
+    WHEN next_range_start_account_code IS NULL AND local_account_digits = 4 THEN 9999
+    WHEN next_range_start_account_code IS NULL AND local_account_digits = 5 THEN 99999
+    WHEN next_range_start_account_code IS NULL THEN range_start_account_code
+    ELSE next_range_start_account_code - 1
+  END                                               AS range_end_account_code,
+  mapped_account_code_3,
+  mapped_account_description,
+  next_range_start_account_code IS NOT NULL         AS supports_previous_account_fallback
+FROM normalized

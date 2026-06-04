@@ -1,0 +1,220 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "bridge_customer_price_class",
+  description: "Customer to price-class bridge for sales-order-active customers. Direct order-location classes are preserved, and a single inferred class is added only when order locations have no class and the sales-price signature is unique.",
+  tags: ["gold", "common", "customer", "price-class", "bridge"]
+}
+
+WITH tenant_price_class_codebook AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    id                                                     AS price_class_id,
+    description                                            AS price_class_description
+  FROM ${ref("dw_1_bronze_visma", "visma_price_classes")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, id
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_customer_locations AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    locationId                                             AS location_id,
+    priceClassId                                           AS price_class_id
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_locations")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, customerId, locationId
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_sales_orders AS (
+  SELECT *
+  FROM ${ref("dw_1_bronze_visma", "visma_sales_orders_v3")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND customerId IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, COALESCE(orderNo, orderId), COALESCE(orderType, type)
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+sales_order_customer_activity AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    COUNT(*)                                               AS sales_order_count,
+    MAX(DATE(SAFE_CAST(date AS TIMESTAMP)))                AS last_sales_order_date
+  FROM latest_sales_orders
+  GROUP BY 1, 2
+),
+
+sales_order_customer_order_locations AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    location                                               AS order_location_id,
+    COUNT(*)                                               AS sales_order_count_at_location
+  FROM latest_sales_orders
+  WHERE location IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+
+direct_price_class_rows AS (
+  SELECT
+    so.tenant_id,
+    so.customer_id,
+    so.order_location_id                                   AS location_id,
+    loc.price_class_id,
+    so.sales_order_count_at_location                       AS evidence_count,
+    'sales_order_order_location_price_class'               AS evidence_method
+  FROM sales_order_customer_order_locations AS so
+  JOIN latest_customer_locations AS loc
+    ON loc.tenant_id = so.tenant_id
+   AND loc.customer_id = so.customer_id
+   AND loc.location_id = so.order_location_id
+  WHERE loc.price_class_id IS NOT NULL
+),
+
+sales_order_class_prices AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    priceCode                                              AS price_class_id,
+    inventoryId                                            AS inventory_id,
+    SAFE_CAST(price AS NUMERIC)                            AS price_amount,
+    SAFE_CAST(effectiveDate AS TIMESTAMP)                  AS effective_at,
+    SAFE_CAST(expirationDate AS TIMESTAMP)                 AS expires_at
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND priceType = 'CustomerPriceClass'
+    AND priceCode IS NOT NULL
+    AND inventoryId IS NOT NULL
+    AND SAFE_CAST(price AS NUMERIC) > 0
+    AND COALESCE(breakQty, 0) = 0
+    AND COALESCE(promotion, FALSE) = FALSE
+),
+
+clean_sales_order_lines AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    location                                               AS order_location_id,
+    orderNo                                                AS order_no,
+    SAFE_CAST(date AS TIMESTAMP)                           AS order_ts,
+    JSON_VALUE(line, '$.inventory.id')                     AS inventory_id,
+    SAFE_CAST(JSON_VALUE(line, '$.unitPrice') AS NUMERIC)  AS unit_price
+  FROM latest_sales_orders,
+  UNNEST(JSON_QUERY_ARRAY(lines, '$')) AS line
+  WHERE JSON_VALUE(line, '$.inventory.id') IS NOT NULL
+    AND SAFE_CAST(JSON_VALUE(line, '$.unitPrice') AS NUMERIC) > 0
+    AND COALESCE(JSON_VALUE(line, '$.hasManualPrice'), 'false') = 'false'
+    AND COALESCE(JSON_VALUE(line, '$.hasManualDiscount'), 'false') = 'false'
+    AND COALESCE(SAFE_CAST(JSON_VALUE(line, '$.discountPercent') AS NUMERIC), 0) = 0
+),
+
+inferred_price_class_matches AS (
+  SELECT
+    l.tenant_id,
+    l.customer_id,
+    p.price_class_id,
+    COUNT(*)                                               AS evidence_count
+  FROM clean_sales_order_lines AS l
+  JOIN sales_order_class_prices AS p
+    ON p.tenant_id = l.tenant_id
+   AND p.inventory_id = l.inventory_id
+   AND p.price_amount = l.unit_price
+   AND (p.effective_at IS NULL OR p.effective_at <= l.order_ts)
+   AND (p.expires_at IS NULL OR l.order_ts <= p.expires_at)
+  GROUP BY 1, 2, 3
+),
+
+inferred_customer_resolution AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    COUNT(DISTINCT price_class_id)                         AS distinct_price_class_count
+  FROM inferred_price_class_matches
+  GROUP BY 1, 2
+),
+
+inferred_single_rows AS (
+  SELECT
+    m.tenant_id,
+    m.customer_id,
+    CAST(NULL AS STRING)                                   AS location_id,
+    m.price_class_id,
+    m.evidence_count,
+    'sales_order_price_signature_inferred'                 AS evidence_method
+  FROM inferred_price_class_matches AS m
+  JOIN inferred_customer_resolution AS r
+    ON r.tenant_id = m.tenant_id
+   AND r.customer_id = m.customer_id
+   AND r.distinct_price_class_count = 1
+  LEFT JOIN direct_price_class_rows AS direct
+    ON direct.tenant_id = m.tenant_id
+   AND direct.customer_id = m.customer_id
+  WHERE direct.customer_id IS NULL
+),
+
+all_bridge_rows AS (
+  SELECT * FROM direct_price_class_rows
+  UNION ALL
+  SELECT * FROM inferred_single_rows
+),
+
+customer_price_class_counts AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    COUNT(DISTINCT price_class_id)                         AS distinct_price_class_count
+  FROM all_bridge_rows
+  GROUP BY 1, 2
+)
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(a.tenant_id AS STRING), '|',
+    CAST(a.customer_id AS STRING)
+  ))                                                       AS customer_key,
+  a.tenant_id,
+  a.customer_id,
+  a.price_class_id,
+  codebook.price_class_description                         AS price_class_description,
+  activity.sales_order_count,
+  activity.last_sales_order_date,
+  COUNT(DISTINCT a.location_id)                            AS location_count_for_price_class,
+  STRING_AGG(
+    DISTINCT a.location_id,
+    ' | '
+    ORDER BY a.location_id
+    LIMIT 10
+  )                                                        AS sample_location_ids,
+  counts.distinct_price_class_count,
+  counts.distinct_price_class_count > 1                    AS customer_has_multiple_price_classes,
+  a.evidence_method                                        AS source_field,
+  'visma'                                                  AS source_system
+FROM all_bridge_rows AS a
+LEFT JOIN tenant_price_class_codebook AS codebook
+  ON codebook.tenant_id = a.tenant_id
+ AND codebook.price_class_id = a.price_class_id
+LEFT JOIN customer_price_class_counts AS counts
+  ON counts.tenant_id = a.tenant_id
+ AND counts.customer_id = a.customer_id
+LEFT JOIN sales_order_customer_activity AS activity
+  ON activity.tenant_id = a.tenant_id
+ AND activity.customer_id = a.customer_id
+GROUP BY
+  customer_key,
+  a.tenant_id,
+  a.customer_id,
+  a.price_class_id,
+  codebook.price_class_description,
+  activity.sales_order_count,
+  activity.last_sales_order_date,
+  counts.distinct_price_class_count,
+  a.evidence_method

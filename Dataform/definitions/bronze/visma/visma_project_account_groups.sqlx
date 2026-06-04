@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_project_account_groups",
+  description: "Bronze: Project-to-GL account group mappings from Visma Global API."
+}

@@ -1,0 +1,41 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "dim_supplier",
+  description: "Supplier master data dimension for finance.",
+  tags: ["gold", "finance", "dimension"]
+}
+
+-- =============================================================================
+-- dim_supplier.sqlx
+-- Gold finance dimension: Supplier master data
+-- Source: dw_1_silver_visma.dim_supplier
+-- Grain: one row per tenant + business_unit + supplier
+-- =============================================================================
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(business_unit_id AS STRING), '|',
+        CAST(supplier_id AS STRING)
+    ))                                              AS supplier_key,
+
+    -- Natural keys
+    tenant_id,
+    business_unit_id,
+    supplier_id,
+
+    -- Attributes
+    supplier_name,
+    status,
+    supplier_class,
+    currency_id,
+    credit_terms,
+    vat_zone,
+    vat_registration_id,
+    corporate_id,
+    last_modified_at,
+
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_supplier")}

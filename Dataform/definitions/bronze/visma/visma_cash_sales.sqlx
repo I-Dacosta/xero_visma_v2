@@ -1,0 +1,8 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_cash_sales",
+  description: "Bronze: Cash sale transaction documents from Visma Global API."
+}
+
+//schema

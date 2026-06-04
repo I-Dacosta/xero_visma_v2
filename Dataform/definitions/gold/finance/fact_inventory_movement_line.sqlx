@@ -1,0 +1,117 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_inventory_movement_line",
+  description: "Inventory movement line fact table with surrogate key FKs, covering adjustments, issues, receipts, and transfers.",
+  tags: ["gold", "finance", "fact"]
+}
+
+-- =============================================================================
+-- fact_inventory_movement_line.sqlx
+-- Gold finance fact: Inventory movement lines
+-- Source: dw_1_silver_visma.fact_inventory_movement_line
+-- Grain: one row per movement line
+-- =============================================================================
+
+WITH fact_source AS (
+    SELECT *
+    FROM ${ref("dw_1_silver_visma", "fact_inventory_movement_line")}
+),
+warehouse_strict AS (
+    SELECT
+        tenant_id,
+        business_unit_id,
+        warehouse_id,
+        ANY_VALUE(warehouse_key) AS warehouse_key
+    FROM ${ref("dw_1_gold_common", "dim_warehouse")}
+    GROUP BY 1,2,3
+),
+location_strict AS (
+    SELECT
+        tenant_id,
+        business_unit_id,
+        location_id,
+        ANY_VALUE(location_key) AS location_key
+    FROM ${ref("dw_1_gold_common", "dim_location")}
+    GROUP BY 1,2,3
+),
+location_fallback AS (
+    SELECT
+        tenant_id,
+        location_id,
+        ANY_VALUE(location_tenant_key) AS location_tenant_key
+    FROM ${ref("dw_1_gold_common", "dim_location")}
+    GROUP BY 1,2
+)
+
+SELECT
+    -- Surrogate FKs (conformed dimensions from gold_common)
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))   AS company_key,
+
+    -- Surrogate FK (finance dimension)
+    CASE
+      WHEN f.inventory_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.inventory_id AS STRING)
+      ))
+    END                                             AS item_key,
+
+    ws.warehouse_key                                AS source_warehouse_key,
+    wd.warehouse_key                                AS destination_warehouse_key,
+
+    -- Degenerate dimensions (line-level identifiers and header linkage)
+    f.tenant_id,
+    f.business_unit_id,
+    f.business_unit_name,
+    f.movement_type,
+    f.reference_number,
+    f.line_number,
+    f.inventory_id,
+    f.inventory_description,
+    f.warehouse_id                                  AS warehouse,
+    f.destination_warehouse_id                      AS to_warehouse,
+    COALESCE(ls.location_key, lf.location_tenant_key) AS location_key,
+    f.location_id                                   AS location,
+    COALESCE(lts.location_key, ltf.location_tenant_key)
+                                                    AS to_location_key,
+    f.to_location_id                                AS to_location,
+    f.location_name,
+    f.to_location_name,
+    f.line_description,
+    f.unit_of_measure                               AS uom,
+    f.lot_serial_number,
+    f.allocations_raw,
+    f.allocation_count,
+    f.reason_code_id,
+    f.reason_code_description,
+
+    -- Measures
+    f.quantity,
+    f.unit_cost,
+    f.amount,
+
+    'visma' AS source_system
+
+FROM fact_source AS f
+LEFT JOIN warehouse_strict AS ws
+    ON f.tenant_id = ws.tenant_id
+ AND f.business_unit_id = ws.business_unit_id
+ AND f.warehouse_id = ws.warehouse_id
+LEFT JOIN warehouse_strict AS wd
+    ON f.tenant_id = wd.tenant_id
+ AND f.business_unit_id = wd.business_unit_id
+ AND f.destination_warehouse_id = wd.warehouse_id
+LEFT JOIN location_strict AS ls
+    ON f.tenant_id = ls.tenant_id
+ AND f.business_unit_id = ls.business_unit_id
+ AND f.location_id = ls.location_id
+LEFT JOIN location_fallback AS lf
+    ON f.tenant_id = lf.tenant_id
+ AND f.location_id = lf.location_id
+LEFT JOIN location_strict AS lts
+    ON f.tenant_id = lts.tenant_id
+ AND f.business_unit_id = lts.business_unit_id
+ AND f.to_location_id = lts.location_id
+LEFT JOIN location_fallback AS ltf
+    ON f.tenant_id = ltf.tenant_id
+ AND f.to_location_id = ltf.location_id

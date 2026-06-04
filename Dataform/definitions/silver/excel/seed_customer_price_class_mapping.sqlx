@@ -1,0 +1,182 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "seed_customer_price_class_mapping",
+  description: "Seed and review table for customer price class mapping. Contains approved code-to-name lookup rows from bronze lookups plus the full observed CustomerPriceClass code universe and auto-generated customerClassId candidate rows for business validation. Only approved rows marked for inclusion should flow downstream.",
+  tags: ["seed", "silver", "excel", "reference", "customer", "pricing"]
+}
+
+WITH manual_approved_codebook_rows AS (
+  SELECT *
+  FROM UNNEST([
+    STRUCT(
+      '33f319b9-4d57-11ee-960c-025417856183' AS tenant_id,
+      'Aquatiq AS' AS organization_name,
+      'customer_sales_prices.CustomerPriceClass' AS source_field,
+      '6' AS source_code,
+      'Nortura' AS candidate_lookup_name,
+      'user_validated' AS candidate_lookup_source,
+      '6' AS validated_price_class_id,
+      'Nortura' AS validated_price_class_name,
+      CAST(NULL AS STRING) AS validated_customer_group_name,
+      TRUE AS include_in_final_mapping,
+      'approved' AS mapping_status,
+      'Approved from user business validation. Confirms price code label and enables deterministic customer-name matching.' AS notes
+    ),
+    STRUCT(
+      '33f319b9-4d57-11ee-960c-025417856183' AS tenant_id,
+      'Aquatiq AS' AS organization_name,
+      'customer_sales_prices.CustomerPriceClass' AS source_field,
+      'BAMA' AS source_code,
+      'Bama' AS candidate_lookup_name,
+      'customer_sales_prices.priceCode' AS candidate_lookup_source,
+      'BAMA' AS validated_price_class_id,
+      'Bama' AS validated_price_class_name,
+      CAST(NULL AS STRING) AS validated_customer_group_name,
+      TRUE AS include_in_final_mapping,
+      'approved' AS mapping_status,
+      'Approved from bronze CustomerPriceClass code itself. Code is human-readable and matches customer names cleanly with no multi-label overlap.' AS notes
+    ),
+    STRUCT(
+      '33f319b9-4d57-11ee-960c-025417856183',
+      'Aquatiq AS',
+      'customer_sales_prices.CustomerPriceClass',
+      'COOP',
+      'Coop',
+      'customer_sales_prices.priceCode',
+      'COOP',
+      'Coop',
+      CAST(NULL AS STRING),
+      TRUE,
+      'approved',
+      'Approved from bronze CustomerPriceClass code itself. Code is human-readable and matches customer names cleanly with no multi-label overlap.'
+    )
+  ])
+),
+
+salesrestr_lookup AS (
+  SELECT
+    JSON_VALUE(item, '$.valueId')                  AS source_code,
+    STRING_AGG(
+      DISTINCT JSON_VALUE(item, '$.description'),
+      ' | '
+      ORDER BY JSON_VALUE(item, '$.description')
+    )                                              AS candidate_lookup_name,
+    'visma_attributes.SALESRESTR'                  AS candidate_lookup_source
+  FROM ${ref("dw_1_bronze_visma", "visma_attributes")},
+    UNNEST(JSON_EXTRACT_ARRAY(details)) AS item
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND attributeID = 'SALESRESTR'
+    AND JSON_VALUE(item, '$.valueId') IS NOT NULL
+  GROUP BY 1
+),
+
+salesrestr_approved_codebook_rows AS (
+  SELECT
+    '33f319b9-4d57-11ee-960c-025417856183'         AS tenant_id,
+    'Aquatiq AS'                                   AS organization_name,
+    'customer_sales_prices.CustomerPriceClass'     AS source_field,
+    source_code,
+    candidate_lookup_name,
+    candidate_lookup_source,
+    source_code                                    AS validated_price_class_id,
+    candidate_lookup_name                          AS validated_price_class_name,
+    CAST(NULL AS STRING)                           AS validated_customer_group_name,
+    TRUE                                           AS include_in_final_mapping,
+    'approved'                                     AS mapping_status,
+    'Approved codebook row from SALESRESTR. Confirms price code label only; customer assignment source is still missing.'
+                                                    AS notes
+  FROM salesrestr_lookup
+),
+
+customer_price_class_code_candidates AS (
+  SELECT
+    '33f319b9-4d57-11ee-960c-025417856183'         AS tenant_id,
+    'Aquatiq AS'                                   AS organization_name,
+    'customer_sales_prices.CustomerPriceClass'     AS source_field,
+    p.priceCode                                    AS source_code,
+    COALESCE(
+      s.candidate_lookup_name,
+      CASE
+        WHEN REGEXP_CONTAINS(p.priceCode, r'[A-Za-zÆØÅæøå]')
+          THEN CONCAT(UPPER(SUBSTR(p.priceCode, 1, 1)), LOWER(SUBSTR(p.priceCode, 2)))
+        ELSE ''
+      END
+    )                                              AS candidate_lookup_name,
+    COALESCE(
+      s.candidate_lookup_source,
+      CASE
+        WHEN REGEXP_CONTAINS(p.priceCode, r'[A-Za-zÆØÅæøå]')
+          THEN 'customer_sales_prices.priceCode'
+        ELSE ''
+      END
+    )                                              AS candidate_lookup_source,
+    CAST(NULL AS STRING)                           AS validated_price_class_id,
+    CAST(NULL AS STRING)                           AS validated_price_class_name,
+    CAST(NULL AS STRING)                           AS validated_customer_group_name,
+    FALSE                                          AS include_in_final_mapping,
+    'pending_business_review'                      AS mapping_status,
+    CONCAT(
+      'Observed CustomerPriceClass code in visma_customer_sales_prices. Distinct items=',
+      CAST(COUNT(DISTINCT p.inventoryId) AS STRING),
+      '. Sample items: ',
+      ARRAY_TO_STRING(
+        ARRAY_AGG(DISTINCT p.inventoryId IGNORE NULLS ORDER BY p.inventoryId LIMIT 5),
+        ' | '
+      )
+    )                                              AS notes
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")} AS p
+  LEFT JOIN salesrestr_lookup AS s
+    ON s.source_code = p.priceCode
+  WHERE p.priceType = 'CustomerPriceClass'
+    AND p.priceCode IS NOT NULL
+  GROUP BY 1, 2, 3, 4, 5, 6
+),
+
+customer_class_candidates AS (
+  SELECT
+    c.tenantId                                     AS tenant_id,
+    c.organizationName                             AS organization_name,
+    'customerClassId'                              AS source_field,
+    c.customerClassId                              AS source_code,
+    COALESCE(s.candidate_lookup_name, '')          AS candidate_lookup_name,
+    COALESCE(s.candidate_lookup_source, '')        AS candidate_lookup_source,
+    CAST(NULL AS STRING)                           AS validated_price_class_id,
+    CAST(NULL AS STRING)                           AS validated_price_class_name,
+    CAST(NULL AS STRING)                           AS validated_customer_group_name,
+    FALSE                                          AS include_in_final_mapping,
+    'pending_business_review'                      AS mapping_status,
+    CONCAT(
+      'Auto-generated candidate from visma_customers.customerClassId. Distinct customers=',
+      CAST(COUNT(DISTINCT c.number) AS STRING),
+      '. Sample customers: ',
+      ARRAY_TO_STRING(
+        ARRAY_AGG(DISTINCT c.name IGNORE NULLS ORDER BY c.name LIMIT 5),
+        ' | '
+      )
+    )                                              AS notes
+  FROM ${ref("dw_1_bronze_visma", "visma_customers")} AS c
+  LEFT JOIN salesrestr_lookup AS s
+    ON s.source_code = c.customerClassId
+  WHERE c.isDeleted IS DISTINCT FROM TRUE
+    AND c.customerClassId IS NOT NULL
+  GROUP BY 1, 2, 3, 4, 5, 6
+)
+
+SELECT *
+FROM manual_approved_codebook_rows
+
+UNION ALL
+
+SELECT *
+FROM salesrestr_approved_codebook_rows
+
+UNION ALL
+
+SELECT *
+FROM customer_price_class_code_candidates
+
+UNION ALL
+
+SELECT *
+FROM customer_class_candidates

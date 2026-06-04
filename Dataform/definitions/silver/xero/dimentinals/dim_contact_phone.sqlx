@@ -1,0 +1,62 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_contact_phone",
+  description: "Silver: Phone numbers per Xero contact. Grain: one row per tenant_id + contact_id + phone_type.",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_contact_phone.sqlx
+-- Silver dimension: Contact phone numbers (Xero)
+-- Source:  dw_1_bronze_xero.xero_contacts (Phones[] unnested)
+-- Grain:   one row per tenant_id + contact_id + phone_type
+--          (Xero allows one entry per type: DEFAULT, DDI, MOBILE, FAX)
+-- FK refs: contact_id → dw_1_silver_xero.dim_contact
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_contacts")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS contact_id,
+    phone
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Phones')) AS phone
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  contact_id,
+
+  JSON_VALUE(phone, '$.PhoneType')                                    AS phone_type,
+  JSON_VALUE(phone, '$.PhoneCountryCode')                             AS country_code,
+  JSON_VALUE(phone, '$.PhoneAreaCode')                                AS area_code,
+  JSON_VALUE(phone, '$.PhoneNumber')                                  AS phone_number,
+
+  -- Concatenated for convenience
+  NULLIF(CONCAT(
+    COALESCE(JSON_VALUE(phone, '$.PhoneCountryCode'), ''), ' ',
+    COALESCE(JSON_VALUE(phone, '$.PhoneAreaCode'), ''), ' ',
+    COALESCE(JSON_VALUE(phone, '$.PhoneNumber'), '')
+  ), '  ')                                                            AS full_phone_number,
+
+  'xero'                                                              AS _source
+
+FROM unnested
+WHERE JSON_VALUE(phone, '$.PhoneNumber') IS NOT NULL
+  AND JSON_VALUE(phone, '$.PhoneNumber') != ''

@@ -1,0 +1,230 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_customer_invoice",
+  description: "Silver: Customer invoice headers with historized business unit mapping by document date and first line subaccount.",
+  tags: ["silver", "visma", "fact"]
+}
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+subaccount_dim AS (
+  SELECT
+    tenant_id,
+    subaccount_id,
+    segment2 AS segment2_value
+  FROM ${ref("dw_1_silver_visma", "dim_subaccount")}
+),
+
+source_base AS (
+  SELECT *
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_invoices")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+),
+
+line_subaccounts AS (
+  SELECT
+    src.tenantId AS tenant_id,
+    src.referenceNumber AS reference_number,
+    src.documentType AS document_type,
+    sd.segment2_value AS source_segment_2_value
+  FROM source_base AS src
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(src.invoiceLines)) AS line_json WITH OFFSET AS line_offset
+  LEFT JOIN subaccount_dim AS sd
+    ON src.tenantId = sd.tenant_id
+   AND COALESCE(
+     JSON_VALUE(line_json, '$.subaccount.subaccountNumber'),
+     CAST(SAFE_CAST(JSON_VALUE(line_json, '$.subaccount.subaccountId') AS INT64) AS STRING),
+     JSON_VALUE(line_json, '$.subaccountId')
+   ) = sd.subaccount_id
+  WHERE COALESCE(
+    JSON_VALUE(line_json, '$.subaccount.subaccountNumber'),
+    CAST(SAFE_CAST(JSON_VALUE(line_json, '$.subaccount.subaccountId') AS INT64) AS STRING),
+    JSON_VALUE(line_json, '$.subaccountId')
+  ) IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY src.tenantId, src.referenceNumber, src.documentType
+    ORDER BY SAFE_CAST(JSON_VALUE(line_json, '$.lineNumber') AS INT64), line_offset
+  ) = 1
+),
+
+base AS (
+  SELECT
+    tenantId AS tenant_id,
+    syncedAt AS synced_at,
+    organizationName AS organization_name,
+    COALESCE(JSON_VALUE(businessUnitId, '$.id'), CAST(businessUnitId AS STRING)) AS source_business_unit_id,
+    businessUnitName AS source_business_unit_name,
+
+    referenceNumber AS reference_number,
+    documentType AS document_type,
+    status,
+
+    COALESCE(
+      JSON_VALUE(customer, '$.number'),
+      JSON_VALUE(customer, '$.id'),
+      JSON_VALUE(customer, '$.acctCD'),
+      customer
+    ) AS customer_id,
+    COALESCE(
+      JSON_VALUE(customer, '$.name'),
+      JSON_VALUE(customer, '$.description')
+    ) AS customer_name,
+    COALESCE(
+      JSON_VALUE(branchNumber, '$.number'),
+      branchNumber
+    ) AS branch_id,
+    COALESCE(
+      currencyId,
+      JSON_VALUE(currencyId, '$.id')
+    ) AS currency_id,
+    COALESCE(
+      JSON_VALUE(location, '$.locationId'),
+      JSON_VALUE(location, '$.id'),
+      location
+    ) AS location_id,
+    COALESCE(
+      JSON_VALUE(salesPerson, '$.salespersonID'),
+      JSON_VALUE(salesPerson, '$.id'),
+      CAST(salesPersonID AS STRING)
+    ) AS sales_person_id,
+
+    COALESCE(JSON_VALUE(creditTerms, '$.id'), creditTerms) AS credit_terms_id,
+    COALESCE(JSON_VALUE(paymentMethod, '$.id'), paymentMethod) AS payment_method_id,
+    paymentReference AS payment_reference,
+    customerRefNumber AS customer_ref_number,
+    externalReference AS external_reference,
+    invoiceText AS invoice_text,
+
+    COALESCE(
+      JSON_VALUE(project, '$.projectId'),
+      JSON_VALUE(project, '$.id')
+    ) AS project_id,
+
+    COALESCE(
+      SAFE_CAST(documentDate AS DATE),
+      DATE(SAFE_CAST(documentDate AS DATETIME)),
+      DATE(SAFE_CAST(documentDate AS TIMESTAMP))
+    ) AS document_date,
+    COALESCE(
+      SAFE_CAST(documentDueDate AS DATE),
+      DATE(SAFE_CAST(documentDueDate AS DATETIME)),
+      DATE(SAFE_CAST(documentDueDate AS TIMESTAMP))
+    ) AS document_due_date,
+    COALESCE(
+      SAFE_CAST(cashDiscountDate AS DATE),
+      DATE(SAFE_CAST(cashDiscountDate AS DATETIME)),
+      DATE(SAFE_CAST(cashDiscountDate AS TIMESTAMP))
+    ) AS cash_discount_date,
+    financialPeriod AS financial_period,
+    postPeriod AS post_period,
+
+    amountInCurrency AS amount_in_currency,
+    amount AS amount,
+    balanceInCurrency AS balance_in_currency,
+    balance AS balance,
+    vatTotalInCurrency AS vat_total_in_currency,
+    vatTotal AS vat_total,
+    cashDiscountInCurrency AS cash_discount_in_currency,
+    cashDiscount AS cash_discount,
+    discountTotalInCurrency AS discount_total_in_currency,
+    discountTotal AS discount_total,
+    detailTotalInCurrency AS detail_total_in_currency,
+    detailTotal AS detail_total,
+    roundingDiff AS rounding_diff,
+    exchangeRate AS exchange_rate,
+
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+  FROM source_base
+),
+
+enriched AS (
+  SELECT
+    b.*,
+    lsa.source_segment_2_value,
+    bm.business_unit_id AS mapped_business_unit_id,
+    bm.business_unit_name AS mapped_business_unit_name,
+    CASE
+      WHEN bm.business_unit_id IS NULL THEN 'no_mapping'
+      WHEN bm.source_segment_2_value IS NOT NULL AND lsa.source_segment_2_value IS NOT NULL THEN 'subaccount_segment2_match'
+      WHEN bm.source_segment_2_value IS NOT NULL THEN 'segment_zero_match'
+      ELSE 'tenant_default_match'
+    END AS business_unit_match_rule,
+    ROW_NUMBER() OVER (
+      PARTITION BY b.tenant_id, b.reference_number, b.document_type
+      ORDER BY
+        CASE WHEN bm.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        bm.valid_from DESC
+    ) AS bu_match_rank
+  FROM base AS b
+  LEFT JOIN line_subaccounts AS lsa
+    ON b.tenant_id = lsa.tenant_id
+   AND b.reference_number = lsa.reference_number
+   AND b.document_type = lsa.document_type
+  LEFT JOIN business_unit_mapping AS bm
+    ON b.tenant_id = bm.tenant_id
+   AND b.document_date BETWEEN bm.valid_from AND bm.valid_to
+   AND (
+     bm.source_segment_2_value IS NULL
+     OR bm.source_segment_2_value = COALESCE(lsa.source_segment_2_value, '0')
+   )
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  organization_name,
+  source_business_unit_id,
+  source_business_unit_name,
+  COALESCE(mapped_business_unit_id, source_business_unit_id) AS business_unit_id,
+  COALESCE(mapped_business_unit_name, source_business_unit_name, organization_name) AS business_unit_name,
+  source_segment_2_value,
+  business_unit_match_rule,
+
+  reference_number,
+  document_type,
+  status,
+  customer_id,
+  customer_name,
+  branch_id,
+  currency_id,
+  location_id,
+  sales_person_id,
+  credit_terms_id,
+  payment_method_id,
+  payment_reference,
+  customer_ref_number,
+  external_reference,
+  invoice_text,
+  project_id,
+  document_date,
+  document_due_date,
+  cash_discount_date,
+  financial_period,
+  post_period,
+  amount_in_currency,
+  amount,
+  balance_in_currency,
+  balance,
+  vat_total_in_currency,
+  vat_total,
+  cash_discount_in_currency,
+  cash_discount,
+  discount_total_in_currency,
+  discount_total,
+  detail_total_in_currency,
+  detail_total,
+  rounding_diff,
+  exchange_rate,
+  last_modified_at
+FROM enriched
+WHERE bu_match_rank = 1

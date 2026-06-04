@@ -1,0 +1,11 @@
+config {
+  type: "view",
+  schema: "dw_1_silver_visma",
+  name: "fact_inventory_issue_line",
+  description: "Inventory issue lines filtered from the unified inventory movement line fact.",
+  tags: ["silver", "visma", "fact", "inventory", "issue"]
+}
+
+SELECT *
+FROM ${ref("dw_1_silver_visma", "fact_inventory_movement_line")}
+WHERE movement_type = 'ISSUE'

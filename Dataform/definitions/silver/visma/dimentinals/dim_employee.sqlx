@@ -1,0 +1,60 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_employee",
+  description: "Employee master dimension from Visma HR module.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- Silver dimension: Employee master data
+-- Source: visma_employees
+-- Why: Needed for time card analysis, expense claim ownership, project resource
+--      allocation, and as a conformed dimension in the gold layer.
+-- =============================================================================
+
+WITH source_data AS (
+SELECT
+    tenantId                                    AS tenant_id,
+    employeeId                                  AS employee_id,
+    employeeNumber                              AS employee_number,
+    employeeName                                AS employee_name,
+    status,
+    department                                  AS department_id,
+    branch,
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+
+FROM ${ref("visma_employees")}
+WHERE isDeleted = false OR isDeleted IS NULL
+),
+current_tenant_business_unit AS (
+  SELECT
+         tenant_id,
+         business_unit_id,
+         business_unit_name,
+         ROW_NUMBER() OVER (
+           PARTITION BY tenant_id
+           ORDER BY
+             CASE
+               WHEN source_segment_2_value = '0' THEN 1
+               WHEN source_segment_2_value IS NULL THEN 2
+               ELSE 3
+             END,
+             COALESCE(valid_to, DATE '9999-12-31') DESC,
+             valid_from DESC
+         ) AS rn
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+  WHERE CURRENT_DATE() BETWEEN valid_from AND COALESCE(valid_to, DATE '9999-12-31')
+)
+SELECT
+  source_data.*,
+  current_tenant_business_unit.business_unit_id,
+  current_tenant_business_unit.business_unit_name
+FROM source_data
+LEFT JOIN current_tenant_business_unit
+  ON source_data.tenant_id = current_tenant_business_unit.tenant_id
+ AND current_tenant_business_unit.rn = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY source_data.tenant_id, source_data.employee_id
+  ORDER BY source_data.last_modified_at DESC, source_data.employee_number DESC
+) = 1

@@ -1,0 +1,65 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_journal",
+  description: "Silver: GL journal headers from Xero Accounting API. Grain: one row per tenant_id + journal_id (latest record by last_seen_at).",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_journal.sqlx
+-- Silver fact: GL journal headers (Xero)
+-- Source:  dw_1_bronze_xero.xero_journals
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + journal_id (latest by last_seen_at)
+-- Note:    JournalDate and CreatedDateUTC use /Date(ms+0000)/ format.
+--          SourceType examples: ACCPAY, ACCREC, ACCPAYPAYMENT, ACCRECPAYMENT,
+--          MANJOURNAL, CASHPAID, CASHREC, TRANSFER
+-- Note:    JournalLines[] → fact_journal_line
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_journals")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.JournalID')                                  AS journal_id,
+  record_id                                                            AS journal_internal_id,
+  SAFE_CAST(JSON_VALUE(payload, '$.JournalNumber') AS INT64)          AS journal_number,
+
+  -- Source document link
+  JSON_VALUE(payload, '$.SourceID')                                   AS source_id,
+  JSON_VALUE(payload, '$.SourceType')                                 AS source_type,
+  JSON_VALUE(payload, '$.Reference')                                  AS reference,
+
+  -- Dates — /Date(ms+0000)/ format
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.JournalDate'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS journal_date,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.CreatedDateUTC'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS created_at,
+
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.JournalLines'))           AS journal_line_count,
+
+  'xero'                                                              AS _source
+
+FROM raw

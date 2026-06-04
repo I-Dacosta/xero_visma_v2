@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_discount_codes",
+  description: "Bronze: Pricing discount rule configurations from Visma Global API."
+}

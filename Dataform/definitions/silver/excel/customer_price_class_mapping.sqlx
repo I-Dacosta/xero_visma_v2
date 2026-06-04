@@ -1,0 +1,296 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "customer_price_class_mapping",
+  description: "Validated customer price class mapping cleaned from the manual seed, plus deterministic customer-level mappings derived from approved codebook labels matched against customer names. Tenant-scoped Visma price class masters are used first where available, with manual approved seed labels retained as fallback.",
+  tags: ["silver", "excel", "reference", "customer", "pricing"]
+}
+
+WITH approved_seed_rows AS (
+  SELECT
+    tenant_id,
+    organization_name,
+    source_field,
+    source_code,
+    candidate_lookup_name,
+    candidate_lookup_source,
+    NULLIF(TRIM(validated_price_class_id), '')       AS validated_price_class_id,
+    NULLIF(TRIM(validated_price_class_name), '')     AS validated_price_class_name,
+    NULLIF(TRIM(validated_customer_group_name), '')  AS validated_customer_group_name,
+    COALESCE(include_in_final_mapping, FALSE)        AS include_in_final_mapping,
+    LOWER(NULLIF(TRIM(mapping_status), ''))          AS mapping_status,
+    NULLIF(TRIM(notes), '')                          AS notes,
+    1                                                AS mapping_priority
+  FROM ${ref("dw_1_silver_excel", "seed_customer_price_class_mapping")}
+  WHERE COALESCE(include_in_final_mapping, FALSE) = TRUE
+    AND LOWER(COALESCE(mapping_status, '')) = 'approved'
+    AND NULLIF(TRIM(validated_price_class_id), '') IS NOT NULL
+),
+
+global_seed_codebook_rows AS (
+  SELECT
+    validated_price_class_id,
+    validated_price_class_name
+  FROM approved_seed_rows
+  WHERE source_field = 'customer_sales_prices.CustomerPriceClass'
+  GROUP BY 1, 2
+),
+
+latest_tenant_price_classes AS (
+  SELECT
+    tenantId                                          AS tenant_id,
+    organizationName                                  AS organization_name,
+    id                                                AS price_class_id,
+    description                                       AS price_class_description
+  FROM ${ref("dw_1_bronze_visma", "visma_price_classes")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, id
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+source_backed_codebook_rows AS (
+  SELECT DISTINCT
+    sp.tenantId                                       AS tenant_id,
+    pc.organization_name,
+    'customer_sales_prices.CustomerPriceClass'        AS source_field,
+    sp.priceCode                                      AS source_code,
+    pc.price_class_description                        AS candidate_lookup_name,
+    'visma_price_classes'                             AS candidate_lookup_source,
+    sp.priceCode                                      AS validated_price_class_id,
+    pc.price_class_description                        AS validated_price_class_name,
+    CAST(NULL AS STRING)                              AS validated_customer_group_name,
+    TRUE                                              AS include_in_final_mapping,
+    'approved'                                        AS mapping_status,
+    'Auto-approved from tenant-scoped visma_price_classes master joined to observed CustomerPriceClass codes.'
+                                                      AS notes,
+    2                                                 AS mapping_priority
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")} AS sp
+  JOIN latest_tenant_price_classes AS pc
+    ON pc.tenant_id = sp.tenantId
+   AND pc.price_class_id = sp.priceCode
+  WHERE sp.priceType = 'CustomerPriceClass'
+    AND sp.priceCode IS NOT NULL
+),
+
+tenant_source_codebook_rows AS (
+  SELECT
+    tenant_id,
+    organization_name,
+    validated_price_class_id,
+    validated_price_class_name,
+    candidate_lookup_source,
+    mapping_priority
+  FROM source_backed_codebook_rows
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, validated_price_class_id
+    ORDER BY mapping_priority, validated_price_class_name
+  ) = 1
+),
+
+master_customer_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    organization_name,
+    customer_name,
+    synced_at                                        AS source_synced_at,
+    synced_at                                        AS source_updated_at,
+    1                                                AS source_priority
+  FROM ${ref("dw_1_silver_visma", "dim_customer")}
+  WHERE customer_id IS NOT NULL
+),
+
+sales_order_customer_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    ARRAY_AGG(customer_name IGNORE NULLS ORDER BY order_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS customer_name,
+    ARRAY_AGG(organization_name IGNORE NULLS ORDER BY order_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS organization_name,
+    ARRAY_AGG(synced_at IGNORE NULLS ORDER BY order_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS source_synced_at,
+    MAX(COALESCE(TIMESTAMP(order_date), synced_at))  AS source_updated_at,
+    3                                                AS source_priority
+  FROM ${ref("dw_1_silver_visma", "fact_sales_order")}
+  WHERE customer_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+customer_invoice_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    ARRAY_AGG(customer_name IGNORE NULLS ORDER BY document_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS customer_name,
+    ARRAY_AGG(organization_name IGNORE NULLS ORDER BY document_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS organization_name,
+    ARRAY_AGG(synced_at IGNORE NULLS ORDER BY document_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS source_synced_at,
+    MAX(COALESCE(TIMESTAMP(document_date), synced_at))
+                                                     AS source_updated_at,
+    2                                                AS source_priority
+  FROM ${ref("dw_1_silver_visma", "fact_customer_invoice")}
+  WHERE customer_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+customer_payment_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    ARRAY_AGG(customer_name IGNORE NULLS ORDER BY application_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS customer_name,
+    ARRAY_AGG(organization_name IGNORE NULLS ORDER BY application_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS organization_name,
+    ARRAY_AGG(synced_at IGNORE NULLS ORDER BY application_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS source_synced_at,
+    MAX(COALESCE(TIMESTAMP(application_date), synced_at))
+                                                     AS source_updated_at,
+    4                                                AS source_priority
+  FROM ${ref("dw_1_silver_visma", "fact_customer_payment")}
+  WHERE customer_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+customer_credit_note_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    ARRAY_AGG(customer_name IGNORE NULLS ORDER BY document_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS customer_name,
+    ARRAY_AGG(organization_name IGNORE NULLS ORDER BY document_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS organization_name,
+    ARRAY_AGG(synced_at IGNORE NULLS ORDER BY document_date DESC, synced_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+                                                     AS source_synced_at,
+    MAX(COALESCE(TIMESTAMP(document_date), synced_at))
+                                                     AS source_updated_at,
+    5                                                AS source_priority
+  FROM ${ref("dw_1_silver_visma", "fact_customer_credit_note")}
+  WHERE customer_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+customer_mapping_universe AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    organization_name,
+    customer_name
+  FROM (
+    SELECT * FROM master_customer_refs
+    UNION ALL
+    SELECT * FROM customer_invoice_refs
+    UNION ALL
+    SELECT * FROM sales_order_customer_refs
+    UNION ALL
+    SELECT * FROM customer_payment_refs
+    UNION ALL
+    SELECT * FROM customer_credit_note_refs
+  )
+  WHERE customer_id IS NOT NULL
+    AND customer_name IS NOT NULL
+  GROUP BY 1, 2, 3, 4
+),
+
+auto_customer_id_matches AS (
+  SELECT
+    c.tenant_id,
+    c.organization_name,
+    'customerId'                                     AS source_field,
+    c.customer_id                                    AS source_code,
+    codebook.validated_price_class_name              AS candidate_lookup_name,
+    'derived_from_tenant_price_class_master'         AS candidate_lookup_source,
+    codebook.validated_price_class_id                AS validated_price_class_id,
+    codebook.validated_price_class_name              AS validated_price_class_name,
+    CAST(NULL AS STRING)                             AS validated_customer_group_name,
+    TRUE                                             AS include_in_final_mapping,
+    'approved'                                       AS mapping_status,
+    CONCAT(
+      'Auto-derived from tenant-scoped visma_price_classes boundary match on customer_name: ',
+      codebook.validated_price_class_name
+    )                                                AS notes,
+    3                                                AS mapping_priority
+  FROM customer_mapping_universe AS c
+  JOIN tenant_source_codebook_rows AS codebook
+    ON codebook.tenant_id = c.tenant_id
+   AND REGEXP_CONTAINS(
+     LOWER(c.customer_name),
+     CONCAT(
+       r'(^|[^a-z0-9])',
+       LOWER(codebook.validated_price_class_name),
+       r'([^a-z0-9]|$)'
+     )
+   )
+  QUALIFY COUNT(DISTINCT codebook.validated_price_class_id) OVER (
+    PARTITION BY c.tenant_id, c.customer_id
+  ) = 1
+),
+
+fallback_auto_customer_id_matches AS (
+  SELECT
+    c.tenant_id,
+    c.organization_name,
+    'customerId'                                     AS source_field,
+    c.customer_id                                    AS source_code,
+    codebook.validated_price_class_name              AS candidate_lookup_name,
+    'derived_from_global_seed_codebook'              AS candidate_lookup_source,
+    codebook.validated_price_class_id                AS validated_price_class_id,
+    codebook.validated_price_class_name              AS validated_price_class_name,
+    CAST(NULL AS STRING)                             AS validated_customer_group_name,
+    TRUE                                             AS include_in_final_mapping,
+    'approved'                                       AS mapping_status,
+    CONCAT(
+      'Auto-derived from customer_name boundary match against globally approved seed label: ',
+      codebook.validated_price_class_name
+    )                                                AS notes,
+    4                                                AS mapping_priority
+  FROM customer_mapping_universe AS c
+  JOIN global_seed_codebook_rows AS codebook
+    ON REGEXP_CONTAINS(
+      LOWER(c.customer_name),
+      CONCAT(
+        r'(^|[^a-z0-9])',
+        LOWER(codebook.validated_price_class_name),
+        r'([^a-z0-9]|$)'
+      )
+    )
+  LEFT JOIN auto_customer_id_matches AS tenant_match
+    ON tenant_match.tenant_id = c.tenant_id
+   AND tenant_match.source_code = c.customer_id
+  WHERE tenant_match.source_code IS NULL
+  QUALIFY COUNT(DISTINCT codebook.validated_price_class_id) OVER (
+    PARTITION BY c.tenant_id, c.customer_id
+  ) = 1
+),
+
+combined_mappings AS (
+  SELECT * FROM approved_seed_rows
+  UNION ALL
+  SELECT * FROM source_backed_codebook_rows
+  UNION ALL
+  SELECT * FROM auto_customer_id_matches
+  UNION ALL
+  SELECT * FROM fallback_auto_customer_id_matches
+)
+
+SELECT
+  tenant_id,
+  organization_name,
+  source_field,
+  source_code,
+  candidate_lookup_name,
+  candidate_lookup_source,
+  validated_price_class_id,
+  validated_price_class_name,
+  validated_customer_group_name,
+  include_in_final_mapping,
+  mapping_status,
+  notes
+FROM combined_mappings
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY tenant_id, source_field, source_code
+  ORDER BY mapping_priority, organization_name, validated_price_class_name, validated_price_class_id
+) = 1

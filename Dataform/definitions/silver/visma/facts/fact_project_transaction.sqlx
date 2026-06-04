@@ -1,0 +1,96 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_project_transaction",
+  description: "Silver: Project transaction document headers sourced from visma_project_transactions and enriched with line-level aggregates.",
+  tags: ["silver", "visma", "fact"]
+}
+
+WITH source_base AS (
+  SELECT * EXCEPT (rn)
+  FROM (
+    SELECT
+      src.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY src.tenantId, src.module, src.refNbr
+        ORDER BY
+          COALESCE(src.refreshedAt, src.syncedAt) DESC,
+          COALESCE(src.firstSyncedAt, src.syncedAt) DESC,
+          src.syncedAt DESC
+      ) AS rn
+    FROM ${ref("dw_1_bronze_visma", "visma_project_transactions")} AS src
+    WHERE src.isDeleted IS DISTINCT FROM TRUE
+  )
+  WHERE rn = 1
+),
+
+line_metrics AS (
+  SELECT
+    tenant_id,
+    module,
+    reference_number,
+    COUNT(*) AS line_count,
+    COUNT(DISTINCT project_id) AS project_count,
+    CASE
+      WHEN COUNT(DISTINCT project_id) = 1 THEN ANY_VALUE(project_id)
+    END AS project_id,
+    CASE
+      WHEN COUNT(DISTINCT project_id) = 1 THEN ANY_VALUE(project_name)
+    END AS project_name,
+    COUNT(DISTINCT project_task_id) AS project_task_count,
+    COUNT(DISTINCT business_unit_id) AS business_unit_count,
+    CASE
+      WHEN COUNT(DISTINCT business_unit_id) = 1 THEN ANY_VALUE(business_unit_id)
+    END AS business_unit_id,
+    CASE
+      WHEN COUNT(DISTINCT business_unit_name) = 1 THEN ANY_VALUE(business_unit_name)
+    END AS business_unit_name,
+    MIN(transaction_date) AS min_transaction_date,
+    MAX(transaction_date) AS max_transaction_date,
+    SUM(COALESCE(amount, 0)) AS total_amount,
+    SUM(COALESCE(quantity, 0)) AS total_quantity,
+    COUNTIF(is_billable) AS billable_line_count,
+    COUNTIF(is_released) AS released_line_count,
+    COUNTIF(is_allocated) AS allocated_line_count
+  FROM ${ref("dw_1_silver_visma", "fact_project_transaction_line")}
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  src.tenantId AS tenant_id,
+  src.syncedAt AS synced_at,
+  src.organizationName AS organization_name,
+  COALESCE(JSON_VALUE(src.businessUnitId, '$.id'), CAST(src.businessUnitId AS STRING)) AS source_business_unit_id,
+  src.businessUnitName AS source_business_unit_name,
+  COALESCE(lm.business_unit_id, COALESCE(JSON_VALUE(src.businessUnitId, '$.id'), CAST(src.businessUnitId AS STRING))) AS business_unit_id,
+  COALESCE(lm.business_unit_name, src.businessUnitName, src.organizationName) AS business_unit_name,
+  CASE
+    WHEN lm.business_unit_count = 1 THEN 'single_line_business_unit'
+    WHEN lm.business_unit_count > 1 THEN 'mixed_line_business_units'
+    WHEN COALESCE(JSON_VALUE(src.businessUnitId, '$.id'), CAST(src.businessUnitId AS STRING)) IS NOT NULL THEN 'source_header_business_unit'
+    ELSE 'unmapped'
+  END AS business_unit_match_rule,
+
+  src.refNbr AS reference_number,
+  src.module,
+  src.status,
+  src.description AS description,
+  lm.line_count,
+  lm.project_count,
+  lm.project_id,
+  lm.project_name,
+  lm.project_task_count,
+  lm.min_transaction_date,
+  lm.max_transaction_date,
+  lm.total_amount,
+  lm.total_quantity,
+  lm.billable_line_count,
+  lm.released_line_count,
+  lm.allocated_line_count,
+  SAFE_CAST(src.refreshedAt AS TIMESTAMP) AS refreshed_at,
+  SAFE_CAST(src.firstSyncedAt AS TIMESTAMP) AS first_synced_at
+FROM source_base AS src
+LEFT JOIN line_metrics AS lm
+  ON src.tenantId = lm.tenant_id
+ AND src.module = lm.module
+ AND src.refNbr = lm.reference_number

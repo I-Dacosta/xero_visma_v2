@@ -1,0 +1,34 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_entity",
+  description: "Conformed reporting-entity dimension resolved from the curated entity mapping reference. Used to group legal entities into the reporting entity structure shown in Power BI.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+WITH entity_reference AS (
+  SELECT
+    entity_code,
+    ANY_VALUE(entity_name) AS entity_name,
+    ANY_VALUE(group_name) AS mapped_group_name
+  FROM ${ref("dw_1_silver_excel", "seed_entity_mapping")}
+  WHERE entity_code IS NOT NULL
+  GROUP BY 1
+),
+company_entities AS (
+  SELECT DISTINCT
+    entity_code,
+    group_name
+  FROM ${ref("dw_1_gold_common", "dim_company")}
+  WHERE entity_code IS NOT NULL
+)
+
+SELECT
+  FARM_FINGERPRINT(CAST(c.entity_code AS STRING))      AS entity_key,
+  c.entity_code,
+  er.entity_name,
+  COALESCE(c.group_name, er.mapped_group_name)         AS group_name,
+  'visma' AS source_system
+FROM company_entities AS c
+LEFT JOIN entity_reference AS er
+  ON er.entity_code = c.entity_code

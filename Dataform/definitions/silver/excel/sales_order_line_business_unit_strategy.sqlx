@@ -1,0 +1,103 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "sales_order_line_business_unit_strategy",
+  description: "Reference mapping for sales order lines that need special business-unit handling in header/reporting logic.",
+  tags: ["silver", "excel", "reference"]
+}
+
+-- Grain:
+--   one row per inventory_id + optional line_type/sales_account_id match.
+--
+-- Purpose:
+--   canonical line BU always comes from raw Visma subaccount segment 2.
+--   this mapping only controls how certain ancillary lines participate in
+--   order-header BU resolution and reporting rollups.
+
+SELECT *
+FROM UNNEST([
+  STRUCT(
+    '1A1' AS inventory_id,
+    CAST(NULL AS STRING) AS line_type,
+    CAST(NULL AS STRING) AS sales_account_id,
+    'allocate_to_material_goods_bu' AS line_business_unit_strategy,
+    'Freight line. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.' AS strategy_description
+  ),
+  STRUCT(
+    '1E8',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Packaging or pallet fee. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1E9',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Packaging or pallet fee. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '10000',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Environmental or lubricant fee. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '4060',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Inbound freight charge. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1B6',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Vehicle or service-car charge. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1B8',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Road toll or ferry charge. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1C2',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Travel time charge. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1C4',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Diet or per diem charge. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1C6',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Road toll charge. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1C39',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Diet and lodging charge. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  ),
+  STRUCT(
+    '1C42',
+    CAST(NULL AS STRING),
+    CAST(NULL AS STRING),
+    'allocate_to_material_goods_bu',
+    'Hotel or lodging reimbursement. Keep source BU on the line, but allocate to the dominant material goods BU for header/reporting when one exists.'
+  )
+])

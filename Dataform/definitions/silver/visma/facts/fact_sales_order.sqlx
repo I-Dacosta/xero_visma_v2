@@ -1,0 +1,970 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_sales_order",
+  description: "Silver: Sales order headers. Flattens SalesOrder V3 JSON payloads and maps business units from line subaccount segment 2.",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- fact_sales_order.sqlx
+-- Silver fact: Sales order headers
+-- Source: dw_1_bronze_visma.visma_sales_orders_v3
+-- Grain: one row per tenantId + orderId
+-- Key transformations:
+--   * Header-level JSON objects are flattened to scalar columns
+--   * Canonical header business units stay NULL when material lines are mixed or unresolved
+--   * Representative business units keep a line-derived fallback for reporting/debugging
+--   * Latest non-deleted order version is retained per tenantId + orderId
+-- =============================================================================
+
+WITH base AS (
+  SELECT
+    *,
+    COALESCE(
+      NULLIF(TRIM(orderLines), ''),
+      NULLIF(TRIM(lines), ''),
+      '[]'
+    ) AS order_lines_json_source
+  FROM ${ref("dw_1_bronze_visma", "visma_sales_orders_v3")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, orderId
+    ORDER BY syncedAt DESC, SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) DESC
+  ) = 1
+),
+
+business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+line_strategy_mapping AS (
+  SELECT
+    inventory_id,
+    line_type,
+    sales_account_id,
+    line_business_unit_strategy,
+    strategy_description
+  FROM ${ref("dw_1_silver_excel", "sales_order_line_business_unit_strategy")}
+),
+
+line_candidates AS (
+  SELECT
+    src.tenantId AS tenant_id,
+    src.orderId AS order_id,
+    COALESCE(
+      SAFE_CAST(src.date AS DATE),
+      DATE(SAFE_CAST(src.date AS TIMESTAMP)),
+      COALESCE(
+        SAFE_CAST(JSON_VALUE(line_json, '$.orderDate') AS DATE),
+        DATE(SAFE_CAST(JSON_VALUE(line_json, '$.orderDate') AS TIMESTAMP))
+      )
+    ) AS line_business_date,
+    COALESCE(
+      SAFE_CAST(JSON_VALUE(line_json, '$.orderDate') AS DATE),
+      DATE(SAFE_CAST(JSON_VALUE(line_json, '$.orderDate') AS TIMESTAMP))
+    ) AS line_order_date,
+    JSON_VALUE(line_json, '$.lineType') AS line_type,
+    COALESCE(
+      JSON_VALUE(line_json, '$.inventory.id'),
+      JSON_VALUE(line_json, '$.inventoryId')
+    ) AS inventory_id,
+    COALESCE(
+      JSON_VALUE(line_json, '$.accountId'),
+      JSON_VALUE(line_json, '$.salesAccountId')
+    ) AS sales_account_id,
+    COALESCE(
+      JSON_VALUE(line_json, '$.description'),
+      JSON_VALUE(line_json, '$.inventory.description')
+    ) AS line_description,
+    COALESCE(
+      JSON_VALUE(line_json, '$.salesPersonId'),
+      JSON_VALUE(line_json, '$.salesPerson.salespersonID'),
+      JSON_VALUE(line_json, '$.salesPerson.id')
+    ) AS line_sales_person_id,
+    COALESCE(
+      JSON_VALUE(line_json, '$.salesPerson.name'),
+      JSON_VALUE(line_json, '$.salesPerson.description')
+    ) AS line_sales_person_name,
+    COALESCE(JSON_VALUE(line_json, '$.subaccount.2'), '0') AS subaccount_seg2,
+    COALESCE(
+      SAFE_CAST(JSON_VALUE(line_json, '$.amount') AS FLOAT64),
+      SAFE_CAST(JSON_VALUE(line_json, '$.extendedPrice') AS FLOAT64),
+      SAFE_CAST(JSON_VALUE(line_json, '$.lineTotalBeforeDiscount') AS FLOAT64),
+      0.0
+    ) AS line_amount,
+    COALESCE(
+      SAFE_CAST(JSON_VALUE(line_json, '$.sortOrder') AS INT64),
+      SAFE_CAST(JSON_VALUE(line_json, '$.lineNbr') AS INT64),
+      SAFE_CAST(JSON_VALUE(line_json, '$.lineId') AS INT64),
+      line_offset + 1
+    ) AS line_rank
+  FROM base src
+  CROSS JOIN UNNEST(JSON_EXTRACT_ARRAY(src.order_lines_json_source)) AS line_json WITH OFFSET AS line_offset
+),
+
+line_candidates_strategized AS (
+  SELECT
+    lc.*,
+    COALESCE(lc.line_amount, 0.0) = 0.0 AS is_zero_value_line,
+    COALESCE(lc.line_amount, 0.0) <> 0.0 AS is_material_line,
+    COALESCE(lc.line_amount, 0.0) <> 0.0
+      AND lc.line_type = 'GoodsForInventory' AS is_material_goods_line,
+    CASE
+      WHEN COALESCE(lc.line_amount, 0.0) = 0.0 THEN 'ignore_zero_value_line'
+      ELSE COALESCE(strategy_map.line_business_unit_strategy, 'source_subaccount')
+    END AS line_business_unit_strategy,
+    strategy_map.strategy_description AS line_business_unit_strategy_description
+  FROM line_candidates lc
+  LEFT JOIN line_strategy_mapping strategy_map
+    ON lc.inventory_id = strategy_map.inventory_id
+   AND (strategy_map.line_type IS NULL OR strategy_map.line_type = lc.line_type)
+   AND (strategy_map.sales_account_id IS NULL OR strategy_map.sales_account_id = lc.sales_account_id)
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY lc.tenant_id, lc.order_id, lc.line_rank
+    ORDER BY
+      CASE WHEN strategy_map.inventory_id IS NOT NULL THEN 1 ELSE 0 END DESC,
+      CASE WHEN strategy_map.line_type IS NOT NULL THEN 1 ELSE 0 END DESC,
+      CASE WHEN strategy_map.sales_account_id IS NOT NULL THEN 1 ELSE 0 END DESC
+  ) = 1
+),
+
+resolved_line_business_units AS (
+  SELECT
+    lc.*,
+    mapped_bu.business_unit_id,
+    mapped_bu.business_unit_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY lc.tenant_id, lc.order_id, lc.line_rank
+      ORDER BY
+        CASE WHEN mapped_bu.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        mapped_bu.valid_from DESC
+    ) AS bu_match_rank
+  FROM line_candidates_strategized lc
+  LEFT JOIN business_unit_mapping mapped_bu
+    ON lc.tenant_id = mapped_bu.tenant_id
+   AND COALESCE(lc.line_business_date, DATE '1900-01-01') BETWEEN mapped_bu.valid_from AND mapped_bu.valid_to
+   AND (
+     mapped_bu.source_segment_2_value IS NULL
+     OR mapped_bu.source_segment_2_value = lc.subaccount_seg2
+   )
+),
+
+line_order_dates AS (
+  SELECT
+    tenant_id,
+    order_id,
+    ARRAY_AGG(line_order_date IGNORE NULLS ORDER BY line_rank LIMIT 1)[SAFE_OFFSET(0)] AS line_order_date
+  FROM line_candidates_strategized
+  GROUP BY 1,2
+),
+
+material_line_sales_person_rollup AS (
+  SELECT
+    tenant_id,
+    order_id,
+    line_sales_person_id AS sales_person_id,
+    ARRAY_AGG(
+      line_sales_person_name IGNORE NULLS
+      ORDER BY COALESCE(line_amount, 0.0) DESC, line_rank ASC
+      LIMIT 1
+    )[SAFE_OFFSET(0)] AS sales_person_name,
+    COUNT(*) AS line_count,
+    SUM(COALESCE(line_amount, 0.0)) AS line_amount_sum,
+    MIN(line_rank) AS first_line_rank
+  FROM line_candidates_strategized
+  WHERE is_material_line
+    AND line_sales_person_id IS NOT NULL
+  GROUP BY 1,2,3
+),
+
+material_line_sales_person_choice AS (
+  SELECT
+    tenant_id,
+    order_id,
+    sales_person_id,
+    sales_person_name,
+    COUNT(*) OVER (PARTITION BY tenant_id, order_id) AS material_line_sales_person_count
+  FROM material_line_sales_person_rollup
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, order_id
+    ORDER BY
+      line_amount_sum DESC,
+      line_count DESC,
+      first_line_rank ASC,
+      sales_person_id
+  ) = 1
+),
+
+all_line_sales_person_rollup AS (
+  SELECT
+    tenant_id,
+    order_id,
+    line_sales_person_id AS sales_person_id,
+    ARRAY_AGG(
+      line_sales_person_name IGNORE NULLS
+      ORDER BY COALESCE(line_amount, 0.0) DESC, line_rank ASC
+      LIMIT 1
+    )[SAFE_OFFSET(0)] AS sales_person_name,
+    COUNT(*) AS line_count,
+    SUM(COALESCE(line_amount, 0.0)) AS line_amount_sum,
+    MIN(line_rank) AS first_line_rank
+  FROM line_candidates_strategized
+  WHERE line_sales_person_id IS NOT NULL
+  GROUP BY 1,2,3
+),
+
+all_line_sales_person_choice AS (
+  SELECT
+    tenant_id,
+    order_id,
+    sales_person_id,
+    sales_person_name,
+    COUNT(*) OVER (PARTITION BY tenant_id, order_id) AS all_line_sales_person_count
+  FROM all_line_sales_person_rollup
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, order_id
+    ORDER BY
+      line_amount_sum DESC,
+      line_count DESC,
+      first_line_rank ASC,
+      sales_person_id
+  ) = 1
+),
+
+material_goods_business_unit_rollup AS (
+  SELECT
+    tenant_id,
+    order_id,
+    business_unit_id,
+    business_unit_name,
+    ARRAY_AGG(
+      subaccount_seg2
+      ORDER BY COALESCE(line_amount, 0.0) DESC, line_rank ASC
+      LIMIT 1
+    )[SAFE_OFFSET(0)] AS subaccount_seg2,
+    COUNT(*) AS line_count,
+    SUM(COALESCE(line_amount, 0.0)) AS line_amount_sum,
+    MIN(line_rank) AS first_line_rank
+  FROM resolved_line_business_units
+  WHERE bu_match_rank = 1
+    AND is_material_goods_line
+    AND line_business_unit_strategy = 'source_subaccount'
+    AND business_unit_id IS NOT NULL
+  GROUP BY 1,2,3,4
+),
+
+material_goods_business_unit_choice AS (
+  SELECT
+    tenant_id,
+    order_id,
+    business_unit_id,
+    business_unit_name,
+    subaccount_seg2
+  FROM material_goods_business_unit_rollup
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, order_id
+    ORDER BY
+      line_amount_sum DESC,
+      line_count DESC,
+      first_line_rank ASC,
+      business_unit_id
+  ) = 1
+),
+
+source_line_business_unit_rollup AS (
+  SELECT
+    tenant_id,
+    order_id,
+    business_unit_id,
+    business_unit_name,
+    ARRAY_AGG(
+      subaccount_seg2
+      ORDER BY COALESCE(line_amount, 0.0) DESC, line_rank ASC
+      LIMIT 1
+    )[SAFE_OFFSET(0)] AS subaccount_seg2,
+    COUNT(*) AS line_count,
+    SUM(COALESCE(line_amount, 0.0)) AS line_amount_sum,
+    MIN(line_rank) AS first_line_rank
+  FROM resolved_line_business_units
+  WHERE bu_match_rank = 1
+    AND is_material_line
+    AND business_unit_id IS NOT NULL
+  GROUP BY 1,2,3,4
+),
+
+source_line_business_unit_choice AS (
+  SELECT
+    tenant_id,
+    order_id,
+    business_unit_id,
+    business_unit_name,
+    subaccount_seg2,
+    COUNT(*) OVER (PARTITION BY tenant_id, order_id) AS source_line_business_unit_count
+  FROM source_line_business_unit_rollup
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, order_id
+    ORDER BY
+      line_amount_sum DESC,
+      line_count DESC,
+      first_line_rank ASC,
+      business_unit_id
+  ) = 1
+),
+
+source_material_line_stats AS (
+  SELECT
+    tenant_id,
+    order_id,
+    COUNT(*) AS source_material_line_count,
+    COUNTIF(business_unit_id IS NULL) AS unresolved_source_material_line_count
+  FROM resolved_line_business_units
+  WHERE bu_match_rank = 1
+    AND is_material_line
+  GROUP BY 1,2
+),
+
+effective_line_business_units AS (
+  SELECT
+    rlb.tenant_id,
+    rlb.order_id,
+    rlb.line_rank,
+    rlb.subaccount_seg2,
+    rlb.line_amount,
+    rlb.is_material_line,
+    rlb.line_business_unit_strategy,
+    CASE
+      WHEN rlb.line_business_unit_strategy = 'allocate_to_material_goods_bu'
+        AND mgbuc.business_unit_id IS NOT NULL
+        THEN mgbuc.business_unit_id
+      ELSE rlb.business_unit_id
+    END AS effective_business_unit_id,
+    CASE
+      WHEN rlb.line_business_unit_strategy = 'allocate_to_material_goods_bu'
+        AND mgbuc.business_unit_name IS NOT NULL
+        THEN mgbuc.business_unit_name
+      ELSE rlb.business_unit_name
+    END AS effective_business_unit_name,
+    CASE
+      WHEN rlb.line_business_unit_strategy = 'allocate_to_material_goods_bu'
+        AND mgbuc.subaccount_seg2 IS NOT NULL
+        THEN mgbuc.subaccount_seg2
+      ELSE rlb.subaccount_seg2
+    END AS effective_subaccount_seg2
+  FROM resolved_line_business_units rlb
+  LEFT JOIN material_goods_business_unit_choice mgbuc
+    ON rlb.tenant_id = mgbuc.tenant_id
+   AND rlb.order_id = mgbuc.order_id
+  WHERE rlb.bu_match_rank = 1
+    AND rlb.is_material_line
+),
+
+effective_material_line_stats AS (
+  SELECT
+    tenant_id,
+    order_id,
+    COUNT(*) AS effective_material_line_count,
+    COUNTIF(effective_business_unit_id IS NULL) AS unresolved_effective_material_line_count
+  FROM effective_line_business_units
+  GROUP BY 1,2
+),
+
+effective_line_business_unit_rollup AS (
+  SELECT
+    tenant_id,
+    order_id,
+    effective_business_unit_id AS business_unit_id,
+    effective_business_unit_name AS business_unit_name,
+    ARRAY_AGG(
+      effective_subaccount_seg2
+      ORDER BY COALESCE(line_amount, 0.0) DESC, line_rank ASC
+      LIMIT 1
+    )[SAFE_OFFSET(0)] AS subaccount_seg2,
+    COUNT(*) AS line_count,
+    SUM(COALESCE(line_amount, 0.0)) AS line_amount_sum,
+    MIN(line_rank) AS first_line_rank
+  FROM effective_line_business_units
+  WHERE effective_business_unit_id IS NOT NULL
+  GROUP BY 1,2,3,4
+),
+
+effective_line_business_unit_choice AS (
+  SELECT
+    tenant_id,
+    order_id,
+    business_unit_id,
+    business_unit_name,
+    subaccount_seg2,
+    COUNT(*) OVER (PARTITION BY tenant_id, order_id) AS effective_line_business_unit_count
+  FROM effective_line_business_unit_rollup
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, order_id
+    ORDER BY
+      line_amount_sum DESC,
+      line_count DESC,
+      first_line_rank ASC,
+      business_unit_id
+  ) = 1
+),
+
+header_enriched AS (
+  SELECT
+    src.tenantId AS tenant_id,
+    src.syncedAt AS synced_at,
+    src.organizationName AS organization_name,
+    COALESCE(effective_lbc.business_unit_id, mapped_bu.business_unit_id) AS representative_business_unit_id,
+    COALESCE(effective_lbc.business_unit_name, mapped_bu.business_unit_name) AS representative_business_unit_name,
+    CASE
+      WHEN COALESCE(effective_stats.effective_material_line_count, 0) = 0 THEN mapped_bu.business_unit_id
+      WHEN COALESCE(effective_stats.unresolved_effective_material_line_count, 0) > 0 THEN NULL
+      WHEN COALESCE(effective_lbc.effective_line_business_unit_count, 0) = 1 THEN effective_lbc.business_unit_id
+      ELSE NULL
+    END AS business_unit_id,
+    CASE
+      WHEN COALESCE(effective_stats.effective_material_line_count, 0) = 0 THEN mapped_bu.business_unit_name
+      WHEN COALESCE(effective_stats.unresolved_effective_material_line_count, 0) > 0 THEN NULL
+      WHEN COALESCE(effective_lbc.effective_line_business_unit_count, 0) = 1 THEN effective_lbc.business_unit_name
+      ELSE NULL
+    END AS business_unit_name,
+    CASE
+      WHEN COALESCE(source_stats.source_material_line_count, 0) = 0 THEN mapped_bu.business_unit_id
+      WHEN COALESCE(source_stats.unresolved_source_material_line_count, 0) > 0 THEN NULL
+      WHEN COALESCE(source_lbc.source_line_business_unit_count, 0) = 1 THEN source_lbc.business_unit_id
+      ELSE NULL
+    END AS source_consistent_business_unit_id,
+    CASE
+      WHEN COALESCE(source_stats.source_material_line_count, 0) = 0 THEN mapped_bu.business_unit_name
+      WHEN COALESCE(source_stats.unresolved_source_material_line_count, 0) > 0 THEN NULL
+      WHEN COALESCE(source_lbc.source_line_business_unit_count, 0) = 1 THEN source_lbc.business_unit_name
+      ELSE NULL
+    END AS source_consistent_business_unit_name,
+    CASE
+      WHEN COALESCE(effective_stats.effective_material_line_count, 0) = 0 THEN mapped_bu.business_unit_id
+      WHEN COALESCE(effective_stats.unresolved_effective_material_line_count, 0) > 0 THEN NULL
+      WHEN COALESCE(effective_lbc.effective_line_business_unit_count, 0) = 1 THEN effective_lbc.business_unit_id
+      ELSE NULL
+    END AS effective_consistent_business_unit_id,
+    CASE
+      WHEN COALESCE(effective_stats.effective_material_line_count, 0) = 0 THEN mapped_bu.business_unit_name
+      WHEN COALESCE(effective_stats.unresolved_effective_material_line_count, 0) > 0 THEN NULL
+      WHEN COALESCE(effective_lbc.effective_line_business_unit_count, 0) = 1 THEN effective_lbc.business_unit_name
+      ELSE NULL
+    END AS effective_consistent_business_unit_name,
+    COALESCE(source_lbc.source_line_business_unit_count, 0) AS line_business_unit_count,
+    COALESCE(source_lbc.source_line_business_unit_count, 0) > 1 AS has_multiple_line_business_units,
+    COALESCE(effective_lbc.effective_line_business_unit_count, 0) AS effective_line_business_unit_count,
+    COALESCE(effective_lbc.effective_line_business_unit_count, 0) > 1 AS has_multiple_effective_line_business_units,
+    COALESCE(source_stats.source_material_line_count, 0) AS source_material_line_count,
+    COALESCE(source_stats.unresolved_source_material_line_count, 0) AS unresolved_source_material_line_count,
+    COALESCE(effective_stats.effective_material_line_count, 0) AS effective_material_line_count,
+    COALESCE(effective_stats.unresolved_effective_material_line_count, 0) AS unresolved_effective_material_line_count,
+    CASE
+      WHEN COALESCE(effective_stats.effective_material_line_count, 0) = 0
+        AND mapped_bu.business_unit_id IS NOT NULL
+        THEN 'tenant_default_match'
+      WHEN COALESCE(effective_stats.effective_material_line_count, 0) = 0
+        THEN 'no_match'
+      WHEN COALESCE(effective_stats.unresolved_effective_material_line_count, 0) > 0
+        THEN 'unresolved_line_business_unit'
+      WHEN COALESCE(effective_lbc.effective_line_business_unit_count, 0) = 1
+        AND COALESCE(source_lbc.source_line_business_unit_count, 0) > 1
+        THEN 'single_effective_line_business_unit_after_strategy'
+      WHEN COALESCE(effective_lbc.effective_line_business_unit_count, 0) = 1
+        THEN 'single_effective_line_business_unit'
+      WHEN COALESCE(effective_lbc.effective_line_business_unit_count, 0) > 1
+        THEN 'mixed_multi_bu_order'
+      WHEN mapped_bu.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'no_match'
+    END AS header_business_unit_selection_method,
+
+    src.orderId AS order_id,
+    src.orderNo AS order_no,
+    src.orderType AS order_type,
+    src.status AS status,
+    COALESCE(
+      JSON_VALUE(src.branch, '$.branchId'),
+      JSON_VALUE(src.branch, '$.id'),
+      CAST(src.branch AS STRING)
+    ) AS branch_id,
+    JSON_VALUE(src.branch, '$.description') AS branch_name,
+    COALESCE(
+      JSON_VALUE(src.branchNumber, '$.number'),
+      JSON_VALUE(src.branch, '$.number'),
+      CAST(src.branchNumber AS STRING)
+    ) AS branch_number,
+    COALESCE(
+      JSON_VALUE(src.currency, '$.id'),
+      CAST(src.currency AS STRING)
+    ) AS currency_id,
+    COALESCE(
+      JSON_VALUE(src.currency, '$.description'),
+      CAST(src.currency AS STRING)
+    ) AS currency_name,
+    SAFE_CAST(src.currencyRate AS FLOAT64) AS exchange_rate,
+
+    src.customerId AS customer_id,
+    src.customerName AS customer_name,
+    src.customerOrder AS customer_order,
+    src.customerRefNo AS customer_ref_no,
+    src.parentCustomer AS parent_customer,
+    COALESCE(JSON_VALUE(src.customer, '$.location.id'), CAST(src.location AS STRING)) AS customer_location_id,
+    JSON_VALUE(src.customer, '$.taxZone.id') AS customer_tax_zone_id,
+    JSON_VALUE(src.customer, '$.taxZone.description') AS customer_tax_zone_description,
+
+    COALESCE(
+      SAFE_CAST(src.date AS DATE),
+      DATE(SAFE_CAST(src.date AS TIMESTAMP)),
+      lod.line_order_date
+    ) AS order_date,
+    COALESCE(
+      SAFE_CAST(COALESCE(JSON_VALUE(src.financialInformation, '$.dueDate'), CAST(src.dueDate AS STRING)) AS DATE),
+      DATE(SAFE_CAST(COALESCE(JSON_VALUE(src.financialInformation, '$.dueDate'), CAST(src.dueDate AS STRING)) AS TIMESTAMP))
+    ) AS due_date,
+    COALESCE(
+      SAFE_CAST(src.requestOn AS DATE),
+      DATE(SAFE_CAST(src.requestOn AS TIMESTAMP))
+    ) AS request_date,
+    COALESCE(
+      SAFE_CAST(src.cancelBy AS DATE),
+      DATE(SAFE_CAST(src.cancelBy AS TIMESTAMP))
+    ) AS cancel_by_date,
+    COALESCE(
+      SAFE_CAST(COALESCE(JSON_VALUE(src.financialInformation, '$.invoiceDate'), CAST(src.invoiceDate AS STRING)) AS DATE),
+      DATE(SAFE_CAST(COALESCE(JSON_VALUE(src.financialInformation, '$.invoiceDate'), CAST(src.invoiceDate AS STRING)) AS TIMESTAMP))
+    ) AS invoice_date,
+    COALESCE(
+      SAFE_CAST(COALESCE(JSON_VALUE(src.shipping, '$.scheduledDate'), CAST(src.shippingScheduledDate AS STRING), CAST(src.scheduledDate AS STRING)) AS DATE),
+      DATE(SAFE_CAST(COALESCE(JSON_VALUE(src.shipping, '$.scheduledDate'), CAST(src.shippingScheduledDate AS STRING), CAST(src.scheduledDate AS STRING)) AS TIMESTAMP))
+    ) AS scheduled_ship_date,
+    COALESCE(
+      SAFE_CAST(COALESCE(JSON_VALUE(src.financialInformation, '$.cashDiscountDate'), CAST(src.cashDiscountDate AS STRING)) AS DATE),
+      DATE(SAFE_CAST(COALESCE(JSON_VALUE(src.financialInformation, '$.cashDiscountDate'), CAST(src.cashDiscountDate AS STRING)) AS TIMESTAMP))
+    ) AS cash_discount_date,
+    COALESCE(JSON_VALUE(src.financialInformation, '$.postPeriod'), CAST(src.postPeriod AS STRING)) AS post_period,
+
+    SAFE_CAST(src.hold AS BOOL) AS hold,
+    SAFE_CAST(src.canceled AS BOOL) AS canceled,
+    SAFE_CAST(src.emailed AS BOOL) AS emailed,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.financialInformation, '$.invoiceSeparately'), CAST(src.invoiceSeparately AS STRING)) AS BOOL) AS invoice_separately,
+    SAFE_CAST(src.shipSeparately AS BOOL) AS ship_separately,
+    SAFE_CAST(src.residentialDelivery AS BOOL) AS residential_delivery,
+    SAFE_CAST(src.saturdayDelivery AS BOOL) AS saturday_delivery,
+    SAFE_CAST(src.insurance AS BOOL) AS insurance,
+    SAFE_CAST(src.isRotRutDeductible AS BOOL) AS is_rot_rut_deductible,
+    SAFE_CAST(src.priority AS INT64) AS priority,
+    JSON_VALUE(src.origin, '$.orderType') AS origin_order_type,
+    JSON_VALUE(src.origin, '$.orderId') AS origin_order_id,
+    src.originalOrderId AS original_order_id,
+    src.originalOrderType AS original_order_type,
+    src.description AS order_description,
+    src.invoiceId AS invoice_id,
+    COALESCE(JSON_VALUE(src.owner, '$.id'), JSON_VALUE(src.owner, '$.internalId')) AS owner_id,
+    COALESCE(JSON_VALUE(src.project, '$.id'), CAST(src.project AS STRING)) AS project_id,
+    JSON_VALUE(src.project, '$.description') AS project_description,
+    COALESCE(JSON_VALUE(src.project, '$.internalId'), JSON_VALUE(src.project, '$.internalID')) AS project_internal_id,
+
+    COALESCE(
+      COALESCE(
+        JSON_VALUE(src.salesPerson, '$.salespersonID'),
+        JSON_VALUE(src.salesPerson, '$.id')
+      ),
+      material_lsp.sales_person_id,
+      all_lsp.sales_person_id
+    ) AS representative_sales_person_id,
+    COALESCE(
+      COALESCE(
+        JSON_VALUE(src.salesPerson, '$.name'),
+        JSON_VALUE(src.salesPerson, '$.description')
+      ),
+      material_lsp.sales_person_name,
+      all_lsp.sales_person_name
+    ) AS representative_sales_person_name,
+    CASE
+      WHEN COALESCE(
+        JSON_VALUE(src.salesPerson, '$.salespersonID'),
+        JSON_VALUE(src.salesPerson, '$.id')
+      ) IS NOT NULL
+        THEN COALESCE(
+          JSON_VALUE(src.salesPerson, '$.salespersonID'),
+          JSON_VALUE(src.salesPerson, '$.id')
+        )
+      WHEN COALESCE(material_lsp.material_line_sales_person_count, 0) = 1
+        THEN material_lsp.sales_person_id
+      WHEN COALESCE(material_lsp.material_line_sales_person_count, 0) = 0
+        AND COALESCE(all_lsp.all_line_sales_person_count, 0) = 1
+        THEN all_lsp.sales_person_id
+      ELSE NULL
+    END AS sales_person_id,
+    CASE
+      WHEN COALESCE(
+        JSON_VALUE(src.salesPerson, '$.salespersonID'),
+        JSON_VALUE(src.salesPerson, '$.id')
+      ) IS NOT NULL
+        THEN COALESCE(
+          JSON_VALUE(src.salesPerson, '$.name'),
+          JSON_VALUE(src.salesPerson, '$.description')
+        )
+      WHEN COALESCE(material_lsp.material_line_sales_person_count, 0) = 1
+        THEN material_lsp.sales_person_name
+      WHEN COALESCE(material_lsp.material_line_sales_person_count, 0) = 0
+        AND COALESCE(all_lsp.all_line_sales_person_count, 0) = 1
+        THEN all_lsp.sales_person_name
+      ELSE NULL
+    END AS sales_person_name,
+    COALESCE(
+      NULLIF(material_lsp.material_line_sales_person_count, 0),
+      all_lsp.all_line_sales_person_count,
+      0
+    ) AS line_sales_person_count,
+    CASE
+      WHEN COALESCE(
+        JSON_VALUE(src.salesPerson, '$.salespersonID'),
+        JSON_VALUE(src.salesPerson, '$.id')
+      ) IS NOT NULL
+        THEN 'header_sales_person'
+      WHEN COALESCE(material_lsp.material_line_sales_person_count, 0) = 1
+        THEN 'single_material_line_sales_person'
+      WHEN COALESCE(material_lsp.material_line_sales_person_count, 0) > 1
+        THEN 'mixed_material_line_sales_people'
+      WHEN COALESCE(all_lsp.all_line_sales_person_count, 0) = 1
+        THEN 'single_line_sales_person'
+      WHEN COALESCE(all_lsp.all_line_sales_person_count, 0) > 1
+        THEN 'mixed_line_sales_people'
+      ELSE 'no_sales_person'
+    END AS sales_person_resolution_method,
+    COALESCE(
+      JSON_VALUE(src.location, '$.locationId'),
+      JSON_VALUE(src.location, '$.id'),
+      CAST(src.location AS STRING)
+    ) AS header_location_id,
+    COALESCE(
+      JSON_VALUE(src.preferredWarehouse, '$.warehouseId'),
+      JSON_VALUE(src.preferredWarehouse, '$.id'),
+      JSON_VALUE(src.customer, '$.location.warehouseId'),
+      CAST(src.preferredWarehouse AS STRING)
+    ) AS header_warehouse_id,
+
+    COALESCE(
+      JSON_VALUE(src.soBillingContact, '$.contactId'),
+      JSON_VALUE(src.billing, '$.contact.id')
+    ) AS billing_contact_id,
+    COALESCE(
+      JSON_VALUE(src.soBillingContact, '$.name'),
+      JSON_VALUE(src.billing, '$.contact.name')
+    ) AS billing_contact_name,
+    COALESCE(
+      JSON_VALUE(src.soBillingAddress, '$.addressId'),
+      JSON_VALUE(src.billing, '$.address.id')
+    ) AS billing_address_id,
+    JSON_VALUE(src.soBillingAddress, '$.addressLine1') AS billing_address_line1,
+    JSON_VALUE(src.soBillingAddress, '$.city') AS billing_city,
+    JSON_VALUE(src.soBillingAddress, '$.postalCode') AS billing_postal_code,
+    COALESCE(
+      JSON_VALUE(src.soBillingAddress, '$.countryId'),
+      JSON_VALUE(src.soBillingAddress, '$.country'),
+      JSON_VALUE(src.billing, '$.address.country.id')
+    ) AS billing_country,
+
+    COALESCE(
+      JSON_VALUE(src.soShippingContact, '$.contactId'),
+      JSON_VALUE(src.shipping, '$.contact.id')
+    ) AS shipping_contact_id,
+    COALESCE(
+      JSON_VALUE(src.soShippingContact, '$.name'),
+      JSON_VALUE(src.shipping, '$.contact.name')
+    ) AS shipping_contact_name,
+    COALESCE(
+      JSON_VALUE(src.soShippingAddress, '$.addressId'),
+      JSON_VALUE(src.shipping, '$.address.id')
+    ) AS shipping_address_id,
+    JSON_VALUE(src.soShippingAddress, '$.addressLine1') AS shipping_address_line1,
+    JSON_VALUE(src.soShippingAddress, '$.city') AS shipping_city,
+    JSON_VALUE(src.soShippingAddress, '$.postalCode') AS shipping_postal_code,
+    COALESCE(
+      JSON_VALUE(src.soShippingAddress, '$.countryId'),
+      JSON_VALUE(src.soShippingAddress, '$.country'),
+      JSON_VALUE(src.shipping, '$.address.country.id')
+    ) AS shipping_country,
+
+    COALESCE(JSON_VALUE(src.shippingTerms, '$.id'), JSON_VALUE(src.shipping, '$.terms.id')) AS shipping_terms_id,
+    COALESCE(
+      JSON_VALUE(src.shippingTerms, '$.name'),
+      JSON_VALUE(src.shippingTerms, '$.description'),
+      JSON_VALUE(src.shipping, '$.terms.description')
+    ) AS shipping_terms_description,
+    COALESCE(JSON_VALUE(src.shippingZone, '$.id'), CAST(src.shippingZone AS STRING)) AS shipping_zone_id,
+    COALESCE(JSON_VALUE(src.shipping, '$.rule'), CAST(src.shippingRule AS STRING)) AS shipping_rule,
+    COALESCE(
+      JSON_VALUE(src.shipVia, '$.id'),
+      JSON_VALUE(src.shipping, '$.shipVia.id'),
+      CAST(src.shipVia AS STRING)
+    ) AS ship_via_id,
+    COALESCE(
+      JSON_VALUE(src.shipVia, '$.name'),
+      JSON_VALUE(src.shipVia, '$.description'),
+      JSON_VALUE(src.shipping, '$.shipVia.description')
+    ) AS ship_via_description,
+    COALESCE(
+      JSON_VALUE(src.paymentMethod, '$.id'),
+      JSON_VALUE(src.paymentSettings, '$.paymentMethod.id'),
+      CAST(src.paymentMethod AS STRING)
+    ) AS payment_method_id,
+    COALESCE(
+      JSON_VALUE(src.paymentMethod, '$.name'),
+      JSON_VALUE(src.paymentMethod, '$.description'),
+      JSON_VALUE(src.paymentSettings, '$.paymentMethod.description')
+    ) AS payment_method_name,
+    src.paymentReference AS payment_reference,
+    COALESCE(
+      JSON_VALUE(src.terms, '$.id'),
+      JSON_VALUE(src.financialInformation, '$.terms.id'),
+      CAST(src.terms AS STRING)
+    ) AS credit_terms_id,
+    COALESCE(
+      JSON_VALUE(src.terms, '$.description'),
+      JSON_VALUE(src.financialInformation, '$.terms.description')
+    ) AS credit_terms_description,
+    COALESCE(
+      JSON_VALUE(src.terms, '$.name'),
+      JSON_VALUE(src.terms, '$.description'),
+      JSON_VALUE(src.financialInformation, '$.terms.description')
+    ) AS credit_terms_name,
+    COALESCE(JSON_VALUE(src.paymentSettings, '$.cashAccountId'), CAST(src.cashAccountId AS STRING)) AS cash_account_id,
+    COALESCE(
+      JSON_VALUE(src.intrastatTransactionType, '$.id'),
+      JSON_VALUE(src.shipping, '$.intrastatTransactionType.id')
+    ) AS intrastat_transaction_type_id,
+    COALESCE(
+      JSON_VALUE(src.intrastatTransactionType, '$.description'),
+      JSON_VALUE(src.shipping, '$.intrastatTransactionType.description')
+    ) AS intrastat_transaction_type_description,
+
+    SAFE_CAST(src.orderQty AS FLOAT64) AS header_order_qty,
+    SAFE_CAST(src.orderTotal AS FLOAT64) AS order_total,
+    SAFE_CAST(src.orderTotalInBaseCurrency AS FLOAT64) AS order_total_base,
+    SAFE_CAST(src.discountTotal AS FLOAT64) AS order_discount_total,
+    SAFE_CAST(src.discountTotalInBaseCurrency AS FLOAT64) AS order_discount_total_base,
+    SAFE_CAST(src.taxTotal AS FLOAT64) AS order_tax_total,
+    SAFE_CAST(src.taxTotalInBaseCurrency AS FLOAT64) AS order_tax_total_base,
+    SAFE_CAST(src.vatExemptTotal AS FLOAT64) AS order_vat_exempt_total,
+    SAFE_CAST(src.vatExemptTotalInBaseCurrency AS FLOAT64) AS order_vat_exempt_total_base,
+    SAFE_CAST(src.vatTaxableTotal AS FLOAT64) AS order_vat_taxable_total,
+    SAFE_CAST(src.vatTaxableTotalInBaseCurrency AS FLOAT64) AS order_vat_taxable_total_base,
+    SAFE_CAST(JSON_VALUE(src.totals, '$.taxableTotal') AS FLOAT64) AS order_taxable_total,
+    SAFE_CAST(JSON_VALUE(src.totals, '$.taxableTotalInBaseCurrency') AS FLOAT64) AS order_taxable_total_base,
+    SAFE_CAST(JSON_VALUE(src.totals, '$.taxExemptTotal') AS FLOAT64) AS order_tax_exempt_total,
+    SAFE_CAST(JSON_VALUE(src.totals, '$.taxExemptTotalInBaseCurrency') AS FLOAT64) AS order_tax_exempt_total_base,
+    SAFE_CAST(src.freightTotal AS FLOAT64) AS order_freight_total,
+    SAFE_CAST(src.freightTotalInBaseCurrency AS FLOAT64) AS order_freight_total_base,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.freightCost'), CAST(src.freightCost AS STRING)) AS FLOAT64) AS order_freight_cost,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.freightCostInBaseCurrency'), CAST(src.freightCostInBaseCurrency AS STRING)) AS FLOAT64) AS order_freight_cost_base,
+    SAFE_CAST(src.costTotal AS FLOAT64) AS order_cost_total,
+    SAFE_CAST(src.costTotalInBaseCurrency AS FLOAT64) AS order_cost_total_base,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.unbilledAmount'), CAST(src.unbilledAmount AS STRING)) AS FLOAT64) AS order_unbilled_amount,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.unbilledAmountInBaseCurrency'), CAST(src.unbilledAmountInBaseCurrency AS STRING)) AS FLOAT64) AS order_unbilled_amount_base,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.unshippedAmount'), CAST(src.unshippedAmount AS STRING)) AS FLOAT64) AS order_unshipped_amount,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.unshippedAmountInBaseCurrency'), CAST(src.unshippedAmountInBaseCurrency AS STRING)) AS FLOAT64) AS order_unshipped_amount_base,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.exciseDutyTotal'), CAST(src.exciseDutyTotal AS STRING)) AS FLOAT64) AS order_excise_duty_total,
+    SAFE_CAST(COALESCE(JSON_VALUE(src.totals, '$.exciseDutyTotalInBaseCurrency'), CAST(src.exciseDutyTotalInBaseCurrency AS STRING)) AS FLOAT64) AS order_excise_duty_total_base,
+    JSON_VALUE(src.tax, '$[0].taxId') AS tax_id,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].taxRate') AS FLOAT64) AS tax_rate,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].taxableAmount') AS FLOAT64) AS tax_taxable_amount,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].taxAmount') AS FLOAT64) AS tax_amount,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].exemptTax') AS BOOL) AS tax_is_exempt,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].includeInTaxable') AS BOOL) AS tax_include_in_taxable,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].isPendingTax') AS BOOL) AS tax_is_pending,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].isStatisticalTax') AS BOOL) AS tax_is_statistical,
+    SAFE_CAST(JSON_VALUE(src.tax, '$[0].isReverseTax') AS BOOL) AS tax_is_reverse,
+    JSON_VALUE(src.tax, '$[0].taxType') AS tax_type,
+    SAFE_CAST(src.lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+  FROM base src
+  LEFT JOIN line_order_dates lod
+    ON src.tenantId = lod.tenant_id
+   AND src.orderId = lod.order_id
+  LEFT JOIN source_line_business_unit_choice source_lbc
+    ON src.tenantId = source_lbc.tenant_id
+   AND src.orderId = source_lbc.order_id
+  LEFT JOIN source_material_line_stats source_stats
+    ON src.tenantId = source_stats.tenant_id
+   AND src.orderId = source_stats.order_id
+  LEFT JOIN effective_line_business_unit_choice effective_lbc
+    ON src.tenantId = effective_lbc.tenant_id
+   AND src.orderId = effective_lbc.order_id
+  LEFT JOIN effective_material_line_stats effective_stats
+    ON src.tenantId = effective_stats.tenant_id
+   AND src.orderId = effective_stats.order_id
+  LEFT JOIN material_line_sales_person_choice material_lsp
+    ON src.tenantId = material_lsp.tenant_id
+   AND src.orderId = material_lsp.order_id
+  LEFT JOIN all_line_sales_person_choice all_lsp
+    ON src.tenantId = all_lsp.tenant_id
+   AND src.orderId = all_lsp.order_id
+  LEFT JOIN business_unit_mapping AS mapped_bu
+    ON src.tenantId = mapped_bu.tenant_id
+   AND COALESCE(
+     SAFE_CAST(src.date AS DATE),
+     DATE(SAFE_CAST(src.date AS TIMESTAMP)),
+     lod.line_order_date
+   ) BETWEEN mapped_bu.valid_from AND mapped_bu.valid_to
+   AND (
+     mapped_bu.source_segment_2_value IS NULL
+     OR mapped_bu.source_segment_2_value = COALESCE(effective_lbc.subaccount_seg2, '0')
+   )
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY src.tenantId, src.orderId
+    ORDER BY
+      CASE WHEN mapped_bu.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+      mapped_bu.valid_from DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  organization_name,
+  business_unit_id,
+  business_unit_name,
+  representative_business_unit_id,
+  representative_business_unit_name,
+  source_consistent_business_unit_id,
+  source_consistent_business_unit_name,
+  effective_consistent_business_unit_id,
+  effective_consistent_business_unit_name,
+  line_business_unit_count,
+  has_multiple_line_business_units,
+  effective_line_business_unit_count,
+  has_multiple_effective_line_business_units,
+  source_material_line_count,
+  unresolved_source_material_line_count,
+  effective_material_line_count,
+  unresolved_effective_material_line_count,
+  header_business_unit_selection_method,
+  order_id,
+  order_no,
+  order_type,
+  status,
+  branch_id,
+  branch_name,
+  branch_number,
+  currency_id,
+  currency_name,
+  exchange_rate,
+  customer_id,
+  customer_name,
+  customer_order,
+  customer_ref_no,
+  parent_customer,
+  customer_location_id,
+  customer_tax_zone_id,
+  customer_tax_zone_description,
+  order_date,
+  due_date,
+  request_date,
+  cancel_by_date,
+  invoice_date,
+  scheduled_ship_date,
+  cash_discount_date,
+  post_period,
+  hold,
+  canceled,
+  emailed,
+  invoice_separately,
+  ship_separately,
+  residential_delivery,
+  saturday_delivery,
+  insurance,
+  is_rot_rut_deductible,
+  priority,
+  origin_order_type,
+  origin_order_id,
+  original_order_id,
+  original_order_type,
+  order_description,
+  invoice_id,
+  owner_id,
+  project_id,
+  project_description,
+  project_internal_id,
+  representative_sales_person_id,
+  representative_sales_person_name,
+  sales_person_id,
+  sales_person_name,
+  line_sales_person_count,
+  sales_person_resolution_method,
+  header_location_id,
+  header_warehouse_id,
+  billing_contact_id,
+  billing_contact_name,
+  billing_address_id,
+  billing_address_line1,
+  billing_city,
+  billing_postal_code,
+  billing_country,
+  shipping_contact_id,
+  shipping_contact_name,
+  shipping_address_id,
+  shipping_address_line1,
+  shipping_city,
+  shipping_postal_code,
+  shipping_country,
+  shipping_terms_id,
+  shipping_terms_description,
+  shipping_zone_id,
+  shipping_rule,
+  ship_via_id,
+  ship_via_description,
+  payment_method_id,
+  payment_method_name,
+  payment_reference,
+  credit_terms_id,
+  credit_terms_description,
+  credit_terms_name,
+  cash_account_id,
+  intrastat_transaction_type_id,
+  intrastat_transaction_type_description,
+  header_order_qty,
+  order_total,
+  order_total_base,
+  order_discount_total,
+  order_discount_total_base,
+  order_tax_total,
+  order_tax_total_base,
+  order_vat_exempt_total,
+  order_vat_exempt_total_base,
+  order_vat_taxable_total,
+  order_vat_taxable_total_base,
+  order_taxable_total,
+  order_taxable_total_base,
+  order_tax_exempt_total,
+  order_tax_exempt_total_base,
+  order_freight_total,
+  order_freight_total_base,
+  order_freight_cost,
+  order_freight_cost_base,
+  order_cost_total,
+  order_cost_total_base,
+  order_unbilled_amount,
+  order_unbilled_amount_base,
+  order_unshipped_amount,
+  order_unshipped_amount_base,
+  order_excise_duty_total,
+  order_excise_duty_total_base,
+  tax_id,
+  tax_rate,
+  tax_taxable_amount,
+  tax_amount,
+  tax_is_exempt,
+  tax_include_in_taxable,
+  tax_is_pending,
+  tax_is_statistical,
+  tax_is_reverse,
+  tax_type,
+  last_modified_at
+FROM header_enriched

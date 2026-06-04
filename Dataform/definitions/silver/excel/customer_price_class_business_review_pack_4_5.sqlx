@@ -1,0 +1,152 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "customer_price_class_business_review_pack_4_5",
+  description: "Tight business-review pack for CustomerPriceClass codes 4 and 5. Combines shortlist ranking, observed price-code usage, customerClass overlap by tenant, and concrete customer examples to support manual approval.",
+  tags: ["silver", "excel", "reference", "customer", "pricing", "review"]
+}
+
+WITH target_shortlist AS (
+  SELECT
+    shortlist_rank,
+    shortlist_bucket,
+    shortlist_reason,
+    source_code,
+    raw_rows                                          AS code_raw_rows,
+    distinct_items                                    AS code_distinct_items,
+    sample_items                                      AS code_sample_items,
+    customer_class_overlap_customers                  AS code_overlap_customers,
+    customer_class_overlap_tenants                    AS code_overlap_tenants,
+    review_priority,
+    review_signal
+  FROM ${ref("dw_1_silver_excel", "customer_price_class_review_shortlist")}
+  WHERE source_code IN ('4', '5')
+),
+
+price_usage_by_tenant AS (
+  SELECT
+    priceCode                                          AS source_code,
+    tenantId                                           AS usage_tenant_id,
+    organizationName                                   AS usage_organization_name,
+    COUNT(*)                                           AS usage_raw_rows,
+    COUNT(DISTINCT inventoryId)                        AS usage_distinct_items,
+    ARRAY_TO_STRING(
+      ARRAY_AGG(DISTINCT inventoryId IGNORE NULLS ORDER BY inventoryId LIMIT 15),
+      ' | '
+    )                                                  AS usage_sample_items
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")}
+  WHERE priceType = 'CustomerPriceClass'
+    AND priceCode IN ('4', '5')
+  GROUP BY 1, 2, 3
+),
+
+customer_overlap_examples AS (
+  SELECT
+    customer_class                                     AS source_code,
+    tenant_id,
+    organization_name,
+    customer_id,
+    customer_name
+  FROM ${ref("dw_1_silver_visma", "dim_customer")}
+  WHERE customer_class IN ('4', '5')
+),
+
+customer_overlap_by_tenant AS (
+  SELECT
+    source_code,
+    tenant_id,
+    organization_name,
+    COUNT(*)                                           AS tenant_customer_count,
+    COUNTIF(
+      REGEXP_CONTAINS(LOWER(customer_name), r'(aquatiq|aqua pharma)')
+    )                                                  AS tenant_group_affiliate_customer_count,
+    COUNTIF(
+      NOT REGEXP_CONTAINS(LOWER(customer_name), r'(aquatiq|aqua pharma)')
+    )                                                  AS tenant_non_group_customer_count,
+    ARRAY_TO_STRING(
+      ARRAY_AGG(
+        CONCAT(customer_id, ': ', customer_name)
+        ORDER BY customer_name, customer_id
+        LIMIT 15
+      ),
+      ' | '
+    )                                                  AS tenant_customer_examples,
+    ARRAY_TO_STRING(
+      ARRAY_AGG(customer_name ORDER BY customer_name, customer_id LIMIT 15),
+      ' | '
+    )                                                  AS tenant_customer_names
+  FROM customer_overlap_examples
+  GROUP BY 1, 2, 3
+),
+
+review_pack AS (
+  SELECT
+    s.shortlist_rank,
+    s.shortlist_bucket,
+    s.shortlist_reason,
+    s.review_priority,
+    s.review_signal,
+    s.source_code,
+    CASE
+      WHEN s.source_code = '4'
+        THEN 'Mixed overlap sample across group entities and external customers. Validate whether code 4 is a broad commercial segment rather than one customer family.'
+      WHEN s.source_code = '5'
+        THEN 'Overlap sample is dominated by Aquatiq/Aqua Pharma legal entities. Check whether code 5 represents affiliate or intercompany pricing.'
+      ELSE 'Review manually.'
+    END                                                AS review_hypothesis,
+    s.code_raw_rows,
+    s.code_distinct_items,
+    s.code_sample_items,
+    s.code_overlap_customers,
+    s.code_overlap_tenants,
+    p.usage_tenant_id,
+    p.usage_organization_name,
+    p.usage_raw_rows,
+    p.usage_distinct_items,
+    p.usage_sample_items,
+    c.tenant_id                                        AS overlap_tenant_id,
+    c.organization_name                                AS overlap_organization_name,
+    c.tenant_customer_count,
+    c.tenant_group_affiliate_customer_count,
+    c.tenant_non_group_customer_count,
+    c.tenant_customer_names,
+    c.tenant_customer_examples,
+    DENSE_RANK() OVER (
+      PARTITION BY s.source_code
+      ORDER BY c.tenant_customer_count DESC, c.organization_name
+    )                                                  AS overlap_tenant_rank
+  FROM target_shortlist AS s
+  LEFT JOIN price_usage_by_tenant AS p
+    USING (source_code)
+  LEFT JOIN customer_overlap_by_tenant AS c
+    USING (source_code)
+)
+
+SELECT
+  shortlist_rank,
+  shortlist_bucket,
+  shortlist_reason,
+  review_priority,
+  review_signal,
+  source_code,
+  review_hypothesis,
+  code_raw_rows,
+  code_distinct_items,
+  code_sample_items,
+  code_overlap_customers,
+  code_overlap_tenants,
+  usage_tenant_id,
+  usage_organization_name,
+  usage_raw_rows,
+  usage_distinct_items,
+  usage_sample_items,
+  overlap_tenant_rank,
+  overlap_tenant_id,
+  overlap_organization_name,
+  tenant_customer_count,
+  tenant_group_affiliate_customer_count,
+  tenant_non_group_customer_count,
+  tenant_customer_names,
+  tenant_customer_examples
+FROM review_pack
+ORDER BY shortlist_rank, overlap_tenant_rank, overlap_organization_name

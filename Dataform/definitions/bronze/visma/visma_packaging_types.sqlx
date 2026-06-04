@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_packaging_types",
+  description: "Bronze: Packaging type definitions for shipping from Visma Global API."
+}

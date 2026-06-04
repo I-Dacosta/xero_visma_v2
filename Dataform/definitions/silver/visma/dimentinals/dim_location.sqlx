@@ -1,0 +1,61 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_location",
+  description: "Location master dimension from Visma.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- Silver dimension: Location master data
+-- Source: visma_locations
+-- Why: Referenced by invoices, shipments, purchase orders, and warehouse
+--      operations. Provides address and tax zone context for transactions.
+-- =============================================================================
+
+WITH source_data AS (
+SELECT
+    tenantId                                    AS tenant_id,
+    SAFE_CAST(locationId AS STRING)             AS location_id,
+    locationName                                AS location_name,
+    active                                      AS is_active,
+    address,
+    vatZone                                     AS vat_zone,
+    gln,
+    corporateId                                 AS corporate_id,
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+
+FROM ${ref("visma_locations")}
+WHERE isDeleted = false OR isDeleted IS NULL
+),
+current_tenant_business_unit AS (
+  SELECT
+         tenant_id,
+         business_unit_id,
+         business_unit_name,
+         ROW_NUMBER() OVER (
+           PARTITION BY tenant_id
+           ORDER BY
+             CASE
+               WHEN source_segment_2_value = '0' THEN 1
+               WHEN source_segment_2_value IS NULL THEN 2
+               ELSE 3
+             END,
+             COALESCE(valid_to, DATE '9999-12-31') DESC,
+             valid_from DESC
+         ) AS rn
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+  WHERE CURRENT_DATE() BETWEEN valid_from AND COALESCE(valid_to, DATE '9999-12-31')
+)
+SELECT
+  source_data.*,
+  current_tenant_business_unit.business_unit_id,
+  current_tenant_business_unit.business_unit_name
+FROM source_data
+LEFT JOIN current_tenant_business_unit
+  ON source_data.tenant_id = current_tenant_business_unit.tenant_id
+ AND current_tenant_business_unit.rn = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY source_data.tenant_id, source_data.location_id
+  ORDER BY source_data.last_modified_at DESC, source_data.location_name DESC
+) = 1

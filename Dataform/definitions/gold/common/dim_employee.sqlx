@@ -1,0 +1,32 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_employee",
+  description: "Conformed employee dimension with surrogate key.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+-- =============================================================================
+-- Conformed employee dimension
+-- Source: dw_1_silver_visma.dim_employee
+-- Why: Shared across expense claims, time cards, and project assignments.
+-- =============================================================================
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(business_unit_id AS STRING), '|',
+        CAST(employee_id AS STRING)
+    ))                                          AS employee_key,
+    tenant_id,
+    business_unit_id,
+    employee_id,
+    employee_number,
+    employee_name,
+    status,
+    department_id,
+    branch,
+    last_modified_at,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_employee")}

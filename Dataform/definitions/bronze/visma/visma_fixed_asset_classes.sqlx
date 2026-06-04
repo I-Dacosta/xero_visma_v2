@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_fixed_asset_classes",
+  description: "Bronze: Fixed asset depreciation class configurations from Visma Global API."
+}

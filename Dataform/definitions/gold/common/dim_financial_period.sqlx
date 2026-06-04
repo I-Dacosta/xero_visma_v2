@@ -1,0 +1,36 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_financial_period",
+  description: "Conformed fiscal calendar period dimension.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+-- =============================================================================
+-- Conformed fiscal period dimension
+-- Source: dw_1_silver_visma.dim_financial_period
+-- Why: Links GL transactions, balances, and budgets to fiscal periods.
+--      Supports time-intelligence DAX measures (YTD, MTD, YoY).
+-- =============================================================================
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(business_unit_id AS STRING), '|',
+        CAST(financial_period_id AS STRING)
+    ))                                          AS financial_period_key,
+    tenant_id,
+    business_unit_id,
+    financial_period_id,
+    period_description,
+    start_date,
+    end_date,
+    fiscal_year,
+    fiscal_month,
+    COALESCE(is_closed_in_gl, FALSE) AS is_closed,
+    is_closed_in_gl,
+    is_closed_in_ap,
+    is_closed_in_ar,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_financial_period")}

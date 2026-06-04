@@ -1,0 +1,52 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_contact_group",
+  description: "Silver: Contact group dimension from Xero Accounting API. Grain: one row per tenant_id + contact_group_id (latest record by last_seen_at).",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_contact_group.sqlx
+-- Silver dimension: Contact groups (Xero)
+-- Source:  dw_1_bronze_xero.xero_contact_groups
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + contact_group_id (latest by last_seen_at)
+-- Note:    Contact membership (Contacts[]) is in dim_contact_group_member.
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_contact_groups")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  -- Natural key
+  JSON_VALUE(payload, '$.ContactGroupID')                            AS contact_group_id,
+  record_id                                                           AS contact_group_internal_id,
+
+  -- Attributes
+  JSON_VALUE(payload, '$.Name')                                      AS group_name,
+  JSON_VALUE(payload, '$.Status')                                    AS status,
+  JSON_VALUE(payload, '$.Status') = 'ACTIVE'                        AS is_active,
+
+  -- Member count (detail in dim_contact_group_member)
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.Contacts'))              AS member_count,
+
+  'xero'                                                              AS _source
+
+FROM raw

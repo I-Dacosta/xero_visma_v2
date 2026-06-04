@@ -1,0 +1,79 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_company",
+  description: "Conformed company dimension at legal-entity grain. One row per original Visma tenant, preserving each tenant as its own company independent of business-unit reporting logic.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+WITH main_branch AS (
+  SELECT
+    tenant_id,
+    branch_id,
+    branch_number,
+    branch_name,
+    organization_name,
+    organization_id,
+    corporate_id,
+    vat_registration_id,
+    IFNULL(is_active, FALSE) AS is_active,
+    IFNULL(is_main_branch, FALSE) AS is_main_branch,
+    synced_at
+  FROM ${ref("dw_1_silver_visma", "dim_branch")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id
+    ORDER BY IFNULL(is_main_branch, FALSE) DESC, synced_at DESC, branch_id
+  ) = 1
+),
+entity_reference AS (
+  SELECT
+    tenant_id,
+    ANY_VALUE(company_id) AS company_id,
+    ANY_VALUE(entity_code) AS entity_code,
+    ANY_VALUE(entity_name) AS entity_name,
+    ANY_VALUE(group_name) AS group_name
+  FROM ${ref("dw_1_silver_excel", "seed_entity_mapping")}
+  WHERE tenant_id IS NOT NULL
+  GROUP BY 1
+),
+-- Per-tenant functional currency from Visma organization profile.
+-- Critical input for fact_general_ledger.amount_nok: Visma's pre-booked
+-- debit_amount/credit_amount are denominated in the tenant's baseCurrency,
+-- NOT NOK. Treating SEK or DKK amounts as NOK (the v1 default behaviour
+-- before this fix) silently inflates/deflates consolidated reporting by
+-- 5-9% for the Swedish/Danish entities.
+tenant_base_currency AS (
+  SELECT
+    tenantId AS tenant_id,
+    baseCurrency AS base_currency
+  FROM ${ref("dw_1_bronze_visma", "visma_organizations")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND baseCurrency IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId ORDER BY syncedAt DESC
+  ) = 1
+)
+
+SELECT
+  FARM_FINGERPRINT(CAST(br.tenant_id AS STRING))      AS company_key,
+  br.tenant_id,
+  br.branch_id,
+  br.branch_number,
+  br.branch_name,
+  br.organization_name,
+  br.organization_id,
+  br.corporate_id,
+  br.vat_registration_id,
+  br.is_active,
+  br.is_main_branch,
+  er.company_id,
+  er.entity_code,
+  COALESCE(er.entity_name, br.organization_name)      AS entity_name,
+  er.group_name,
+  COALESCE(tbc.base_currency, 'NOK')                  AS base_currency,
+  'visma' AS source_system
+FROM main_branch AS br
+LEFT JOIN entity_reference AS er
+  ON SUBSTR(br.tenant_id, 1, 8) = er.tenant_id
+LEFT JOIN tenant_base_currency AS tbc
+  ON tbc.tenant_id = br.tenant_id

@@ -1,0 +1,143 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_missing_gl_accounts",
+  description: "Accounts from the conformed account master that do not occur in GL transactions. Includes a flag showing whether the account still appears in GL balances.",
+  tags: ["gold", "common", "dimension", "finance", "exception"]
+}
+
+-- =============================================================================
+-- dim_missing_gl_accounts.sqlx
+-- Gold common dimension: accounts present in account master but absent from GL
+-- Source: dw_1_silver_visma.dim_account
+-- Grain: one row per tenant + account_cd
+-- =============================================================================
+
+WITH account_base AS (
+  SELECT
+    tenant_id,
+    synced_at,
+    organization_name,
+    account_id,
+    account_cd,
+    account_cd_numeric,
+    account_class,
+    account_group_cd,
+    account_type,
+    control_account_module,
+    tax_category,
+    post_option,
+    public_code,
+    public_code_1,
+    account_description,
+    is_active,
+    is_cash_account,
+    allow_manual_entry,
+    use_default_sub,
+    use_default_subaccount,
+    currency_id,
+    account_mapping_profile,
+    last_modified_at,
+    account_code_1,
+    account_code_2,
+    account_code_3,
+    bs_pl,
+    fsli_1,
+    fsli_2,
+    fsli_3,
+    is_ebitda,
+    is_net_income,
+    cf_1,
+    cf_2,
+    cf_3,
+    nwc,
+    capex,
+    intercompany_flag,
+    chart_of_accounts_source,
+    has_chart_of_accounts_mapping,
+    account_mapping_method
+  FROM ${ref("dw_1_silver_visma", "dim_account")}
+),
+gl_transaction_accounts AS (
+  SELECT DISTINCT
+    tenant_id,
+    COALESCE(account_cd, account_id)              AS account_cd
+  FROM ${ref("dw_1_silver_visma", "fact_general_ledger")}
+  WHERE COALESCE(account_cd, account_id) IS NOT NULL
+),
+gl_balance_accounts AS (
+  SELECT DISTINCT
+    tenant_id,
+    COALESCE(account_cd, account_id)              AS account_cd
+  FROM ${ref("dw_1_silver_visma", "fact_general_ledger_balance")}
+  WHERE COALESCE(account_cd, account_id) IS NOT NULL
+)
+
+SELECT
+  CONCAT(
+    CAST(a.tenant_id AS STRING), '|',
+    CAST(a.account_cd AS STRING)
+  )                                               AS account_key,
+
+  FARM_FINGERPRINT(CONCAT(
+    CAST(a.currency_id AS STRING)
+  ))                                              AS currency_key,
+
+  a.tenant_id,
+  a.organization_name,
+  a.account_cd,
+  a.account_cd_numeric,
+  a.account_id                                     AS source_account_id,
+  a.account_description,
+  a.account_class,
+  a.account_group_cd,
+  a.account_type,
+  a.currency_id,
+  a.account_mapping_profile,
+  a.is_active,
+  a.is_cash_account,
+  a.allow_manual_entry,
+  a.use_default_sub,
+  a.use_default_subaccount,
+  a.control_account_module,
+  a.post_option,
+  a.public_code,
+  a.public_code_1,
+  a.tax_category,
+  a.synced_at,
+  a.last_modified_at,
+  a.bs_pl,
+  a.fsli_1,
+  a.fsli_2,
+  a.fsli_3,
+  a.is_ebitda,
+  a.is_net_income,
+  a.cf_1,
+  a.cf_2,
+  a.cf_3,
+  (UPPER(TRIM(COALESCE(a.nwc, ''))) IN ('X', 'TRUE', '1', 'YES'))
+                                                  AS is_nwc,
+  (UPPER(TRIM(COALESCE(a.capex, ''))) IN ('X', 'TRUE', '1', 'YES'))
+                                                  AS is_capex,
+  a.intercompany_flag,
+  a.account_code_1,
+  a.account_code_2,
+  a.account_code_3,
+  a.chart_of_accounts_source,
+  a.has_chart_of_accounts_mapping                 AS has_hierarchy,
+  a.account_mapping_method,
+  FALSE                                           AS has_gl_transactions,
+  (bal.account_cd IS NOT NULL)                    AS has_gl_balance,
+  CASE
+    WHEN bal.account_cd IS NOT NULL THEN 'missing_from_gl_transactions_but_present_in_gl_balance'
+    ELSE 'missing_from_gl_transactions_and_gl_balance'
+  END                                             AS missing_gl_reason,
+  'visma'                                         AS source_system
+FROM account_base AS a
+LEFT JOIN gl_transaction_accounts AS gl
+  ON gl.tenant_id = a.tenant_id
+ AND gl.account_cd = a.account_cd
+LEFT JOIN gl_balance_accounts AS bal
+  ON bal.tenant_id = a.tenant_id
+ AND bal.account_cd = a.account_cd
+WHERE gl.account_cd IS NULL

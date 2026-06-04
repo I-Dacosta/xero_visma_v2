@@ -1,0 +1,57 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_tracking_option",
+  description: "Silver: Tracking category options (values) from Xero Accounting API. Grain: one row per tenant_id + tracking_category_id + tracking_option_id.",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_tracking_option.sqlx
+-- Silver dimension: Tracking category options (Xero)
+-- Source:  dw_1_bronze_xero.xero_tracking_categories (Options[] unnested)
+-- Grain:   one row per tenant_id + tracking_category_id + tracking_option_id
+-- FK refs: tracking_category_id → dw_1_silver_xero.dim_tracking_category
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_tracking_categories")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS tracking_category_id,
+    JSON_VALUE(r.payload, '$.Name') AS category_name,
+    opt
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Options')) AS opt
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  tracking_category_id,
+  category_name,
+
+  JSON_VALUE(opt, '$.TrackingOptionID')                               AS tracking_option_id,
+  JSON_VALUE(opt, '$.Name')                                           AS option_name,
+  JSON_VALUE(opt, '$.Status')                                         AS status,
+  SAFE_CAST(JSON_VALUE(opt, '$.IsActive')   AS BOOL)                  AS is_active,
+  SAFE_CAST(JSON_VALUE(opt, '$.IsArchived') AS BOOL)                  AS is_archived,
+  SAFE_CAST(JSON_VALUE(opt, '$.IsDeleted')  AS BOOL)                  AS is_deleted,
+
+  'xero'                                                              AS _source
+
+FROM unnested
+WHERE SAFE_CAST(JSON_VALUE(opt, '$.IsDeleted') AS BOOL) IS DISTINCT FROM TRUE

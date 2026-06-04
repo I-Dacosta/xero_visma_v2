@@ -1,0 +1,35 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_currency_market_rate",
+  description: "Conformed external market currency-rate reference table from the staging currency feed.",
+  tags: ["gold", "common", "currency", "reference", "market-rate"]
+}
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(from_currency_id AS STRING), '|',
+    CAST(to_currency_id AS STRING), '|',
+    CAST(rate_date AS STRING), '|',
+    CAST(rate_source AS STRING), '|',
+    CAST(is_inverse_rate AS STRING)
+  ))                                                AS currency_market_rate_key,
+
+  FARM_FINGERPRINT(CAST(from_currency_id AS STRING))
+                                                    AS from_currency_key,
+  FARM_FINGERPRINT(CAST(to_currency_id AS STRING))
+                                                    AS to_currency_key,
+
+  from_currency_id,
+  to_currency_id,
+  rate_date,
+  exchange_rate,
+  inverse_exchange_rate,
+  rate_source,
+  source_timestamp,
+  is_inverse_rate,
+  is_latest_rate_for_pair,
+
+  'staging_currency_feed'                           AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_currency_market_rate")}

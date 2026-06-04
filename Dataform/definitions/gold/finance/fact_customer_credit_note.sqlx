@@ -1,0 +1,91 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_customer_credit_note",
+  description: "Customer credit note fact with surrogate keys.",
+  tags: ["gold", "finance", "fact"]
+}
+
+WITH fact_source AS (
+    SELECT
+        FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+        FARM_FINGERPRINT(CONCAT(
+            CAST(f.tenant_id AS STRING), '|',
+            CAST(f.customer_id AS STRING)
+        ))                                          AS customer_key,
+        FARM_FINGERPRINT(CAST(f.document_date AS STRING))
+                                                    AS date_key,
+        FARM_FINGERPRINT(CONCAT(
+            CAST(f.currency_id AS STRING)
+        ))                                          AS currency_key,
+        CASE
+          WHEN f.account_id IS NOT NULL THEN CONCAT(
+            CAST(f.tenant_id AS STRING), '|',
+            CAST(f.account_id AS STRING)
+          )
+        END                                         AS account_key,
+        f.*
+    FROM ${ref("dw_1_silver_visma", "fact_customer_credit_note")} AS f
+),
+enriched AS (
+    SELECT
+        f.*,
+        mr.currency_market_rate_daily_key,
+        mr.market_currency_rate_key,
+        mr.market_rate_date,
+        mr.market_exchange_rate_to_nok,
+        mr.market_inverse_exchange_rate_from_nok,
+        mr.market_rate_source,
+        COALESCE(mr.has_market_rate, FALSE) AS has_market_rate_to_nok,
+        COALESCE(mr.is_rate_filled_forward, FALSE) AS is_market_rate_filled_forward
+    FROM fact_source AS f
+    LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS mr
+        ON mr.date_key = f.date_key
+       AND mr.currency_key = f.currency_key
+)
+
+SELECT
+    company_key,
+    customer_key,
+    date_key,
+    currency_key,
+    account_key,
+    reference_number,
+    document_type,
+    document_date,
+    document_due_date,
+    financial_period,
+    post_period,
+    status,
+    sales_person_id,
+    amount,
+    amount_in_currency,
+    balance,
+    balance_in_currency,
+    vat_total,
+    vat_total_in_currency,
+    detail_total,
+    detail_total_in_currency,
+    discount_total,
+    discount_total_in_currency,
+    exchange_rate,
+    currency_market_rate_daily_key,
+    market_currency_rate_key,
+    market_rate_date,
+    market_exchange_rate_to_nok,
+    market_inverse_exchange_rate_from_nok,
+    market_rate_source,
+    has_market_rate_to_nok,
+    is_market_rate_filled_forward,
+    SAFE_MULTIPLY(amount_in_currency, market_exchange_rate_to_nok)
+                                                    AS amount_in_currency_market_nok,
+    SAFE_MULTIPLY(balance_in_currency, market_exchange_rate_to_nok)
+                                                    AS balance_in_currency_market_nok,
+    SAFE_MULTIPLY(vat_total_in_currency, market_exchange_rate_to_nok)
+                                                    AS vat_total_in_currency_market_nok,
+    SAFE_MULTIPLY(detail_total_in_currency, market_exchange_rate_to_nok)
+                                                    AS detail_total_in_currency_market_nok,
+    SAFE_MULTIPLY(discount_total_in_currency, market_exchange_rate_to_nok)
+                                                    AS discount_total_in_currency_market_nok,
+    'visma' AS source_system
+FROM enriched

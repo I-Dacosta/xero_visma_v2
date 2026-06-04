@@ -1,0 +1,136 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_supplier_invoice",
+  description: "Supplier invoice header fact table with surrogate key FKs.",
+  tags: ["gold", "finance", "fact"]
+}
+
+-- =============================================================================
+-- fact_supplier_invoice.sqlx
+-- Gold finance fact: Supplier invoice headers
+-- Source: dw_1_silver_visma.fact_supplier_invoice
+-- Grain: one row per invoice header
+-- =============================================================================
+
+WITH fact_source AS (
+    SELECT
+        FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+        FARM_FINGERPRINT(CAST(f.date AS STRING))
+                                                    AS date_key,
+        FARM_FINGERPRINT(CONCAT(
+            CAST(f.currency_id AS STRING)
+        ))                                          AS currency_key,
+        f.*
+    FROM ${ref("dw_1_silver_visma", "fact_supplier_invoice")} AS f
+),
+location_strict AS (
+    SELECT
+        tenant_id,
+        business_unit_id,
+        location_id,
+        ANY_VALUE(location_key) AS location_key
+    FROM ${ref("dw_1_gold_common", "dim_location")}
+    GROUP BY 1,2,3
+),
+location_fallback AS (
+    SELECT
+        tenant_id,
+        location_id,
+        ANY_VALUE(location_tenant_key) AS location_tenant_key
+    FROM ${ref("dw_1_gold_common", "dim_location")}
+    GROUP BY 1,2
+),
+enriched AS (
+    SELECT
+        f.*,
+        COALESCE(ls.location_key, lf.location_tenant_key) AS resolved_location_key,
+        mr.currency_market_rate_daily_key,
+        mr.market_currency_rate_key,
+        mr.market_rate_date,
+        mr.market_exchange_rate_to_nok,
+        mr.market_inverse_exchange_rate_from_nok,
+        mr.market_rate_source,
+        COALESCE(mr.has_market_rate, FALSE) AS has_market_rate_to_nok,
+        COALESCE(mr.is_rate_filled_forward, FALSE) AS is_market_rate_filled_forward
+    FROM fact_source AS f
+    LEFT JOIN location_strict AS ls
+        ON f.tenant_id = ls.tenant_id
+     AND f.business_unit_id = ls.business_unit_id
+     AND f.location_id = ls.location_id
+    LEFT JOIN location_fallback AS lf
+        ON f.tenant_id = lf.tenant_id
+     AND f.location_id = lf.location_id
+    LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS mr
+        ON mr.date_key = f.date_key
+       AND mr.currency_key = f.currency_key
+)
+
+SELECT
+    -- Surrogate FKs (conformed dimensions from gold_common)
+    company_key,
+    date_key,
+    currency_key,
+
+    -- Surrogate FK (finance dimension)
+    FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.supplier_id AS STRING)
+    ))                                              AS supplier_key,
+
+    -- Degenerate dimensions
+    f.reference_number,
+    f.document_type,
+    f.date,
+    f.due_date,
+    f.financial_period,
+    f.post_period,
+    f.status,
+    f.supplier_reference,
+    f.approval_status,
+    f.pay_date,
+    f.branch_id,
+    resolved_location_key                             AS location_key,
+    f.location_id                                   AS location,
+    f.credit_terms_id                               AS credit_terms,
+    f.payment_method_id                             AS payment_method,
+
+    -- Measures
+    f.balance,
+    f.balance_in_currency,
+    f.vat_total,
+    f.vat_total_in_currency,
+    f.cash_discount,
+    f.cash_discount_in_currency,
+    f.detail_total,
+    f.detail_total_in_currency,
+    f.discount_total,
+    f.discount_total_in_currency,
+    f.exchange_rate,
+    f.rounding_diff,
+    f.rounding_diff_in_currency,
+    currency_market_rate_daily_key,
+    market_currency_rate_key,
+    market_rate_date,
+    market_exchange_rate_to_nok,
+    market_inverse_exchange_rate_from_nok,
+    market_rate_source,
+    has_market_rate_to_nok,
+    is_market_rate_filled_forward,
+    SAFE_MULTIPLY(f.balance_in_currency, market_exchange_rate_to_nok)
+                                                    AS balance_in_currency_market_nok,
+    SAFE_MULTIPLY(f.vat_total_in_currency, market_exchange_rate_to_nok)
+                                                    AS vat_total_in_currency_market_nok,
+    SAFE_MULTIPLY(f.cash_discount_in_currency, market_exchange_rate_to_nok)
+                                                    AS cash_discount_in_currency_market_nok,
+    SAFE_MULTIPLY(f.detail_total_in_currency, market_exchange_rate_to_nok)
+                                                    AS detail_total_in_currency_market_nok,
+    SAFE_MULTIPLY(f.discount_total_in_currency, market_exchange_rate_to_nok)
+                                                    AS discount_total_in_currency_market_nok,
+    SAFE_MULTIPLY(f.rounding_diff_in_currency, market_exchange_rate_to_nok)
+                                                    AS rounding_diff_in_currency_market_nok,
+
+    'visma' AS source_system
+
+FROM enriched AS f

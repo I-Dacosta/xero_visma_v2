@@ -1,0 +1,44 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_payment_service",
+  description: "Silver: Payment services configured in Xero. Grain: one row per tenant_id + payment_service_id (latest record by last_seen_at). Bronze table currently empty.",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_payment_service.sqlx
+-- Silver dimension: Payment services (Xero)
+-- Source:  dw_1_bronze_xero.xero_payment_services (currently empty)
+-- Grain:   one row per tenant_id + payment_service_id (latest by last_seen_at)
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_payment_services")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.PaymentServiceID')                           AS payment_service_id,
+  record_id                                                            AS payment_service_internal_id,
+  JSON_VALUE(payload, '$.PaymentServiceName')                         AS payment_service_name,
+  JSON_VALUE(payload, '$.PaymentServiceUrl')                          AS payment_service_url,
+  JSON_VALUE(payload, '$.PaymentServiceType')                         AS payment_service_type,
+  JSON_VALUE(payload, '$.PayNowText')                                 AS pay_now_text,
+
+  'xero'                                                              AS _source
+
+FROM raw

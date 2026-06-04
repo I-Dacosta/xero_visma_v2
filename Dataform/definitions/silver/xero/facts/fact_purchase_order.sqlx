@@ -1,0 +1,93 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_purchase_order",
+  description: "Silver: Purchase order headers from Xero Accounting API. Grain: one row per tenant_id + purchase_order_id (latest record by last_seen_at).",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_purchase_order.sqlx
+-- Silver fact: Purchase order headers (Xero)
+-- Source:  dw_1_bronze_xero.xero_purchase_orders
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + purchase_order_id (latest by last_seen_at)
+-- Note:    Date/DateString and UpdatedDateUTC use /Date(ms+0000)/ format.
+-- Note:    LineItems[] → fact_purchase_order_line
+-- FK refs: contact_id        → dw_1_silver_xero.dim_contact
+--          branding_theme_id → dw_1_silver_xero.dim_branding_theme
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_purchase_orders")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.PurchaseOrderID')                            AS purchase_order_id,
+  record_id                                                            AS purchase_order_internal_id,
+  JSON_VALUE(payload, '$.PurchaseOrderNumber')                        AS purchase_order_number,
+  JSON_VALUE(payload, '$.Type')                                       AS purchase_order_type,
+
+  -- Foreign keys
+  JSON_VALUE(payload, '$.Contact.ContactID')                          AS contact_id,
+  JSON_VALUE(payload, '$.Contact.Name')                               AS contact_name,
+  JSON_VALUE(payload, '$.BrandingThemeID')                            AS branding_theme_id,
+
+  -- Status & reference
+  JSON_VALUE(payload, '$.Status')                                     AS status,
+  JSON_VALUE(payload, '$.Reference')                                  AS reference,
+  JSON_VALUE(payload, '$.LineAmountTypes')                            AS line_amount_types,
+
+  -- Delivery info
+  JSON_VALUE(payload, '$.AttentionTo')                                AS attention_to,
+  JSON_VALUE(payload, '$.Telephone')                                  AS telephone,
+  JSON_VALUE(payload, '$.DeliveryAddress')                            AS delivery_address,
+  JSON_VALUE(payload, '$.DeliveryInstructions')                       AS delivery_instructions,
+
+  -- Dates — /Date(ms+0000)/ with DateString companion
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.Date'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS order_date,
+  DATE(PARSE_DATETIME('%Y-%m-%dT%H:%M:%S',
+    JSON_VALUE(payload, '$.DateString')))                             AS order_date_local,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.UpdatedDateUTC'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS updated_at,
+
+  -- Currency
+  JSON_VALUE(payload, '$.CurrencyCode')                               AS currency_code,
+  SAFE_CAST(JSON_VALUE(payload, '$.CurrencyRate') AS FLOAT64)         AS currency_rate,
+
+  -- Amounts
+  SAFE_CAST(JSON_VALUE(payload, '$.SubTotal')  AS FLOAT64)            AS sub_total,
+  SAFE_CAST(JSON_VALUE(payload, '$.TotalTax')  AS FLOAT64)            AS total_tax,
+  SAFE_CAST(JSON_VALUE(payload, '$.Total')     AS FLOAT64)            AS total,
+
+  -- Flags
+  SAFE_CAST(JSON_VALUE(payload, '$.IsDiscounted')   AS BOOL)          AS is_discounted,
+  SAFE_CAST(JSON_VALUE(payload, '$.HasAttachments') AS BOOL)          AS has_attachments,
+  SAFE_CAST(JSON_VALUE(payload, '$.HasErrors')      AS BOOL)          AS has_errors,
+
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.LineItems'))              AS line_item_count,
+
+  'xero'                                                              AS _source
+
+FROM raw

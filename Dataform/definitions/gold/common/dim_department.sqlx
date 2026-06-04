@@ -1,0 +1,25 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_department",
+  description: "Conformed department master data dimension.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(department_id AS STRING)
+    ))                                          AS department_key,
+
+    -- Natural keys
+    tenant_id,
+    department_id,
+
+    -- Attributes
+    department_name,
+    last_modified_at,
+
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_department")}

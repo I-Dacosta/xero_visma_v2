@@ -1,0 +1,68 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_project",
+  description: "Conformed project master data dimension.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(business_unit_id AS STRING), '|',
+        CAST(project_id AS STRING)
+    ))                                          AS project_key,
+
+    -- Natural keys
+    tenant_id,
+    business_unit_id,
+    project_id,
+
+    -- Attributes
+    project_name,
+    status,
+    start_date,
+    end_date,
+    customer,
+    customer_raw,
+    customer_id,
+    customer_name,
+    billing_rule,
+    billing_rule_raw,
+    billing_rule_id,
+    billing_rule_description,
+    billing_rule_active,
+    branch_raw,
+    branch_id,
+    branch_name,
+    customer_location_raw,
+    customer_location_id,
+    customer_location_name,
+    project_manager_raw,
+    project_manager_employee_id,
+    project_manager_employee_number,
+    project_manager_name,
+    project_manager_department,
+    project_manager_status,
+    default_subaccount_raw,
+    default_subaccount_id,
+    template_raw,
+    template_id,
+    template_description,
+    template_status,
+    visibility_raw,
+    visible_in_gl,
+    visible_in_ap,
+    visible_in_ar,
+    visible_in_so,
+    visible_in_po,
+    visible_in_ea,
+    visible_in_ta,
+    visible_in_in,
+    visible_in_ca,
+    visible_in_cr,
+    last_modified_at,
+
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_project")}

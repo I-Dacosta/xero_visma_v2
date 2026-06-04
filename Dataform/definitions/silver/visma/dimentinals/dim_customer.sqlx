@@ -1,0 +1,144 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_customer",
+  description: "Silver: Customer master dimension. Keeps customer grain at tenant plus customer and resolves price class from SalesOrders V3 default location rows when available.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_customer.sqlx
+-- Silver dimension: Customer master data
+-- Source: dw_1_bronze_visma.visma_customers plus visma_customer_locations and
+--         visma_price_classes lookup
+-- Grain: one row per tenantId + customerId (latest non-deleted record)
+-- =============================================================================
+
+WITH latest_customers AS (
+  SELECT *
+  FROM ${ref("dw_1_bronze_visma", "visma_customers")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY tenantId, number
+      ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_customer_locations AS (
+  SELECT
+    tenantId                                                    AS tenant_id,
+    organizationName                                            AS organization_name,
+    syncedAt                                                    AS synced_at,
+    customerId                                                  AS customer_id,
+    locationId                                                  AS location_id,
+    CAST(internalId AS STRING)                                  AS location_internal_id,
+    name                                                        AS location_name,
+    countryId                                                   AS location_country_id,
+    taxRegistrationId                                           AS location_tax_registration_id,
+    corporateId                                                 AS location_corporate_id,
+    warehouseId                                                 AS warehouse_id,
+    priceClassId                                                AS price_class_id
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_locations")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY tenantId, customerId, locationId
+      ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_price_classes AS (
+  SELECT
+    tenantId                                                    AS tenant_id,
+    id                                                          AS price_class_id,
+    description                                                 AS price_class_description
+  FROM ${ref("dw_1_bronze_visma", "visma_price_classes")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, id
+    ORDER BY syncedAt DESC
+  ) = 1
+)
+
+SELECT
+    c.tenantId                                                  AS tenant_id,
+    c.syncedAt                                                  AS synced_at,
+    c.organizationName                                          AS organization_name,
+
+    c.number                                                    AS customer_id,
+    c.id                                                        AS customer_internal_id,
+    CAST(c.internalId AS STRING)                                AS customer_acumatica_id,
+
+    c.name                                                      AS customer_name,
+    COALESCE(c.corporateId, JSON_VALUE(c.defaultLocation, '$.corporateId'))
+                                                                AS corporate_id,
+    c.currencyId                                                AS currency_id,
+    c.salesAccountId                                            AS sales_account_id,
+    c.exportType                                                AS export_type,
+    c.creditLimit                                               AS credit_limit,
+    c.creditDaysPastDue                                         AS credit_days_past_due,
+
+    JSON_VALUE(c.creditTerms, '$.id')                           AS credit_terms,
+    JSON_VALUE(c.creditTerms, '$.description')                  AS credit_terms_description,
+
+    JSON_VALUE(c.customerClass, '$.id')                         AS customer_class,
+    JSON_VALUE(c.customerClass, '$.description')                AS customer_class_description,
+
+    JSON_VALUE(c.defaultLocation, '$.id')                       AS default_location_id,
+    loc.price_class_id                                          AS default_location_price_class_id,
+    CASE
+      WHEN loc.customer_id IS NOT NULL THEN 'v3_customer_locations'
+      ELSE NULL
+    END                                                         AS default_location_price_class_source,
+
+    loc.price_class_id                                          AS source_price_class_id,
+    price_lookup.price_class_description                        AS source_price_class_description,
+
+    customer_class_lookup.price_class_id                        AS customer_class_price_class_lookup_id,
+    customer_class_lookup.price_class_description               AS customer_class_price_class_lookup_description,
+
+    COALESCE(
+      JSON_VALUE(c.location, '$.id'),
+      JSON_VALUE(c.location, '$.locationId'),
+      JSON_VALUE(c.defaultLocation, '$.id')
+    )                                                           AS location_id,
+
+    COALESCE(JSON_VALUE(c.mainAddress, '$.addressLine1'), c.addressLine1)
+                                                                AS main_address_line1,
+    COALESCE(JSON_VALUE(c.mainAddress, '$.addressLine2'), c.addressLine2)
+                                                                AS main_address_line2,
+    JSON_VALUE(c.mainAddress, '$.city')                         AS main_city,
+    COALESCE(JSON_VALUE(c.mainAddress, '$.postalCode'), c.postalCode)
+                                                                AS main_postal_code,
+    JSON_VALUE(c.mainAddress, '$.state')                        AS main_state,
+    COALESCE(
+      JSON_VALUE(c.mainAddress, '$.countryId'),
+      JSON_VALUE(c.mainAddress, '$.country'),
+      c.country
+    )                                                           AS main_country,
+
+    JSON_VALUE(c.mainContact, '$.fullName')                     AS main_contact_name,
+    JSON_VALUE(c.mainContact, '$.email')                        AS main_contact_email,
+    JSON_VALUE(c.mainContact, '$.phone1')                       AS main_contact_phone,
+
+    c.consolidateInvoices                                       AS consolidate_invoices,
+    c.acceptAutoInvoices                                        AS accept_auto_invoices,
+    c.excludeDebtCollection                                     AS exclude_debt_collection,
+    c.invoiceToDefaultLocation                                  AS invoice_to_default_location,
+    c.printInvoices                                             AS print_invoices,
+    c.printStatements                                           AS print_statements,
+    c.printDunningLetters                                       AS print_dunning_letters,
+
+    SAFE_CAST(c.createdDateTime AS TIMESTAMP)                   AS created_at,
+    SAFE_CAST(c.lastModifiedDateTime AS TIMESTAMP)              AS last_modified_at
+
+FROM latest_customers AS c
+LEFT JOIN latest_customer_locations AS loc
+  ON loc.tenant_id = c.tenantId
+ AND loc.customer_id = c.number
+ AND loc.location_id = JSON_VALUE(c.defaultLocation, '$.id')
+LEFT JOIN latest_price_classes AS price_lookup
+  ON price_lookup.tenant_id = c.tenantId
+ AND price_lookup.price_class_id = loc.price_class_id
+LEFT JOIN latest_price_classes AS customer_class_lookup
+  ON customer_class_lookup.tenant_id = c.tenantId
+ AND customer_class_lookup.price_class_id = c.customerClassId

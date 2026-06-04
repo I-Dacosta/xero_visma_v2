@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_time_cards",
+  description: "Bronze: Employee time card entries (employee-scoped) from Visma Global API."
+}

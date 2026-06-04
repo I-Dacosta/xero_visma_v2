@@ -1,0 +1,74 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_sales",
+  name: "fact_shipment_detail_line",
+  description: "Shipment detail line fact with surrogate keys. Maps to Power BI fctShipmentDetailLines.",
+  tags: ["gold", "sales", "fact"]
+}
+
+WITH fact_source AS (
+    SELECT *
+    FROM ${ref("dw_1_silver_visma", "fact_shipment_line")}
+),
+location_strict AS (
+    SELECT
+        tenant_id,
+        business_unit_id,
+        location_id,
+        ANY_VALUE(location_key) AS location_key
+    FROM ${ref("dw_1_gold_common", "dim_location")}
+    GROUP BY 1,2,3
+),
+location_fallback AS (
+    SELECT
+        tenant_id,
+        location_id,
+        ANY_VALUE(location_tenant_key) AS location_tenant_key
+    FROM ${ref("dw_1_gold_common", "dim_location")}
+    GROUP BY 1,2
+)
+
+SELECT
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+
+    FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.shipment_number AS STRING)
+    ))                                              AS shipment_key,
+
+    FARM_FINGERPRINT(CAST(f.shipment_date AS STRING)) AS date_key,
+
+    CASE
+      WHEN f.inventory_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.inventory_id AS STRING)
+      ))
+    END                                             AS item_key,
+
+    FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.warehouse_id AS STRING)
+    ))                                              AS warehouse_key,
+
+    f.shipment_number,
+    f.shipment_type,
+    f.line_nbr,
+    f.line_description,
+    f.unit_of_measure,
+        COALESCE(ls.location_key, lf.location_tenant_key) AS location_key,
+    f.location_id,
+    f.lot_serial_nbr,
+    f.shipped_qty,
+    f.ordered_qty,
+    'visma' AS source_system
+
+FROM fact_source AS f
+LEFT JOIN location_strict AS ls
+    ON f.tenant_id = ls.tenant_id
+ AND f.business_unit_id = ls.business_unit_id
+ AND f.location_id = ls.location_id
+LEFT JOIN location_fallback AS lf
+    ON f.tenant_id = lf.tenant_id
+ AND f.location_id = lf.location_id

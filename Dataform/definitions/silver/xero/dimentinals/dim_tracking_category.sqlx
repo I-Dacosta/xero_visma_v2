@@ -1,0 +1,48 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_tracking_category",
+  description: "Silver: Tracking category dimension from Xero Accounting API. Grain: one row per tenant_id + tracking_category_id (latest record by last_seen_at).",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_tracking_category.sqlx
+-- Silver dimension: Tracking categories (Xero)
+-- Source:  dw_1_bronze_xero.xero_tracking_categories
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + tracking_category_id (latest by last_seen_at)
+-- Note:    Options[] (the values within each category) → dim_tracking_option
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_tracking_categories")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.TrackingCategoryID')                         AS tracking_category_id,
+  record_id                                                            AS tracking_category_internal_id,
+  JSON_VALUE(payload, '$.Name')                                       AS category_name,
+  JSON_VALUE(payload, '$.Status')                                     AS status,
+  JSON_VALUE(payload, '$.Status') = 'ACTIVE'                         AS is_active,
+
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.Options'))                AS option_count,
+
+  'xero'                                                              AS _source
+
+FROM raw

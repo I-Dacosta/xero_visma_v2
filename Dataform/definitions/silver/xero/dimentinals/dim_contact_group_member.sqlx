@@ -1,0 +1,98 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_contact_group_member",
+  description: "Silver: Contact group membership bridge from Xero. Grain: one row per tenant_id + contact_group_id + contact_id. Sources both endpoints for a complete picture.",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_contact_group_member.sqlx
+-- Silver dimension: Contact group membership bridge (Xero)
+-- Sources (UNIONed for completeness — neither endpoint alone is authoritative):
+--   A) dw_1_bronze_xero.xero_contact_groups → Contacts[] per group
+--      (group-centric: which contacts belong to this group)
+--   B) dw_1_bronze_xero.xero_contacts → ContactGroups[] per contact
+--      (contact-centric: which groups this contact belongs to)
+-- Grain:   one row per tenant_id + contact_group_id + contact_id
+--          (UNION DISTINCT deduplicates rows that appear in both endpoints)
+-- FK refs: contact_group_id → dw_1_silver_xero.dim_contact_group
+--          contact_id       → dw_1_silver_xero.dim_contact
+-- =============================================================================
+
+-- Source A: group endpoint — Contacts[] within each ContactGroup record
+WITH groups_raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_contact_groups")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+from_groups AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id                              AS contact_group_id,
+    JSON_VALUE(contact, '$.ContactID')       AS contact_id,
+    JSON_VALUE(contact, '$.Name')            AS contact_name,
+    CAST(NULL AS STRING)                     AS contact_group_name,
+    'xero_contact_groups'                    AS _endpoint
+  FROM groups_raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Contacts')) AS contact
+),
+
+-- Source B: contacts endpoint — ContactGroups[] within each Contact record
+contacts_raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_contacts")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+from_contacts AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    JSON_VALUE(grp, '$.ContactGroupID')      AS contact_group_id,
+    r.record_id                              AS contact_id,
+    JSON_VALUE(r.payload, '$.Name')          AS contact_name,
+    JSON_VALUE(grp, '$.Name')               AS contact_group_name,
+    'xero_contacts'                          AS _endpoint
+  FROM contacts_raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.ContactGroups')) AS grp
+),
+
+-- Combine: prefer the groups endpoint row when both sources have the same pair
+-- (it carries the authoritative group-side view); fill contact_group_name from
+-- the contacts endpoint when the group record didn't include it.
+combined AS (
+  SELECT * FROM from_groups
+  UNION ALL
+  SELECT * FROM from_contacts
+)
+
+SELECT
+  tenant_id,
+  MAX(synced_at)          AS synced_at,
+  contact_group_id,
+  contact_id,
+  -- Take the name from whichever source provided it
+  MAX(contact_name)       AS contact_name,
+  MAX(contact_group_name) AS contact_group_name,
+  'xero'                  AS _source
+FROM combined
+WHERE contact_group_id IS NOT NULL
+  AND contact_id       IS NOT NULL
+GROUP BY tenant_id, contact_group_id, contact_id

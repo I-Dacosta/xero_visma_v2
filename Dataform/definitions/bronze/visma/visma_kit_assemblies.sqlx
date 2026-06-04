@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_kit_assemblies",
+  description: "Bronze: Kit assembly records with component details from Visma Global API."
+}

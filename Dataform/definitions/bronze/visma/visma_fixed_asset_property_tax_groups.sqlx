@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_fixed_asset_property_tax_groups",
+  description: "Bronze: Fixed asset property tax group definitions from Visma Global API."
+}

@@ -1,0 +1,63 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_batch_payment_line",
+  description: "Silver: Individual payments within a Xero batch payment. Grain: one row per tenant_id + batch_payment_id + payment_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_batch_payment_line.sqlx
+-- Silver fact: Batch payment lines (Xero)
+-- Source:  dw_1_bronze_xero.xero_batch_payments (Payments[] array unnested)
+-- Grain:   one row per tenant_id + batch_payment_id + payment_id
+-- FK refs: batch_payment_id → dw_1_silver_xero.fact_batch_payment
+--          invoice_id      → dw_1_silver_xero.fact_invoice (future)
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_batch_payments")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id                                                               AS batch_payment_id,
+    pmt
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Payments')) AS pmt
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  batch_payment_id,
+
+  -- Natural key for this line
+  JSON_VALUE(pmt, '$.PaymentID')                                             AS payment_id,
+
+  -- Foreign key to invoice dimension
+  JSON_VALUE(pmt, '$.Invoice.InvoiceID')                                     AS invoice_id,
+  JSON_VALUE(pmt, '$.Invoice.CurrencyCode')                                  AS invoice_currency_code,
+
+  -- Amounts
+  SAFE_CAST(JSON_VALUE(pmt, '$.Amount')     AS FLOAT64)                      AS amount,
+  SAFE_CAST(JSON_VALUE(pmt, '$.BankAmount') AS FLOAT64)                      AS bank_amount,
+
+  -- Invoice flags
+  SAFE_CAST(JSON_VALUE(pmt, '$.Invoice.HasErrors')    AS BOOL)               AS invoice_has_errors,
+  SAFE_CAST(JSON_VALUE(pmt, '$.Invoice.IsDiscounted') AS BOOL)               AS invoice_is_discounted,
+
+  'xero'                                                                      AS _source
+
+FROM unnested

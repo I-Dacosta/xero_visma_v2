@@ -1,0 +1,111 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_general_ledger_balance",
+  description: "General ledger balance fact at period and account grain. Includes period balances in local currency and NOK for finance statement and trend reporting.",
+  tags: ["gold", "finance", "fact"]
+}
+
+-- =============================================================================
+-- Gold finance fact: GL period balances
+-- Source: dw_1_silver_visma.fact_general_ledger_balance
+-- Grain: one row per account/subaccount/branch/ledger/period/currency
+-- Key rule: account_key is the readable tenant|account_cd key used in Power BI
+-- =============================================================================
+
+WITH balance_base AS (
+  SELECT
+    f.*,
+    SAFE.PARSE_DATE('%Y%m', f.financial_period) AS accounting_period_date
+  FROM ${ref("dw_1_silver_visma", "fact_general_ledger_balance")} AS f
+),
+fact_source AS (
+  SELECT
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+    FARM_FINGERPRINT(CONCAT(
+      CAST(f.currency_id AS STRING)
+    ))                                            AS currency_key,
+    CASE
+      WHEN COALESCE(f.account_cd, f.account_id) IS NOT NULL THEN CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(COALESCE(f.account_cd, f.account_id) AS STRING)
+      )
+    END                                           AS account_key,
+    f.*
+  FROM balance_base AS f
+),
+enriched AS (
+  SELECT
+    f.*,
+    bu.business_unit_key,
+    bu.entity_code,
+    bu.business_unit_name                         AS dim_business_unit_name,
+    bu.group_name,
+    mr.currency_market_rate_daily_key,
+    mr.market_currency_rate_key,
+    mr.market_rate_date,
+    mr.market_exchange_rate_to_nok,
+    mr.market_inverse_exchange_rate_from_nok,
+    mr.market_rate_source,
+    COALESCE(mr.has_market_rate, FALSE)           AS has_market_rate_to_nok,
+    COALESCE(mr.is_rate_filled_forward, FALSE)    AS is_market_rate_filled_forward
+  FROM fact_source AS f
+  LEFT JOIN ${ref("dw_1_silver_visma", "dim_business_unit")} AS bu
+    ON  bu.tenant_id        = f.tenant_id
+    AND bu.business_unit_id = f.business_unit_id
+    AND f.accounting_period_date >= bu.bu_valid_from
+    AND (bu.bu_valid_to IS NULL OR f.accounting_period_date <= bu.bu_valid_to)
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS mr
+    ON mr.currency_key = f.currency_key
+   AND mr.calendar_date = f.accounting_period_date
+)
+
+SELECT
+  company_key,
+  currency_key,
+  account_key,
+  tenant_id,
+  business_unit_id,
+  COALESCE(account_cd, account_id)                AS account_cd,
+  account_type,
+  subaccount_id,
+  subaccount_cd,
+  branch_id,
+  ledger,
+  currency_id,
+  financial_period,
+  accounting_period_date,
+  balance_type,
+  year_closed,
+  beginning_balance,
+  beginning_balance_currency,
+  ptd_debit,
+  ptd_debit_currency,
+  ptd_credit,
+  ptd_credit_currency,
+  ytd_balance,
+  ytd_balance_currency,
+  last_modified_at,
+  currency_market_rate_daily_key,
+  market_currency_rate_key,
+  market_rate_date,
+  market_exchange_rate_to_nok,
+  market_inverse_exchange_rate_from_nok,
+  market_rate_source,
+  has_market_rate_to_nok,
+  is_market_rate_filled_forward,
+  SAFE_MULTIPLY(beginning_balance_currency, market_exchange_rate_to_nok)
+                                                  AS beginning_balance_currency_market_nok,
+  SAFE_MULTIPLY(ptd_debit_currency, market_exchange_rate_to_nok)
+                                                  AS ptd_debit_currency_market_nok,
+  SAFE_MULTIPLY(ptd_credit_currency, market_exchange_rate_to_nok)
+                                                  AS ptd_credit_currency_market_nok,
+  SAFE_MULTIPLY(ytd_balance_currency, market_exchange_rate_to_nok)
+                                                  AS ytd_balance_currency_market_nok,
+  business_unit_key,
+  entity_code,
+  COALESCE(dim_business_unit_name, business_unit_name)
+                                                  AS business_unit_name,
+  group_name,
+  'visma' AS source_system
+FROM enriched

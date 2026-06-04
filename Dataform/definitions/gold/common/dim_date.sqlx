@@ -1,0 +1,35 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_date",
+  description: "Conformed date dimension (generated date spine 2020-2030).",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+WITH date_spine AS (
+    SELECT
+        date_day
+    FROM
+        UNNEST(GENERATE_DATE_ARRAY('2020-01-01', '2030-12-31')) AS date_day
+)
+
+SELECT
+    FARM_FINGERPRINT(CAST(date_day AS STRING))  AS date_key,
+    date_day,
+    EXTRACT(YEAR FROM date_day)                 AS year,
+    EXTRACT(QUARTER FROM date_day)              AS quarter,
+    EXTRACT(MONTH FROM date_day)                AS month,
+    FORMAT_DATE('%B', date_day)                 AS month_name,
+    EXTRACT(DAY FROM date_day)                  AS day_of_month,
+    EXTRACT(DAYOFWEEK FROM date_day)            AS day_of_week,
+    FORMAT_DATE('%A', date_day)                 AS day_name,
+    EXTRACT(ISOWEEK FROM date_day)             AS week_of_year,
+    EXTRACT(DAYOFWEEK FROM date_day) IN (1, 7)  AS is_weekend,
+    FORMAT_DATE('%Y-%m', date_day)              AS year_month,
+
+    -- Fiscal calendar (assumes fiscal year = calendar year)
+    EXTRACT(YEAR FROM date_day)                 AS fiscal_year,
+    EXTRACT(QUARTER FROM date_day)              AS fiscal_quarter,
+    FORMAT_DATE('%Y%m', date_day)               AS fiscal_period
+
+FROM date_spine

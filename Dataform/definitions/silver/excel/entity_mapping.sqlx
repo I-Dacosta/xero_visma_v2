@@ -1,0 +1,107 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "entity_mapping",
+  description: "Cleaned and typed entity mapping. Primary source: reference_data.xlsx via bronze (pre-deduplicated via MERGE). Fallback: seed data for bootstrap.",
+  tags: ["silver", "excel", "reference"],
+//  assertions: {
+//    nonNull: ["company_id", "entity_code"],
+//    uniqueKey: ["company_id"]
+//  }
+}
+
+-- Primary source: Excel data ingested through bronze (pre-deduplicated via MERGE)
+WITH 
+bronze_data AS (
+  SELECT
+    SAFE_CAST(r.company_id AS INT64) AS company_id,
+    UPPER(TRIM(SAFE_CAST(r.entity_code AS STRING))) AS entity_code,
+    SAFE_CAST(r.entity_name AS STRING) AS entity_name,
+    SAFE_CAST(r.business_unit_code AS STRING) AS business_unit_code,
+    SAFE_CAST(r.business_unit_name AS STRING) AS business_unit_name,
+    SAFE_CAST(r.group_name AS STRING) AS group_name,
+    COALESCE(m.tenant_id, SAFE_CAST(r.company_id AS STRING)) AS tenant_id,
+    CAST(NULL AS DATE) AS entity_valid_to,
+    'bronze' AS _source
+  FROM ${ref("dw_1_bronze_excel", "raw_entity_mapping")} r
+  LEFT JOIN (
+    SELECT DISTINCT company_id, tenant_id
+    FROM ${ref("dw_1_silver_excel", "seed_entity_mapping")}
+    WHERE company_id IS NOT NULL
+  ) m ON SAFE_CAST(r.company_id AS INT64) = m.company_id
+  WHERE r.company_id IS NOT NULL AND TRIM(r.company_id) != ''
+--    AND COALESCE(r.deleted, '0') != '1'
+),
+
+-- Fallback: seed data for keys not yet in bronze
+seed_rows AS (
+  SELECT
+    company_id,
+    entity_code,
+    entity_name,
+    business_unit_code,
+    business_unit_name,
+    group_name,
+    tenant_id,
+    entity_valid_to,
+    'seed' AS _source
+  FROM ${ref("dw_1_silver_excel", "seed_entity_mapping")}
+),
+
+bronze_entity_code_keys AS (
+  SELECT DISTINCT UPPER(TRIM(COALESCE(entity_code, ''))) AS entity_code_key
+  FROM bronze_data
+),
+
+bronze_entity_name_keys AS (
+  SELECT DISTINCT UPPER(TRIM(COALESCE(entity_name, ''))) AS entity_name_key
+  FROM bronze_data
+),
+
+bronze_company_id_keys AS (
+  SELECT DISTINCT company_id
+  FROM bronze_data
+  WHERE company_id IS NOT NULL
+),
+
+seed_data AS (
+  SELECT s.*
+  FROM seed_rows AS s
+  LEFT JOIN bronze_entity_code_keys AS bec
+    ON UPPER(TRIM(COALESCE(s.entity_code, ''))) = bec.entity_code_key
+  LEFT JOIN bronze_entity_name_keys AS ben
+    ON UPPER(TRIM(COALESCE(s.entity_name, ''))) = ben.entity_name_key
+  LEFT JOIN bronze_company_id_keys AS bci
+    ON s.company_id = bci.company_id
+  WHERE bec.entity_code_key IS NULL
+    AND ben.entity_name_key IS NULL
+    AND bci.company_id IS NULL  -- exclude entire company_id already covered by bronze
+)
+
+SELECT
+  company_id,
+  entity_code,
+  entity_name,
+  business_unit_code,
+  business_unit_name,
+  group_name,
+  tenant_id,
+  entity_valid_to,
+  CURRENT_TIMESTAMP() AS _loaded_at,
+  _source
+FROM bronze_data
+
+UNION ALL
+
+SELECT
+  company_id,
+  entity_code,
+  entity_name,
+  business_unit_code,
+  business_unit_name,
+  group_name,
+  tenant_id,
+  entity_valid_to,
+  CURRENT_TIMESTAMP() AS _loaded_at,
+  _source
+FROM seed_data

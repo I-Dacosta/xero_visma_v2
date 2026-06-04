@@ -1,0 +1,27 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "seed_global_account_mapping_scope",
+  description: "Organizations covered by the global NO/SE/DK Visma account mapping extracted from Group mapping (kun NO, SE, DK pr 2304).xlsx.",
+  tags: ["seed", "silver", "excel", "finance", "reference"]
+}
+
+-- Source: Group mapping (kun NO, SE, DK pr 2304).xlsx
+-- Sheet: NO
+-- Scope rule: distinct company names covered by the shared cross-tenant mapping.
+
+SELECT *
+FROM UNNEST([
+  STRUCT('NO_SE_DK' AS mapping_scope, 'Aquatiq AS' AS organization_name, 'NO' AS country_code),
+  STRUCT('NO_SE_DK', 'Aquatiq Food Factory AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Aquatiq Hygiene Systems AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Aqua Pharma Group AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Aqua Pharma AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Sensilist AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Aquatiq Sense AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Consult AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Aquatiq Group AS', 'NO'),
+  STRUCT('NO_SE_DK', 'Aquatiq AB', 'SE'),
+  STRUCT('NO_SE_DK', 'Aquatiq Food Automation ApS', 'DK'),
+  STRUCT('NO_SE_DK', 'Aquatiq Aps', 'DK')
+])

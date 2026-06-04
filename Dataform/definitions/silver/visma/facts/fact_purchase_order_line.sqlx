@@ -1,0 +1,156 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_purchase_order_line",
+  description: "Purchase order lines flattened from JSON. Grain: one row per PO line (tenant + orderNbr + lineNbr).",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Purchase order lines (flattened from JSON array)
+-- Source: visma_purchase_orders -> lines (JSON string)
+-- Grain: one row per PO line (tenant + orderType + orderNbr + lineNbr)
+-- Why: Maps to Power BI fctPurchaseOrderLineExt. Supports PO quantity,
+--      amount, and received-vs-ordered analysis.
+-- =============================================================================
+
+WITH subaccount_dim AS (
+  SELECT
+    tenant_id,
+    subaccount_id,
+    segment2 AS segment2_value
+  FROM ${ref("dw_1_silver_visma", "dim_subaccount")}
+),
+
+business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+  SELECT
+      h.tenantId                                          AS tenant_id,
+      CAST(NULL AS STRING)                                AS raw_business_unit_id,
+      CAST(NULL AS STRING)                                AS business_unit_id,
+      h.orderNbr                                          AS order_nbr,
+      h.orderType                                         AS order_type,
+      h.supplier                                          AS supplier,
+      SAFE_CAST(COALESCE(
+        JSON_VALUE(h.supplier, '$.number'),
+        JSON_VALUE(h.supplier, '$.id'),
+        JSON_VALUE(h.supplier, '$.internalId')
+      ) AS STRING)                                        AS supplier_id,
+      JSON_VALUE(h.supplier, '$.name')                    AS supplier_name,
+      h.currency                                          AS currency_id,
+      COALESCE(
+        SAFE_CAST(h.date AS DATE),
+        DATE(SAFE_CAST(h.date AS TIMESTAMP))
+      ) AS order_date,
+
+      -- Line dimension FKs
+      COALESCE(
+        JSON_VALUE(line, '$.inventory.number'),
+        JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.number'),
+        JSON_VALUE(line, '$.inventory.id'),
+        JSON_VALUE(line, '$."inventory.id"'),
+        JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.id'),
+        JSON_VALUE(line, '$.inventoryId')
+      ) AS inventory_id,
+      COALESCE(JSON_VALUE(line, '$.warehouse.id'), JSON_VALUE(line, '$."warehouse.id"'), JSON_VALUE(JSON_VALUE(line, '$.warehouse'), '$.id'), JSON_VALUE(line, '$.warehouse')) AS warehouse_id,
+      COALESCE(JSON_VALUE(line, '$.account.id'), JSON_VALUE(line, '$."account.id"'), JSON_VALUE(JSON_VALUE(line, '$.account'), '$.id'), JSON_VALUE(line, '$.account')) AS account_id,
+      COALESCE(
+        JSON_VALUE(line, '$.subaccount.id'),
+        JSON_VALUE(line, '$."subaccount.id"'),
+        JSON_VALUE(JSON_VALUE(line, '$.subaccount'), '$.id'),
+        JSON_VALUE(line, '$.subaccount'),
+        JSON_VALUE(line, '$.sub.subaccountNumber'),
+        JSON_VALUE(line, '$.sub.subaccountId'),
+        JSON_VALUE(JSON_VALUE(line, '$.sub'), '$.subaccountNumber')
+      ) AS subaccount_id,
+      COALESCE(
+        JSON_VALUE(line, '$.sub.segments[1].segmentValue'),
+        JSON_VALUE(line, '$.subaccount.segments[1].segmentValue'),
+        JSON_VALUE(line, '$.subaccount.2')
+      ) AS raw_segment_2_value,
+      COALESCE(JSON_VALUE(line, '$.project.id'), JSON_VALUE(line, '$."project.id"'), JSON_VALUE(JSON_VALUE(line, '$.project'), '$.id'), JSON_VALUE(line, '$.project')) AS project_id,
+
+      -- Degenerate dimensions
+      COALESCE(JSON_VALUE(line, '$.lineNbr'), JSON_VALUE(line, '$.lineNumber'), JSON_VALUE(line, '$.sortOrder')) AS line_nbr,
+      JSON_VALUE(line, '$.lineType')                       AS line_type,
+      COALESCE(
+        JSON_VALUE(line, '$.lineDescription'),
+        JSON_VALUE(line, '$.description'),
+        JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.description')
+      ) AS line_description,
+      COALESCE(JSON_VALUE(line, '$.uom'), JSON_VALUE(line, '$.uoM'), JSON_VALUE(line, '$.unitOfMeasure')) AS unit_of_measure,
+      COALESCE(
+        SAFE_CAST(JSON_VALUE(line, '$.promisedDate') AS DATE),
+        DATE(SAFE_CAST(JSON_VALUE(line, '$.promisedDate') AS TIMESTAMP))
+      ) AS promised_date,
+      COALESCE(
+        SAFE_CAST(JSON_VALUE(line, '$.requestedDate') AS DATE),
+        DATE(SAFE_CAST(JSON_VALUE(line, '$.requestedDate') AS TIMESTAMP))
+      ) AS requested_date,
+      JSON_VALUE(line, '$.completed')                      AS is_completed,
+
+      -- Measures
+      SAFE_CAST(JSON_VALUE(line, '$.orderQty') AS NUMERIC)        AS order_qty,
+      SAFE_CAST(JSON_VALUE(line, '$.receivedQty') AS NUMERIC)     AS received_qty,
+      SAFE_CAST(JSON_VALUE(line, '$.openQty') AS NUMERIC)         AS open_qty,
+      SAFE_CAST(JSON_VALUE(line, '$.unitCost') AS NUMERIC)        AS unit_cost,
+      SAFE_CAST(JSON_VALUE(line, '$.unitCostInBaseCurrency') AS NUMERIC) AS unit_cost_base,
+      SAFE_CAST(COALESCE(JSON_VALUE(line, '$.amount'), JSON_VALUE(line, '$.extCost')) AS NUMERIC) AS amount,
+      SAFE_CAST(JSON_VALUE(line, '$.amountInBaseCurrency') AS NUMERIC) AS amount_base,
+      SAFE_CAST(JSON_VALUE(line, '$.discountPercent') AS NUMERIC) AS discount_percent
+  FROM ${ref("visma_purchase_orders")} AS h
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.lines)) AS line
+  WHERE h.isDeleted = false OR h.isDeleted IS NULL
+),
+
+enriched AS (
+  SELECT
+    src.*,
+    COALESCE(src.raw_segment_2_value, subaccount_dim.segment2_value) AS source_segment_2_value,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    CASE
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value IS NOT NULL THEN 'subaccount_segment2_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value = '0' THEN 'segment_zero_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'unresolved'
+    END AS business_unit_resolution_method,
+    ROW_NUMBER() OVER (
+      PARTITION BY src.tenant_id, src.order_type, src.order_nbr, src.line_nbr, src.inventory_id
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        business_unit_mapping.valid_from DESC,
+        COALESCE(src.amount, 0) DESC,
+        COALESCE(src.order_qty, 0) DESC
+    ) AS bu_match_rank
+  FROM source_data AS src
+  LEFT JOIN subaccount_dim
+    ON src.tenant_id = subaccount_dim.tenant_id
+   AND src.subaccount_id = subaccount_dim.subaccount_id
+  LEFT JOIN business_unit_mapping
+    ON src.tenant_id = business_unit_mapping.tenant_id
+   AND src.order_date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = COALESCE(src.raw_segment_2_value, subaccount_dim.segment2_value, '0')
+   )
+)
+
+SELECT
+  enriched.* EXCEPT (business_unit_id, mapped_bu_id, mapped_bu_name, bu_match_rank),
+  COALESCE(enriched.mapped_bu_id, enriched.business_unit_id) AS business_unit_id,
+  enriched.mapped_bu_name AS business_unit_name
+FROM enriched
+WHERE bu_match_rank = 1

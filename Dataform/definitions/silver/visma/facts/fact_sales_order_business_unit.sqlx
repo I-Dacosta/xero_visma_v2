@@ -1,0 +1,72 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_sales_order_business_unit",
+  description: "Silver: Sales order split by source line business unit. Aggregates sales order lines to one row per tenant + order + source BU.",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- Grain:
+--   one row per tenant_id + order_id + source line business_unit_id.
+--
+-- Purpose:
+--   exposes how mixed orders split across source BUs without forcing a single
+--   BU onto the header row.
+
+SELECT
+  hdr.tenant_id,
+  hdr.synced_at,
+  hdr.organization_name,
+  hdr.order_id,
+  hdr.order_no,
+  hdr.order_type,
+  hdr.status,
+  hdr.order_date,
+  hdr.customer_id,
+  hdr.customer_name,
+  hdr.branch_id,
+  hdr.header_warehouse_id,
+
+  line.business_unit_id,
+  line.business_unit_name,
+
+  hdr.line_business_unit_count AS source_line_business_unit_count,
+  hdr.has_multiple_line_business_units AS has_multiple_source_line_business_units,
+  hdr.effective_line_business_unit_count,
+  hdr.has_multiple_effective_line_business_units,
+  hdr.header_business_unit_selection_method,
+
+  COUNT(*) AS line_count,
+  COUNTIF(line.line_is_material) AS material_line_count,
+  COUNTIF(line.line_is_zero_value) AS zero_value_line_count,
+  COUNTIF(line.line_business_unit_strategy = 'allocate_to_material_goods_bu') AS ancillary_line_count,
+  COUNTIF(line.line_business_unit_strategy = 'source_subaccount' AND line.line_is_material) AS core_material_line_count,
+
+  SUM(COALESCE(line.line_order_qty, 0.0)) AS line_order_qty,
+  SUM(COALESCE(line.line_amount, 0.0)) AS line_amount,
+  SUM(COALESCE(line.line_discount_amount, 0.0)) AS line_discount_amount,
+  SUM(COALESCE(line.amount_not_invoiced, 0.0)) AS amount_not_invoiced
+FROM ${ref("dw_1_silver_visma", "fact_sales_order_line")} AS line
+INNER JOIN ${ref("dw_1_silver_visma", "fact_sales_order")} AS hdr
+  ON line.tenant_id = hdr.tenant_id
+ AND line.order_id = hdr.order_id
+GROUP BY
+  hdr.tenant_id,
+  hdr.synced_at,
+  hdr.organization_name,
+  hdr.order_id,
+  hdr.order_no,
+  hdr.order_type,
+  hdr.status,
+  hdr.order_date,
+  hdr.customer_id,
+  hdr.customer_name,
+  hdr.branch_id,
+  hdr.header_warehouse_id,
+  line.business_unit_id,
+  line.business_unit_name,
+  hdr.line_business_unit_count,
+  hdr.has_multiple_line_business_units,
+  hdr.effective_line_business_unit_count,
+  hdr.has_multiple_effective_line_business_units,
+  hdr.header_business_unit_selection_method

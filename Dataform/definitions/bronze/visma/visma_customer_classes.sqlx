@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_customer_classes",
+  description: "Bronze: Customer segmentation class definitions from Visma Global API."
+}

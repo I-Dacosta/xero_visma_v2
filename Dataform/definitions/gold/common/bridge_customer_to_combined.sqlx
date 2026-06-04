@@ -1,0 +1,123 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "bridge_customer_to_combined",
+  description: "Bridge from tenant-scoped finance customers to the cross-tenant combined customer dimension.",
+  tags: ["gold", "common", "bridge", "customer", "conformed"]
+}
+
+WITH base_customers AS (
+  SELECT
+    customer_key,
+    tenant_id,
+    customer_id,
+    organization_name,
+    customer_name,
+    corporate_id,
+    main_country,
+    price_class_id,
+    price_class_description,
+    CASE
+      WHEN corporate_id IS NULL THEN NULL
+      ELSE NULLIF(
+        UPPER(REGEXP_REPLACE(TRIM(corporate_id), r'[^A-Z0-9]', '')),
+        ''
+      )
+    END                                                   AS corporate_id_norm_raw,
+    NULLIF(
+      UPPER(REGEXP_REPLACE(TRIM(customer_name), r'[^A-Z0-9]', '')),
+      ''
+    )                                                      AS customer_name_norm,
+    NULLIF(UPPER(TRIM(main_country)), '')                  AS main_country_norm
+  FROM ${ref("dw_1_gold_finance", "dim_customer")}
+),
+
+normalized_customers AS (
+  SELECT
+    customer_key,
+    tenant_id,
+    customer_id,
+    organization_name,
+    customer_name,
+    corporate_id,
+    main_country,
+    price_class_id,
+    price_class_description,
+    CASE
+      WHEN corporate_id_norm_raw IN (
+        '0', '00', '000000000', '0000000000', '999999999', '9999999999',
+        'NULL', 'NONE', 'NAN'
+      ) THEN NULL
+      ELSE corporate_id_norm_raw
+    END                                                   AS corporate_id_norm,
+    customer_name_norm,
+    main_country_norm
+  FROM base_customers
+),
+
+bridge_base AS (
+  SELECT
+    customer_key,
+    tenant_id,
+    customer_id,
+    organization_name,
+    customer_name,
+    corporate_id,
+    main_country,
+    price_class_id,
+    price_class_description,
+    corporate_id_norm,
+    customer_name_norm,
+    main_country_norm,
+    CASE
+      WHEN corporate_id_norm IS NOT NULL THEN 'corporate_id'
+      WHEN customer_name_norm IS NOT NULL
+       AND main_country_norm IS NOT NULL THEN 'name_country'
+      ELSE 'tenant_customer'
+    END                                                   AS combined_match_method,
+    CASE
+      WHEN corporate_id_norm IS NOT NULL THEN corporate_id_norm
+      WHEN customer_name_norm IS NOT NULL
+       AND main_country_norm IS NOT NULL THEN CONCAT(
+         main_country_norm, '|', customer_name_norm
+       )
+      ELSE CONCAT(tenant_id, '|', customer_id)
+    END                                                   AS combined_match_value
+  FROM normalized_customers
+)
+
+SELECT
+  b.customer_key,
+  b.tenant_id,
+  b.customer_id,
+  b.organization_name,
+  b.customer_name,
+  b.corporate_id,
+  b.corporate_id_norm,
+  b.main_country,
+  b.main_country_norm,
+  b.customer_name_norm,
+  b.price_class_id,
+  b.price_class_description,
+  CONCAT(b.combined_match_method, '|', b.combined_match_value)
+                                                          AS customer_combined_key,
+  b.combined_match_method,
+  b.combined_match_value,
+  CASE b.combined_match_method
+    WHEN 'corporate_id' THEN 'high'
+    WHEN 'name_country' THEN 'medium'
+    ELSE 'low'
+  END                                                     AS combined_match_confidence,
+  dc.tenant_count                                         AS combined_tenant_count,
+  dc.customer_reference_count                             AS combined_customer_reference_count,
+  dc.distinct_price_class_count                           AS combined_distinct_price_class_count,
+  dc.unified_price_class_id                               AS combined_unified_price_class_id,
+  dc.unified_price_class_description                      AS combined_unified_price_class_description,
+  dc.is_cross_tenant_customer,
+  dc.has_safe_unified_price_class,
+  'visma'                                                 AS source_system
+FROM bridge_base AS b
+JOIN ${ref("dw_1_gold_common", "dim_customer_combined")} AS dc
+  ON dc.customer_combined_key = CONCAT(
+    b.combined_match_method, '|', b.combined_match_value
+  )

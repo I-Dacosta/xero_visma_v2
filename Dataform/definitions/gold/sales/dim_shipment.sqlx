@@ -1,0 +1,40 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_sales",
+  name: "dim_shipment",
+  description: "Shipment header dimension for the sales star schema. Maps to Power BI dimShipment.",
+  tags: ["gold", "sales", "dimension"]
+}
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.shipment_number AS STRING)
+    ))                                              AS shipment_key,
+
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+
+    FARM_FINGERPRINT(CAST(f.shipment_date AS STRING)) AS date_key,
+
+    f.tenant_id,
+    f.business_unit_id,
+    f.shipment_number,
+    f.shipment_type,
+    f.status,
+    f.shipment_date,
+    f.customer,
+    f.from_warehouse_id,
+    f.to_warehouse_id,
+    f.currency_id,
+    f.ship_via,
+    f.operation,
+    f.shipped_quantity,
+    f.shipped_weight,
+    f.shipped_volume,
+    f.freight_amount,
+    f.freight_cost,
+    f.last_modified_at,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "fact_shipment")} AS f

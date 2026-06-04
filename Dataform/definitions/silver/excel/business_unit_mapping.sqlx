@@ -1,0 +1,293 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "business_unit_mapping",
+  description: "Historized business unit crosswalk keyed by source tenant, optional subaccount segment 2 value, and validity dates.",
+  tags: ["silver", "excel", "reference"]
+}
+
+-- Grain:
+--   one row per source tenant + optional source_segment_2_value + validity window.
+--
+-- Join rule:
+--   facts join on tenant_id + accounting/business date, with exact segment-2 matches
+--   preferred over NULL segment defaults.
+--
+-- Canonical BU IDs:
+--   - unaffected tenants keep their own tenant as the BU (`tenant_id|00`)
+--   - Aquatiq AS BUs use the parent tenant plus segment 2 (`33f...|01`, `|02`, ...)
+--   - historical tenants map into the post-2026 Aquatiq AS canonical BU IDs
+--     so reporting can trace BU history across the reorganisation.
+
+SELECT *
+FROM UNNEST([
+  -- Standalone tenants: BU = tenant/org name
+  STRUCT(
+    'ab0e5d06-fa25-11ed-a0e0-0693d8a7c3dd' AS tenant_id,
+    'Aqua Pharma AS' AS organization_name,
+    CAST(NULL AS STRING) AS source_segment_2_value,
+    'ab0e5d06-fa25-11ed-a0e0-0693d8a7c3dd|00' AS business_unit_id,
+    'Aqua Pharma AS' AS business_unit_name,
+    'ab0e5d06-fa25-11ed-a0e0-0693d8a7c3dd' AS reporting_tenant_id,
+    'Aqua Pharma AS' AS reporting_organization_name,
+    'AQUA_PHARMA_AS' AS entity_code,
+    'Aquatiq' AS group_name,
+    DATE '1900-01-01' AS valid_from,
+    CAST(NULL AS DATE) AS valid_to
+  ),
+  STRUCT(
+    'ffa4a061-8084-11e9-b307-0aa512338dd6',
+    'Aqua Pharma Group AS',
+    CAST(NULL AS STRING),
+    'ffa4a061-8084-11e9-b307-0aa512338dd6|00',
+    'Aqua Pharma Group AS',
+    'ffa4a061-8084-11e9-b307-0aa512338dd6',
+    'Aqua Pharma Group AS',
+    'AQUA_PHARMA_GROUP_AS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '2b6e5cd6-6ce0-11ee-970e-025417856183',
+    'Aquatiq AB',
+    CAST(NULL AS STRING),
+    '2b6e5cd6-6ce0-11ee-970e-025417856183|00',
+    'Aquatiq AB',
+    '2b6e5cd6-6ce0-11ee-970e-025417856183',
+    'Aquatiq AB',
+    'AQUATIQ_AB',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    'd1507c4a-7717-11ee-970e-025417856183',
+    'Aquatiq Aps',
+    CAST(NULL AS STRING),
+    'd1507c4a-7717-11ee-970e-025417856183|00',
+    'Aquatiq Aps',
+    'd1507c4a-7717-11ee-970e-025417856183',
+    'Aquatiq Aps',
+    'AQUATIQ_APS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    'bed46bb6-21cc-11e9-b307-0aa512338dd6',
+    'Aquatiq Food Automation ApS',
+    CAST(NULL AS STRING),
+    'bed46bb6-21cc-11e9-b307-0aa512338dd6|00',
+    'Aquatiq Food Automation ApS',
+    'bed46bb6-21cc-11e9-b307-0aa512338dd6',
+    'Aquatiq Food Automation ApS',
+    'AQUATIQ_FOOD_AUTOMATION_APS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '7d2c489e-21cc-11e9-b307-0aa512338dd6',
+    'Aquatiq Group AS',
+    CAST(NULL AS STRING),
+    '7d2c489e-21cc-11e9-b307-0aa512338dd6|00',
+    'Aquatiq Group AS',
+    '7d2c489e-21cc-11e9-b307-0aa512338dd6',
+    'Aquatiq Group AS',
+    'AQUATIQ_GROUP_AS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    'eda0dd16-fa25-11ed-a0e0-0693d8a7c3dd',
+    'Sensilist AS',
+    CAST(NULL AS STRING),
+    'eda0dd16-fa25-11ed-a0e0-0693d8a7c3dd|00',
+    'Sensilist AS',
+    'eda0dd16-fa25-11ed-a0e0-0693d8a7c3dd',
+    'Sensilist AS',
+    'SENSILIST_AS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+
+  -- Aquatiq AS tenant before the 2026-01-01 rename/reorganisation: tenant represented Chemistry
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Chemistry',
+    CAST(NULL AS STRING),
+    '33f319b9-4d57-11ee-960c-025417856183|01',
+    'Chemistry',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'CHEMISTRY',
+    'Aquatiq',
+    DATE '1900-01-01',
+    DATE '2025-12-31'
+  ),
+
+  -- Historical standalone tenants that roll into canonical Aquatiq AS BUs.
+  -- These tenants still emit post-2025 data with local segment-2 department/service
+  -- codes, but reporting BU remains the same canonical Aquatiq AS BU.
+  STRUCT(
+    '61320c0a-102d-11ee-a0e0-0693d8a7c3dd',
+    'Aquatiq Hygiene Systems AS',
+    CAST(NULL AS STRING),
+    '33f319b9-4d57-11ee-960c-025417856183|02',
+    'AHS',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_HYGIENE_SYSTEMS_AS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    'f630d6b0-5566-11ee-960c-025417856183',
+    'Aquatiq Food Factory AS',
+    CAST(NULL AS STRING),
+    '33f319b9-4d57-11ee-960c-025417856183|02',
+    'AHS',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_FOOD_FACTORY_AS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '9b1fa69b-5568-11ee-960c-025417856183',
+    'Consult AS',
+    CAST(NULL AS STRING),
+    '33f319b9-4d57-11ee-960c-025417856183|03',
+    'Consult',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'CONSULT_AS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    'bb6c024e-5567-11ee-960c-025417856183',
+    'Aquatiq Sense AS',
+    CAST(NULL AS STRING),
+    '33f319b9-4d57-11ee-960c-025417856183|04',
+    'FT&A',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_SENSE_AS',
+    'Aquatiq',
+    DATE '1900-01-01',
+    CAST(NULL AS DATE)
+  ),
+
+  -- Aquatiq AS after the 2026-01-01 reorganisation: BU driven by raw Visma subaccount segment 2
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '0',
+    '33f319b9-4d57-11ee-960c-025417856183|00',
+    'Aquatiq AS',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '1',
+    '33f319b9-4d57-11ee-960c-025417856183|01',
+    'Chemistry',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '2',
+    '33f319b9-4d57-11ee-960c-025417856183|02',
+    'AHS',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '3',
+    '33f319b9-4d57-11ee-960c-025417856183|03',
+    'Consult',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '4',
+    '33f319b9-4d57-11ee-960c-025417856183|04',
+    'FT&A',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '6',
+    '33f319b9-4d57-11ee-960c-025417856183|06',
+    'Commercial',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '8',
+    '33f319b9-4d57-11ee-960c-025417856183|08',
+    'Properties',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  ),
+  STRUCT(
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    '9',
+    '33f319b9-4d57-11ee-960c-025417856183|09',
+    'Management & Shared Services',
+    '33f319b9-4d57-11ee-960c-025417856183',
+    'Aquatiq AS',
+    'AQUATIQ_AS',
+    'Aquatiq',
+    DATE '2026-01-01',
+    CAST(NULL AS DATE)
+  )
+])

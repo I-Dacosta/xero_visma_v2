@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_number_sequences",
+  description: "Bronze: Document numbering sequence configurations from Visma Global API."
+}

@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_attributes",
+  description: "Bronze: Custom field/attribute definitions from Visma Global API."
+}

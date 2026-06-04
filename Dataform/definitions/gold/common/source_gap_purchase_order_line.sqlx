@@ -1,0 +1,104 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "source_gap_purchase_order_line",
+  description: "Source-level data quality gaps for purchase order lines, derived directly from bronze purchase orders. One row per bronze line with a critical missing field for downstream procurement analysis.",
+  tags: ["gold", "common", "qa", "exception", "procurement", "source-gap"]
+}
+
+WITH parsed_lines AS (
+  SELECT
+    h.tenantId                                              AS tenant_id,
+    h.organizationName                                      AS organization_name,
+    h.orderNbr                                              AS order_nbr,
+    h.orderType                                             AS order_type,
+    COALESCE(
+      SAFE_CAST(h.date AS DATE),
+      DATE(SAFE_CAST(h.date AS TIMESTAMP))
+    )                                                       AS order_date,
+    SAFE_CAST(COALESCE(
+      JSON_VALUE(h.supplier, '$.number'),
+      JSON_VALUE(h.supplier, '$.id'),
+      JSON_VALUE(h.supplier, '$.internalId')
+    ) AS STRING)                                            AS supplier_id,
+    JSON_VALUE(h.supplier, '$.name')                        AS supplier_name,
+    COALESCE(
+      JSON_VALUE(line, '$.lineNbr'),
+      JSON_VALUE(line, '$.lineNumber'),
+      JSON_VALUE(line, '$.sortOrder')
+    )                                                       AS line_nbr,
+    COALESCE(
+      JSON_VALUE(line, '$.inventory.number'),
+      JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.number'),
+      JSON_VALUE(line, '$.inventory.id'),
+      JSON_VALUE(line, '$."inventory.id"'),
+      JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.id'),
+      JSON_VALUE(line, '$.inventoryId')
+    )                                                       AS inventory_id,
+    COALESCE(
+      JSON_VALUE(line, '$.lineDescription'),
+      JSON_VALUE(line, '$.description'),
+      JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.description')
+    )                                                       AS line_description,
+    SAFE_CAST(COALESCE(
+      JSON_VALUE(line, '$.amount'),
+      JSON_VALUE(line, '$.extCost')
+    ) AS NUMERIC)                                           AS amount,
+    line                                                    AS source_line_json
+  FROM ${ref("dw_1_bronze_visma", "visma_purchase_orders")} AS h
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.lines)) AS line
+  WHERE h.isDeleted IS DISTINCT FROM TRUE
+),
+
+classified AS (
+  SELECT
+    *,
+    (inventory_id IS NULL)                                  AS missing_inventory_id,
+    (line_description IS NULL OR TRIM(line_description) = '')
+                                                            AS missing_line_description,
+    (amount IS NULL)                                        AS missing_amount,
+    REGEXP_CONTAINS(
+      UPPER(TRIM(COALESCE(line_description, ''))),
+      r'(FRAKT|FORTOLLING|EMBALLASJE|PALL|GEBYR|AVGIFT|PROGRAMMERING|INTEGRERING|SERVICE|ADMINISTRASJON)'
+    )                                                       AS likely_non_item_or_service_line
+  FROM parsed_lines
+)
+
+SELECT
+  tenant_id,
+  organization_name,
+  order_nbr,
+  order_type,
+  order_date,
+  supplier_id,
+  supplier_name,
+  line_nbr,
+  inventory_id,
+  line_description,
+  amount,
+  missing_inventory_id,
+  missing_line_description,
+  missing_amount,
+  likely_non_item_or_service_line,
+  CASE
+    WHEN missing_amount THEN 'missing_amount'
+    WHEN missing_inventory_id AND missing_line_description THEN 'missing_inventory_id_and_description'
+    WHEN missing_inventory_id AND likely_non_item_or_service_line THEN 'missing_inventory_id_expected_service_or_charge'
+    WHEN missing_inventory_id THEN 'missing_inventory_id_unexpected'
+    WHEN missing_line_description THEN 'missing_line_description'
+    ELSE 'ok'
+  END                                                       AS source_gap_reason,
+  CASE
+    WHEN missing_amount THEN 'high'
+    WHEN missing_inventory_id AND NOT likely_non_item_or_service_line THEN 'medium'
+    ELSE 'low'
+  END                                                       AS source_gap_severity,
+  (missing_inventory_id OR missing_line_description OR missing_amount)
+                                                            AS has_source_gap,
+  source_line_json,
+  'visma_purchase_orders.lines'                             AS source_table_name,
+  'visma'                                                   AS source_system
+FROM classified
+WHERE missing_inventory_id
+   OR missing_line_description
+   OR missing_amount

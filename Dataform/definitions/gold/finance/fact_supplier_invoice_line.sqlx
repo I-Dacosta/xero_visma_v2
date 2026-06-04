@@ -1,0 +1,120 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_supplier_invoice_line",
+  description: "Supplier invoice line fact table with surrogate key FKs.",
+  tags: ["gold", "finance", "fact"]
+}
+
+-- =============================================================================
+-- fact_supplier_invoice_line.sqlx
+-- Gold finance fact: Supplier invoice lines
+-- Source: dw_1_silver_visma.fact_supplier_invoice_line
+-- Grain: one row per invoice line
+-- =============================================================================
+
+WITH line_source AS (
+    SELECT
+        FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+        CASE
+          WHEN f.account_id IS NOT NULL THEN CONCAT(
+            CAST(f.tenant_id AS STRING), '|',
+            CAST(f.account_id AS STRING)
+          )
+        END                                         AS account_key,
+        CASE
+          WHEN f.inventory_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+            CAST(f.tenant_id AS STRING), '|',
+            CAST(f.inventory_id AS STRING)
+          ))
+        END                                         AS item_key,
+        f.*
+    FROM ${ref("dw_1_silver_visma", "fact_supplier_invoice_line")} AS f
+),
+header_source AS (
+    SELECT
+        tenant_id,
+        business_unit_id,
+        reference_number,
+        document_type,
+        supplier_id,
+        date AS document_date,
+        currency_id
+    FROM ${ref("dw_1_silver_visma", "fact_supplier_invoice")}
+),
+enriched AS (
+    SELECT
+        f.*,
+        CASE
+          WHEN h.supplier_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+            CAST(f.tenant_id AS STRING), '|',
+            CAST(h.business_unit_id AS STRING), '|',
+            CAST(h.supplier_id AS STRING)
+          ))
+        END                                         AS supplier_key,
+        FARM_FINGERPRINT(CAST(COALESCE(f.document_date, h.document_date) AS STRING))
+                                                    AS date_key,
+        FARM_FINGERPRINT(CAST(COALESCE(f.currency_id, h.currency_id) AS STRING))
+                                                    AS currency_key,
+        h.supplier_id AS header_supplier_id,
+        h.business_unit_id AS header_business_unit_id,
+        COALESCE(f.document_date, h.document_date)  AS resolved_document_date,
+        COALESCE(f.currency_id, h.currency_id)      AS resolved_currency_id,
+        mr.currency_market_rate_daily_key,
+        mr.market_currency_rate_key,
+        mr.market_rate_date,
+        mr.market_exchange_rate_to_nok,
+        mr.market_inverse_exchange_rate_from_nok,
+        mr.market_rate_source,
+        COALESCE(mr.has_market_rate, FALSE)           AS has_market_rate_to_nok,
+        COALESCE(mr.is_rate_filled_forward, FALSE)    AS is_market_rate_filled_forward
+    FROM line_source AS f
+    LEFT JOIN header_source AS h
+      ON h.tenant_id = f.tenant_id
+     AND h.reference_number = f.reference_number
+     AND h.document_type = f.document_type
+    LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS mr
+      ON mr.date_key = FARM_FINGERPRINT(CAST(COALESCE(f.document_date, h.document_date) AS STRING))
+     AND mr.currency_key = FARM_FINGERPRINT(CAST(COALESCE(f.currency_id, h.currency_id) AS STRING))
+)
+
+SELECT
+    company_key,
+    date_key,
+    currency_key,
+    supplier_key,
+    account_key,
+    item_key,
+    tenant_id,
+    header_business_unit_id                           AS business_unit_id,
+    business_unit_id                                 AS line_business_unit_id,
+    business_unit_name                               AS line_business_unit_name,
+    COALESCE(header_supplier_id, supplier_id)        AS supplier_id,
+    reference_number,
+    document_type,
+    resolved_document_date                           AS document_date,
+    resolved_currency_id                             AS currency_id,
+    line_number,
+    inventory_id,
+    line_description,
+    unit_of_measure,
+    subaccount_id,
+    project_id,
+    branch_id,
+    quantity,
+    unit_cost,
+    amount,
+    currency_market_rate_daily_key,
+    market_currency_rate_key,
+    market_rate_date,
+    market_exchange_rate_to_nok,
+    market_inverse_exchange_rate_from_nok,
+    market_rate_source,
+    has_market_rate_to_nok,
+    is_market_rate_filled_forward,
+    SAFE_MULTIPLY(amount, market_exchange_rate_to_nok)
+                                                    AS amount_market_nok,
+    SAFE_MULTIPLY(unit_cost, market_exchange_rate_to_nok)
+                                                    AS unit_cost_market_nok,
+    'visma' AS source_system
+FROM enriched

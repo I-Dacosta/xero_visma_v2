@@ -1,0 +1,187 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_currency_market_rate_to_nok_daily",
+  description: "Daily market FX bridge from source currency to NOK, with fill-forward logic from the external staging feed. Used to calculate comparable NOK values across finance and sales facts.",
+  tags: ["gold", "common", "currency", "reference", "market-rate"]
+}
+
+WITH reference_dates AS (
+  SELECT MAX(transaction_date) AS max_reference_date
+  FROM ${ref("dw_1_silver_visma", "fact_general_ledger")}
+
+  UNION ALL
+
+  SELECT MAX(SAFE.PARSE_DATE('%Y%m', financial_period)) AS max_reference_date
+  FROM ${ref("dw_1_silver_visma", "fact_general_ledger_balance")}
+
+  UNION ALL
+
+  SELECT MAX(document_date) AS max_reference_date
+  FROM ${ref("dw_1_silver_visma", "fact_customer_invoice")}
+
+  UNION ALL
+
+  SELECT MAX(date) AS max_reference_date
+  FROM ${ref("dw_1_silver_visma", "fact_supplier_invoice")}
+
+  UNION ALL
+
+  SELECT MAX(application_date) AS max_reference_date
+  FROM ${ref("dw_1_silver_visma", "fact_customer_payment")}
+
+  UNION ALL
+
+  SELECT MAX(document_date) AS max_reference_date
+  FROM ${ref("dw_1_silver_visma", "fact_customer_credit_note")}
+
+  UNION ALL
+
+  SELECT MAX(application_date) AS max_reference_date
+  FROM ${ref("dw_1_silver_visma", "fact_supplier_payment")}
+),
+rate_bounds AS (
+  SELECT
+    MIN(rate_date) AS min_rate_date,
+    GREATEST(
+      MAX(rate_date),
+      COALESCE((SELECT MAX(max_reference_date) FROM reference_dates), MAX(rate_date))
+    ) AS max_rate_date
+  FROM ${ref("dw_1_gold_common", "dim_currency_market_rate")}
+),
+date_spine AS (
+  SELECT
+    date_key,
+    date_day AS calendar_date
+  FROM ${ref("dw_1_gold_common", "dim_date")}
+  CROSS JOIN rate_bounds
+  WHERE date_day >= rate_bounds.min_rate_date
+    AND date_day <= rate_bounds.max_rate_date
+),
+currency_spine AS (
+  SELECT
+    currency_key,
+    currency_id
+  FROM ${ref("dw_1_gold_common", "dim_currency")}
+  WHERE has_staging_market_rate = TRUE
+     OR currency_id = 'NOK'
+),
+market_rate_candidates AS (
+  SELECT
+    d.date_key,
+    d.calendar_date,
+    c.currency_key,
+    c.currency_id AS from_currency_id,
+    'NOK' AS to_currency_id,
+    r.currency_market_rate_key AS market_currency_rate_key,
+    r.rate_date AS market_rate_date,
+    r.exchange_rate AS market_exchange_rate_to_nok,
+    r.rate_source AS market_rate_source,
+    r.source_timestamp,
+    FALSE AS is_same_currency,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.currency_id, d.calendar_date
+      ORDER BY
+        CASE WHEN r.rate_date IS NULL THEN 1 ELSE 0 END,
+        r.rate_date DESC,
+        r.source_timestamp DESC
+    ) AS rate_rank
+  FROM date_spine AS d
+  CROSS JOIN currency_spine AS c
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate")} AS r
+    ON r.from_currency_id = c.currency_id
+   AND r.to_currency_id = 'NOK'
+   AND r.is_inverse_rate = FALSE
+   AND r.rate_date <= d.calendar_date
+  WHERE c.currency_id <> 'NOK'
+),
+non_nok_daily_rates AS (
+  SELECT
+    FARM_FINGERPRINT(CONCAT(
+      CAST(from_currency_id AS STRING), '|',
+      CAST(to_currency_id AS STRING), '|',
+      CAST(calendar_date AS STRING)
+    )) AS currency_market_rate_daily_key,
+    date_key,
+    currency_key,
+    from_currency_id,
+    to_currency_id,
+    calendar_date,
+    market_currency_rate_key,
+    market_rate_date,
+    market_exchange_rate_to_nok,
+    SAFE_DIVIDE(1, market_exchange_rate_to_nok) AS market_inverse_exchange_rate_from_nok,
+    market_rate_source,
+    is_same_currency,
+    market_rate_date IS NOT NULL AS has_market_rate,
+    market_rate_date IS NOT NULL AND market_rate_date < calendar_date
+      AS is_rate_filled_forward,
+    source_timestamp
+  FROM market_rate_candidates
+  WHERE rate_rank = 1
+),
+nok_self_rates AS (
+  SELECT
+    FARM_FINGERPRINT(CONCAT(
+      CAST('NOK' AS STRING), '|',
+      CAST('NOK' AS STRING), '|',
+      CAST(d.calendar_date AS STRING)
+    )) AS currency_market_rate_daily_key,
+    d.date_key,
+    c.currency_key,
+    'NOK' AS from_currency_id,
+    'NOK' AS to_currency_id,
+    d.calendar_date,
+    CAST(NULL AS INT64) AS market_currency_rate_key,
+    d.calendar_date AS market_rate_date,
+    CAST(1 AS NUMERIC) AS market_exchange_rate_to_nok,
+    CAST(1 AS NUMERIC) AS market_inverse_exchange_rate_from_nok,
+    'self' AS market_rate_source,
+    TRUE AS is_same_currency,
+    TRUE AS has_market_rate,
+    FALSE AS is_rate_filled_forward,
+    CAST(NULL AS TIMESTAMP) AS source_timestamp
+  FROM date_spine AS d
+  JOIN currency_spine AS c
+    ON c.currency_id = 'NOK'
+)
+
+SELECT
+  currency_market_rate_daily_key,
+  date_key,
+  currency_key,
+  from_currency_id,
+  to_currency_id,
+  calendar_date,
+  market_currency_rate_key,
+  market_rate_date,
+  market_exchange_rate_to_nok,
+  market_inverse_exchange_rate_from_nok,
+  market_rate_source,
+  is_same_currency,
+  has_market_rate,
+  is_rate_filled_forward,
+  source_timestamp,
+  'staging_currency_feed' AS source_system
+FROM non_nok_daily_rates
+
+UNION ALL
+
+SELECT
+  currency_market_rate_daily_key,
+  date_key,
+  currency_key,
+  from_currency_id,
+  to_currency_id,
+  calendar_date,
+  market_currency_rate_key,
+  market_rate_date,
+  market_exchange_rate_to_nok,
+  market_inverse_exchange_rate_from_nok,
+  market_rate_source,
+  is_same_currency,
+  has_market_rate,
+  is_rate_filled_forward,
+  source_timestamp,
+  'staging_currency_feed' AS source_system
+FROM nok_self_rates

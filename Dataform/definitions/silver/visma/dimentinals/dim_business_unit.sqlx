@@ -1,0 +1,83 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_business_unit",
+  description: "Silver: historized business unit dimension keyed by source tenant, canonical BU, and validity window.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    organization_name,
+    source_segment_2_value AS segment2,
+    business_unit_id,
+    business_unit_name,
+    reporting_tenant_id,
+    reporting_organization_name,
+    entity_code,
+    group_name,
+    valid_from AS bu_valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS bu_valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+main_branch AS (
+  SELECT
+    tenant_id,
+    branch_id,
+    branch_number,
+    branch_name,
+    organization_id,
+    corporate_id,
+    IFNULL(is_active, FALSE) AS is_active,
+    IFNULL(is_main_branch, FALSE) AS is_main_branch,
+    synced_at
+  FROM ${ref("dw_1_silver_visma", "dim_branch")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id
+    ORDER BY IFNULL(is_main_branch, FALSE) DESC, synced_at DESC, branch_id
+  ) = 1
+)
+
+SELECT
+  m.tenant_id,
+  m.organization_name,
+  m.business_unit_id,
+  m.segment2,
+  m.business_unit_name,
+  CAST(FARM_FINGERPRINT(m.tenant_id || '|' || m.business_unit_id || '|' || CAST(m.bu_valid_from AS STRING)) AS STRING) AS business_unit_key,
+
+  m.entity_code,
+  m.group_name,
+  m.reporting_tenant_id,
+  m.reporting_organization_name,
+
+  CASE
+    WHEN m.bu_valid_to = DATE '9999-12-31' THEN NULL
+    ELSE m.bu_valid_to
+  END AS entity_valid_to,
+  m.bu_valid_from,
+  CASE
+    WHEN m.bu_valid_to = DATE '9999-12-31' THEN NULL
+    ELSE m.bu_valid_to
+  END AS bu_valid_to,
+  m.bu_valid_to <> DATE '9999-12-31' AS is_historical,
+
+  b.branch_id AS visma_branch_id,
+  b.branch_number AS visma_branch_number,
+  b.branch_name AS visma_branch_name,
+  b.organization_id AS visma_branch_organization_id,
+  IF(b.branch_id IS NULL, 0, 100) AS branch_match_score,
+  CASE
+    WHEN b.branch_id IS NULL THEN 'no_branch_for_tenant'
+    ELSE 'tenant_main_branch'
+  END AS branch_match_rule,
+
+  CAST(NULL AS STRING) AS mapped_department_id,
+  CAST(NULL AS STRING) AS mapped_department_description,
+
+  b.synced_at
+FROM business_unit_mapping AS m
+LEFT JOIN main_branch AS b
+  ON m.tenant_id = b.tenant_id

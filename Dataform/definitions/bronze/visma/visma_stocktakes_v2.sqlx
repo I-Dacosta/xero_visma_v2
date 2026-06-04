@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_stocktakes_v2",
+  description: "Bronze: Physical inventory count documents (v2) from Visma Global API."
+}

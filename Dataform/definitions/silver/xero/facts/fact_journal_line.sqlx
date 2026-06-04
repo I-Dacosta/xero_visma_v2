@@ -1,0 +1,72 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_journal_line",
+  description: "Silver: GL journal line items from Xero Accounting API. Grain: one row per tenant_id + journal_id + journal_line_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_journal_line.sqlx
+-- Silver fact: GL journal lines (Xero)
+-- Source:  dw_1_bronze_xero.xero_journals (JournalLines[] unnested)
+-- Grain:   one row per tenant_id + journal_id + journal_line_id
+-- ⚠️ IMPORTANT: Journal lines use TrackingCategories[] not Tracking[]
+--    (different key name from all other Xero entities with tracking).
+-- FK refs: journal_id → dw_1_silver_xero.fact_journal
+--          account_id → dw_1_silver_xero.dim_account
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_journals")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS journal_id,
+    line
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.JournalLines')) AS line
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  journal_id,
+
+  JSON_VALUE(line, '$.JournalLineID')                                 AS journal_line_id,
+
+  -- Account FK
+  JSON_VALUE(line, '$.AccountID')                                     AS account_id,
+  JSON_VALUE(line, '$.AccountCode')                                   AS account_code,
+  JSON_VALUE(line, '$.AccountName')                                   AS account_name,
+  JSON_VALUE(line, '$.AccountType')                                   AS account_type,
+
+  -- Description & amounts
+  JSON_VALUE(line, '$.Description')                                   AS description,
+  SAFE_CAST(JSON_VALUE(line, '$.GrossAmount') AS FLOAT64)             AS gross_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.NetAmount')   AS FLOAT64)             AS net_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.TaxAmount')   AS FLOAT64)             AS tax_amount,
+
+  -- ⚠️ Journals use TrackingCategories not Tracking
+  JSON_VALUE(line, '$.TrackingCategories[0].TrackingCategoryID')      AS tracking_category_1_id,
+  JSON_VALUE(line, '$.TrackingCategories[0].Name')                    AS tracking_category_1_name,
+  JSON_VALUE(line, '$.TrackingCategories[0].Option')                  AS tracking_option_1_name,
+  JSON_VALUE(line, '$.TrackingCategories[1].TrackingCategoryID')      AS tracking_category_2_id,
+  JSON_VALUE(line, '$.TrackingCategories[1].Name')                    AS tracking_category_2_name,
+  JSON_VALUE(line, '$.TrackingCategories[1].Option')                  AS tracking_option_2_name,
+
+  'xero'                                                              AS _source
+
+FROM unnested

@@ -1,0 +1,71 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_currency_market_rate",
+  description: "Silver: External market currency-rate reference table from the staging currency feed. Grain: one row per currency pair + rate date + direction.",
+  tags: ["silver", "currency", "reference", "market-rate"]
+}
+
+WITH source_rates AS (
+  SELECT
+    currency_code                                    AS base_currency_id,
+    quote_currency                                   AS quote_currency_id,
+    SAFE_CAST(rate AS NUMERIC)                       AS exchange_rate,
+    SAFE_CAST(date AS DATE)                          AS rate_date,
+    source                                           AS rate_source,
+    SAFE_CAST(created_at AS TIMESTAMP)               AS source_timestamp
+  FROM ${ref("dw_1_staging_currency_n2", "HistoryratesPowerBI")}
+  WHERE currency_code IS NOT NULL
+    AND quote_currency IS NOT NULL
+    AND rate IS NOT NULL
+    AND date IS NOT NULL
+),
+deduped_rates AS (
+  SELECT *
+  FROM source_rates
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY base_currency_id, quote_currency_id, rate_date
+    ORDER BY source_timestamp DESC, rate_source DESC
+  ) = 1
+),
+direct_and_inverse_rates AS (
+  SELECT
+    base_currency_id                                 AS from_currency_id,
+    quote_currency_id                                AS to_currency_id,
+    rate_date,
+    exchange_rate,
+    SAFE_DIVIDE(1, exchange_rate)                    AS inverse_exchange_rate,
+    rate_source,
+    source_timestamp,
+    FALSE                                            AS is_inverse_rate
+  FROM deduped_rates
+
+  UNION ALL
+
+  SELECT
+    quote_currency_id                                AS from_currency_id,
+    base_currency_id                                 AS to_currency_id,
+    rate_date,
+    SAFE_DIVIDE(1, exchange_rate)                    AS exchange_rate,
+    exchange_rate                                    AS inverse_exchange_rate,
+    rate_source,
+    source_timestamp,
+    TRUE                                             AS is_inverse_rate
+  FROM deduped_rates
+)
+
+SELECT
+  from_currency_id,
+  to_currency_id,
+  rate_date,
+  exchange_rate,
+  inverse_exchange_rate,
+  rate_source,
+  source_timestamp,
+  is_inverse_rate,
+  ROW_NUMBER() OVER (
+    PARTITION BY from_currency_id, to_currency_id, is_inverse_rate
+    ORDER BY rate_date DESC, source_timestamp DESC
+  ) = 1                                              AS is_latest_rate_for_pair
+FROM direct_and_inverse_rates
+

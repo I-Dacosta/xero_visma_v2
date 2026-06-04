@@ -1,0 +1,109 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "customer_price_class_gap_report",
+  description: "Detailed report of remaining customer price-class gaps after safe cross-tenant corporate-ID backfill. Explains why each customer is still missing price class and what should be fixed in source or process.",
+  tags: ["gold", "common", "customer", "price-class", "report"]
+}
+
+WITH gap_base AS (
+  SELECT
+    customer_key,
+    tenant_id,
+    customer_id,
+    organization_name,
+    customer_name,
+    corporate_id,
+    has_sales_orders,
+    sales_order_count,
+    last_sales_order_date,
+    default_location_id,
+    source_price_class_id,
+    source_price_class_description,
+    default_location_price_class_id,
+    default_location_price_class_source,
+    distinct_location_price_class_count,
+    has_multiple_location_price_classes,
+    inferred_price_class_count,
+    customer_specific_price_match_count,
+    sample_location_price_classes,
+    inferred_price_class_evidence,
+    customer_specific_price_evidence,
+    cross_tenant_merge_corporate_id_norm,
+    cross_tenant_merge_group_tenant_count,
+    cross_tenant_merge_candidate_price_class_id,
+    cross_tenant_merge_candidate_price_class_description,
+    cross_tenant_merge_supporting_tenant_count,
+    cross_tenant_merge_supporting_customer_count,
+    cross_tenant_merge_sample_customers,
+    price_class_mapping_method
+  FROM ${ref("dw_1_gold_finance", "dim_customer")}
+  WHERE price_class_id IS NULL
+),
+
+classified AS (
+  SELECT
+    *,
+    CASE
+      WHEN price_class_mapping_method = 'not_in_sales_orders'
+        THEN 'not_in_sales_orders'
+      WHEN price_class_mapping_method = 'sales_order_multiple_order_location_price_classes_conflict'
+        THEN 'multiple_location_price_classes_conflict'
+      WHEN price_class_mapping_method = 'sales_order_price_signature_conflict'
+        THEN 'price_signature_conflict'
+      WHEN price_class_mapping_method = 'sales_order_customer_specific_pricing_no_class'
+        THEN 'customer_specific_pricing_without_price_class'
+      WHEN price_class_mapping_method = 'sales_order_no_price_class_evidence'
+        THEN 'no_price_class_evidence_in_bronze'
+      ELSE 'other_unmapped'
+    END                                                    AS gap_reason,
+    CASE
+      WHEN price_class_mapping_method = 'not_in_sales_orders'
+        THEN 'Keep NULL unless the customer should be active in Sales Orders. If it should be active, source a direct customer/location price-class assignment.'
+      WHEN price_class_mapping_method = 'sales_order_multiple_order_location_price_classes_conflict'
+        THEN 'Keep NULL in dim_customer. Customer has multiple active classes; use bridge_customer_price_class for analysis instead of forcing one class.'
+      WHEN price_class_mapping_method = 'sales_order_price_signature_conflict'
+        THEN 'Review Sales Orders pricing against customer_sales_prices. Multiple class price signatures match the same customer and need source cleanup.'
+      WHEN price_class_mapping_method = 'sales_order_customer_specific_pricing_no_class'
+        THEN 'Customer uses customer-specific pricing rather than a shared price class. Only populate source assignment if the business expects a shared class.'
+      WHEN price_class_mapping_method = 'sales_order_no_price_class_evidence'
+        THEN 'Populate visma_customer_locations.priceClassId or visma_customers.priceClass in source. Sales Orders exist, but bronze has no safe class evidence.'
+      ELSE 'Review manually. Current bronze signals are insufficient for a safe price-class assignment.'
+    END                                                    AS recommended_action
+  FROM gap_base
+)
+
+SELECT
+  customer_key,
+  tenant_id,
+  customer_id,
+  organization_name,
+  customer_name,
+  corporate_id,
+  has_sales_orders,
+  sales_order_count,
+  last_sales_order_date,
+  default_location_id,
+  source_price_class_id,
+  source_price_class_description,
+  default_location_price_class_id,
+  default_location_price_class_source,
+  distinct_location_price_class_count,
+  has_multiple_location_price_classes,
+  inferred_price_class_count,
+  customer_specific_price_match_count,
+  sample_location_price_classes,
+  inferred_price_class_evidence,
+  customer_specific_price_evidence,
+  cross_tenant_merge_corporate_id_norm,
+  cross_tenant_merge_group_tenant_count,
+  cross_tenant_merge_candidate_price_class_id,
+  cross_tenant_merge_candidate_price_class_description,
+  cross_tenant_merge_supporting_tenant_count,
+  cross_tenant_merge_supporting_customer_count,
+  cross_tenant_merge_sample_customers,
+  price_class_mapping_method,
+  gap_reason,
+  recommended_action,
+  'visma'                                                  AS source_system
+FROM classified

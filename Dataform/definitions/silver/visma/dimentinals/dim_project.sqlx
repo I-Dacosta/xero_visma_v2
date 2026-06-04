@@ -1,0 +1,107 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_project",
+  description: "Project dimension sourced from Visma projects.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- Silver dimension: Project master data
+-- Source: visma_projects
+-- =============================================================================
+
+WITH source_data AS (
+SELECT
+    tenantId                                    AS tenant_id,
+    SAFE_CAST(projectID AS STRING)              AS project_id,
+    description                                 AS project_name,
+    status,
+    SAFE_CAST(startDate AS DATE)                AS start_date,
+    SAFE_CAST(endDate AS DATE)                  AS end_date,
+    customer                                    AS customer,
+    customer                                    AS customer_raw,
+    JSON_VALUE(customer, '$.number')            AS customer_id,
+    JSON_VALUE(customer, '$.name')              AS customer_name,
+    billingRule                                 AS billing_rule,
+    billingRule                                 AS billing_rule_raw,
+    JSON_VALUE(billingRule, '$.id')             AS billing_rule_id,
+    JSON_VALUE(billingRule, '$.description')    AS billing_rule_description,
+    SAFE_CAST(JSON_VALUE(billingRule, '$.active') AS BOOL)
+                                                AS billing_rule_active,
+    branch                                      AS branch_raw,
+    JSON_VALUE(branch, '$.number')              AS branch_id,
+    JSON_VALUE(branch, '$.name')                AS branch_name,
+    customerLocation                            AS customer_location_raw,
+    JSON_VALUE(customerLocation, '$.id')        AS customer_location_id,
+    JSON_VALUE(customerLocation, '$.name')      AS customer_location_name,
+    projectManager                              AS project_manager_raw,
+    JSON_VALUE(projectManager, '$.employeeId')  AS project_manager_employee_id,
+    JSON_VALUE(projectManager, '$.employeeNumber')
+                                                AS project_manager_employee_number,
+    JSON_VALUE(projectManager, '$.employeeName') AS project_manager_name,
+    JSON_VALUE(projectManager, '$.department')  AS project_manager_department,
+    JSON_VALUE(projectManager, '$.status')      AS project_manager_status,
+    defSub                                      AS default_subaccount_raw,
+    JSON_VALUE(defSub, '$.id')                  AS default_subaccount_id,
+    template                                    AS template_raw,
+    JSON_VALUE(template, '$.number')            AS template_id,
+    JSON_VALUE(template, '$.description')       AS template_description,
+    JSON_VALUE(template, '$.status')            AS template_status,
+    visibility                                  AS visibility_raw,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInGl') AS BOOL)
+                                                AS visible_in_gl,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInAp') AS BOOL)
+                                                AS visible_in_ap,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInAr') AS BOOL)
+                                                AS visible_in_ar,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInSo') AS BOOL)
+                                                AS visible_in_so,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInPo') AS BOOL)
+                                                AS visible_in_po,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInEa') AS BOOL)
+                                                AS visible_in_ea,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInTa') AS BOOL)
+                                                AS visible_in_ta,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInIn') AS BOOL)
+                                                AS visible_in_in,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInCa') AS BOOL)
+                                                AS visible_in_ca,
+    SAFE_CAST(JSON_VALUE(visibility, '$.visibleInCr') AS BOOL)
+                                                AS visible_in_cr,
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+
+FROM ${ref("visma_projects")}
+WHERE isDeleted = false OR isDeleted IS NULL
+),
+current_tenant_business_unit AS (
+  SELECT
+         tenant_id,
+         business_unit_id,
+         business_unit_name,
+         ROW_NUMBER() OVER (
+           PARTITION BY tenant_id
+           ORDER BY
+             CASE
+               WHEN source_segment_2_value = '0' THEN 1
+               WHEN source_segment_2_value IS NULL THEN 2
+               ELSE 3
+             END,
+             COALESCE(valid_to, DATE '9999-12-31') DESC,
+             valid_from DESC
+         ) AS rn
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+  WHERE CURRENT_DATE() BETWEEN valid_from AND COALESCE(valid_to, DATE '9999-12-31')
+)
+SELECT
+  source_data.*,
+  current_tenant_business_unit.business_unit_id,
+  current_tenant_business_unit.business_unit_name
+FROM source_data
+LEFT JOIN current_tenant_business_unit
+  ON source_data.tenant_id = current_tenant_business_unit.tenant_id
+ AND current_tenant_business_unit.rn = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY source_data.tenant_id, source_data.project_id
+  ORDER BY source_data.last_modified_at DESC, source_data.project_name DESC
+) = 1

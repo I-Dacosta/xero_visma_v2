@@ -1,0 +1,956 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "dim_customer",
+  description: "Conformed customer dimension at tenant plus customer grain. Price class is resolved from active Sales Orders customers using order locations first, then strict sales-price signature inference when the order location has no class.",
+  tags: ["gold", "finance", "dimension"]
+}
+
+-- =============================================================================
+-- dim_customer.sqlx
+-- Gold finance dimension: Customer master data
+-- Source: customer master plus fallback customer references from sales/finance
+-- Grain: one row per tenant + customer
+-- Price class policy:
+--   * Only customers observed in Sales Orders are considered active for price class
+--   * Direct source of truth is Sales Orders order-location -> customer_locations
+--   * Fallback is exact Sales Orders price signature -> customer_sales_prices
+--   * Final fallback is safe cross-tenant merge on normalized corporate ID only
+--   * Customers with direct order-location conflicts or inferred conflicts stay NULL
+-- =============================================================================
+
+WITH master_customers AS (
+  SELECT *
+  FROM ${ref("dw_1_silver_visma", "dim_customer")}
+),
+
+tenant_price_class_codebook AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    id                                                     AS price_class_id,
+    description                                            AS price_class_description
+  FROM ${ref("dw_1_bronze_visma", "visma_price_classes")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, id
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_customer_locations AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    locationId                                             AS location_id,
+    priceClassId                                           AS price_class_id
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_locations")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, customerId, locationId
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_sales_orders AS (
+  SELECT *
+  FROM ${ref("dw_1_bronze_visma", "visma_sales_orders_v3")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND customerId IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, COALESCE(orderNo, orderId), COALESCE(orderType, type)
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+sales_order_customer_activity AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    COUNT(*)                                               AS sales_order_count,
+    MAX(DATE(SAFE_CAST(date AS TIMESTAMP)))                AS last_sales_order_date,
+    ARRAY_AGG(
+      customerName IGNORE NULLS
+      ORDER BY SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) DESC, syncedAt DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS sales_order_customer_name,
+    ARRAY_AGG(
+      organizationName IGNORE NULLS
+      ORDER BY SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) DESC, syncedAt DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS sales_order_organization_name,
+    ARRAY_AGG(
+      syncedAt IGNORE NULLS
+      ORDER BY SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) DESC, syncedAt DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS sales_order_synced_at
+  FROM latest_sales_orders
+  GROUP BY 1, 2
+),
+
+sales_order_customer_order_locations AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    location                                               AS order_location_id,
+    COUNT(*)                                               AS sales_order_count_at_location
+  FROM latest_sales_orders
+  WHERE location IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+
+direct_sales_order_price_class_summary AS (
+  SELECT
+    so.tenant_id,
+    so.customer_id,
+    COUNT(DISTINCT loc.price_class_id)                     AS distinct_location_price_class_count,
+    ARRAY_AGG(
+      DISTINCT loc.price_class_id IGNORE NULLS
+      ORDER BY loc.price_class_id
+    )                                                      AS location_price_class_ids,
+    STRING_AGG(
+      DISTINCT CONCAT(so.order_location_id, ':', COALESCE(loc.price_class_id, 'NULL')),
+      ' | '
+      ORDER BY CONCAT(so.order_location_id, ':', COALESCE(loc.price_class_id, 'NULL'))
+      LIMIT 10
+    )                                                      AS sample_location_price_classes
+  FROM sales_order_customer_order_locations AS so
+  LEFT JOIN latest_customer_locations AS loc
+    ON loc.tenant_id = so.tenant_id
+   AND loc.customer_id = so.customer_id
+   AND loc.location_id = so.order_location_id
+  GROUP BY 1, 2
+),
+
+direct_sales_order_price_class_resolved AS (
+  SELECT
+    s.*,
+    (s.distinct_location_price_class_count = 1)            AS has_single_direct_price_class,
+    (s.distinct_location_price_class_count > 1)            AS has_multiple_direct_price_classes,
+    s.location_price_class_ids[SAFE_OFFSET(0)]             AS unique_direct_price_class_id,
+    codebook.price_class_description                       AS unique_direct_price_class_description
+  FROM direct_sales_order_price_class_summary AS s
+  LEFT JOIN tenant_price_class_codebook AS codebook
+    ON codebook.tenant_id = s.tenant_id
+   AND codebook.price_class_id = s.location_price_class_ids[SAFE_OFFSET(0)]
+),
+
+sales_order_class_prices AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    priceCode                                              AS price_class_id,
+    inventoryId                                            AS inventory_id,
+    SAFE_CAST(price AS NUMERIC)                            AS price_amount,
+    SAFE_CAST(effectiveDate AS TIMESTAMP)                  AS effective_at,
+    SAFE_CAST(expirationDate AS TIMESTAMP)                 AS expires_at
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND priceType = 'CustomerPriceClass'
+    AND priceCode IS NOT NULL
+    AND inventoryId IS NOT NULL
+    AND SAFE_CAST(price AS NUMERIC) > 0
+    AND COALESCE(breakQty, 0) = 0
+    AND COALESCE(promotion, FALSE) = FALSE
+),
+
+sales_order_customer_prices AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    priceCode                                              AS customer_id,
+    inventoryId                                            AS inventory_id,
+    SAFE_CAST(price AS NUMERIC)                            AS price_amount,
+    SAFE_CAST(effectiveDate AS TIMESTAMP)                  AS effective_at,
+    SAFE_CAST(expirationDate AS TIMESTAMP)                 AS expires_at
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND priceType = 'Customer'
+    AND priceCode IS NOT NULL
+    AND inventoryId IS NOT NULL
+    AND SAFE_CAST(price AS NUMERIC) > 0
+    AND COALESCE(breakQty, 0) = 0
+    AND COALESCE(promotion, FALSE) = FALSE
+),
+
+clean_sales_order_lines AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    organizationName                                       AS organization_name,
+    customerId                                             AS customer_id,
+    customerName                                           AS customer_name,
+    location                                               AS order_location_id,
+    orderNo                                                AS order_no,
+    SAFE_CAST(date AS TIMESTAMP)                           AS order_ts,
+    JSON_VALUE(line, '$.inventory.id')                     AS inventory_id,
+    SAFE_CAST(JSON_VALUE(line, '$.unitPrice') AS NUMERIC)  AS unit_price,
+    JSON_VALUE(line, '$.description')                      AS line_description
+  FROM latest_sales_orders,
+  UNNEST(JSON_QUERY_ARRAY(lines, '$')) AS line
+  WHERE JSON_VALUE(line, '$.inventory.id') IS NOT NULL
+    AND SAFE_CAST(JSON_VALUE(line, '$.unitPrice') AS NUMERIC) > 0
+    AND COALESCE(JSON_VALUE(line, '$.hasManualPrice'), 'false') = 'false'
+    AND COALESCE(JSON_VALUE(line, '$.hasManualDiscount'), 'false') = 'false'
+    AND COALESCE(SAFE_CAST(JSON_VALUE(line, '$.discountPercent') AS NUMERIC), 0) = 0
+),
+
+inferred_sales_order_price_class_matches AS (
+  SELECT
+    l.tenant_id,
+    l.customer_id,
+    l.order_no,
+    l.order_location_id,
+    l.inventory_id,
+    l.unit_price,
+    p.price_class_id
+  FROM clean_sales_order_lines AS l
+  JOIN sales_order_class_prices AS p
+    ON p.tenant_id = l.tenant_id
+   AND p.inventory_id = l.inventory_id
+   AND p.price_amount = l.unit_price
+   AND (p.effective_at IS NULL OR p.effective_at <= l.order_ts)
+   AND (p.expires_at IS NULL OR l.order_ts <= p.expires_at)
+),
+
+inferred_sales_order_price_class_summary AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    COUNT(DISTINCT price_class_id)                         AS inferred_price_class_count,
+    ARRAY_AGG(
+      DISTINCT price_class_id
+      ORDER BY price_class_id
+    )                                                      AS inferred_price_class_ids,
+    STRING_AGG(
+      DISTINCT CONCAT(inventory_id, '@', CAST(unit_price AS STRING)),
+      ' | '
+      ORDER BY CONCAT(inventory_id, '@', CAST(unit_price AS STRING))
+      LIMIT 10
+    )                                                      AS inferred_price_class_evidence
+  FROM inferred_sales_order_price_class_matches
+  GROUP BY 1, 2
+),
+
+inferred_sales_order_price_class_resolved AS (
+  SELECT
+    s.*,
+    (s.inferred_price_class_count = 1)                     AS has_single_inferred_price_class,
+    (s.inferred_price_class_count > 1)                     AS has_multiple_inferred_price_classes,
+    s.inferred_price_class_ids[SAFE_OFFSET(0)]             AS unique_inferred_price_class_id,
+    codebook.price_class_description                       AS unique_inferred_price_class_description
+  FROM inferred_sales_order_price_class_summary AS s
+  LEFT JOIN tenant_price_class_codebook AS codebook
+    ON codebook.tenant_id = s.tenant_id
+   AND codebook.price_class_id = s.inferred_price_class_ids[SAFE_OFFSET(0)]
+),
+
+customer_specific_price_hits AS (
+  SELECT
+    l.tenant_id,
+    l.customer_id,
+    COUNT(*)                                               AS customer_specific_price_match_count,
+    STRING_AGG(
+      DISTINCT CONCAT(l.inventory_id, '@', CAST(l.unit_price AS STRING)),
+      ' | '
+      ORDER BY CONCAT(l.inventory_id, '@', CAST(l.unit_price AS STRING))
+      LIMIT 10
+    )                                                      AS customer_specific_price_evidence
+  FROM clean_sales_order_lines AS l
+  JOIN sales_order_customer_prices AS p
+    ON p.tenant_id = l.tenant_id
+   AND p.customer_id = l.customer_id
+   AND p.inventory_id = l.inventory_id
+   AND p.price_amount = l.unit_price
+   AND (p.effective_at IS NULL OR p.effective_at <= l.order_ts)
+   AND (p.expires_at IS NULL OR l.order_ts <= p.expires_at)
+  GROUP BY 1, 2
+),
+
+customer_invoice_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    ARRAY_AGG(
+      customer_name IGNORE NULLS
+      ORDER BY document_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS customer_name,
+    ARRAY_AGG(
+      organization_name IGNORE NULLS
+      ORDER BY document_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS organization_name,
+    ARRAY_AGG(
+      synced_at IGNORE NULLS
+      ORDER BY document_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS synced_at,
+    MAX(COALESCE(TIMESTAMP(document_date), synced_at))     AS source_updated_at,
+    1                                                      AS source_priority
+  FROM ${ref("dw_1_silver_visma", "fact_customer_invoice")}
+  WHERE customer_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+sales_order_customer_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    sales_order_customer_name                              AS customer_name,
+    sales_order_organization_name                          AS organization_name,
+    sales_order_synced_at                                  AS synced_at,
+    TIMESTAMP(last_sales_order_date)                       AS source_updated_at,
+    2                                                      AS source_priority
+  FROM sales_order_customer_activity
+),
+
+customer_payment_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    ARRAY_AGG(
+      customer_name IGNORE NULLS
+      ORDER BY application_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS customer_name,
+    ARRAY_AGG(
+      organization_name IGNORE NULLS
+      ORDER BY application_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS organization_name,
+    ARRAY_AGG(
+      synced_at IGNORE NULLS
+      ORDER BY application_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS synced_at,
+    MAX(COALESCE(TIMESTAMP(application_date), synced_at))  AS source_updated_at,
+    3                                                      AS source_priority
+  FROM ${ref("dw_1_silver_visma", "fact_customer_payment")}
+  WHERE customer_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+customer_credit_note_refs AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    ARRAY_AGG(
+      customer_name IGNORE NULLS
+      ORDER BY document_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS customer_name,
+    ARRAY_AGG(
+      organization_name IGNORE NULLS
+      ORDER BY document_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS organization_name,
+    ARRAY_AGG(
+      synced_at IGNORE NULLS
+      ORDER BY document_date DESC, synced_at DESC
+      LIMIT 1
+    )[SAFE_OFFSET(0)]                                      AS synced_at,
+    MAX(COALESCE(TIMESTAMP(document_date), synced_at))     AS source_updated_at,
+    4                                                      AS source_priority
+  FROM ${ref("dw_1_silver_visma", "fact_customer_credit_note")}
+  WHERE customer_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+fallback_customer_refs AS (
+  SELECT * FROM customer_invoice_refs
+  UNION ALL
+  SELECT * FROM sales_order_customer_refs
+  UNION ALL
+  SELECT * FROM customer_payment_refs
+  UNION ALL
+  SELECT * FROM customer_credit_note_refs
+),
+
+missing_customer_refs AS (
+  SELECT
+    r.tenant_id,
+    r.customer_id,
+    r.organization_name,
+    r.synced_at,
+    r.customer_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.tenant_id, r.customer_id
+      ORDER BY r.source_priority ASC, r.source_updated_at DESC NULLS LAST
+    )                                                      AS customer_rank
+  FROM fallback_customer_refs AS r
+  LEFT JOIN master_customers AS m
+    ON m.tenant_id = r.tenant_id
+   AND m.customer_id = r.customer_id
+  WHERE r.customer_id IS NOT NULL
+    AND m.customer_id IS NULL
+),
+
+master_customers_enriched AS (
+  SELECT
+    m.*,
+    COALESCE(so.sales_order_count, 0)                      AS sales_order_count,
+    so.last_sales_order_date,
+    COALESCE(so.sales_order_count, 0) > 0                  AS has_sales_orders,
+    COALESCE(direct.distinct_location_price_class_count, 0)
+                                                           AS distinct_location_price_class_count,
+    COALESCE(direct.has_multiple_direct_price_classes, FALSE)
+                                                           AS has_multiple_location_price_classes,
+    direct.unique_direct_price_class_id,
+    direct.unique_direct_price_class_description,
+    direct.sample_location_price_classes,
+    COALESCE(inferred.inferred_price_class_count, 0)       AS inferred_price_class_count,
+    inferred.unique_inferred_price_class_id,
+    inferred.unique_inferred_price_class_description,
+    inferred.inferred_price_class_evidence,
+    COALESCE(customer_specific.customer_specific_price_match_count, 0)
+                                                           AS customer_specific_price_match_count,
+    customer_specific.customer_specific_price_evidence
+  FROM master_customers AS m
+  LEFT JOIN sales_order_customer_activity AS so
+    ON so.tenant_id = m.tenant_id
+   AND so.customer_id = m.customer_id
+  LEFT JOIN direct_sales_order_price_class_resolved AS direct
+    ON direct.tenant_id = m.tenant_id
+   AND direct.customer_id = m.customer_id
+  LEFT JOIN inferred_sales_order_price_class_resolved AS inferred
+    ON inferred.tenant_id = m.tenant_id
+   AND inferred.customer_id = m.customer_id
+  LEFT JOIN customer_specific_price_hits AS customer_specific
+    ON customer_specific.tenant_id = m.tenant_id
+   AND customer_specific.customer_id = m.customer_id
+),
+
+base_dimension AS (
+  SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(tenant_id AS STRING), '|',
+    CAST(customer_id AS STRING)
+  ))                                                       AS customer_key,
+  tenant_id,
+  customer_id,
+  customer_internal_id,
+  customer_acumatica_id,
+  organization_name,
+  synced_at,
+  customer_name,
+  customer_class,
+  customer_class_description,
+  source_price_class_id,
+  source_price_class_description,
+  default_location_id,
+  default_location_price_class_id,
+  default_location_price_class_source,
+  customer_class_price_class_lookup_id,
+  customer_class_price_class_lookup_description,
+  has_sales_orders,
+  sales_order_count,
+  last_sales_order_date,
+  distinct_location_price_class_count,
+  has_multiple_location_price_classes,
+  inferred_price_class_count,
+  customer_specific_price_match_count,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN unique_direct_price_class_id
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN unique_inferred_price_class_id
+    ELSE NULL
+  END                                                      AS sales_order_unique_price_class_id,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN unique_direct_price_class_description
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN unique_inferred_price_class_description
+    ELSE NULL
+  END                                                      AS sales_order_unique_price_class_description,
+  sample_location_price_classes,
+  inferred_price_class_evidence,
+  customer_specific_price_evidence,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN unique_direct_price_class_id
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN unique_inferred_price_class_id
+    ELSE NULL
+  END                                                      AS price_class_id,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN unique_direct_price_class_description
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN unique_inferred_price_class_description
+    ELSE NULL
+  END                                                      AS price_class_description,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN COALESCE(
+        CONCAT(
+          unique_direct_price_class_id,
+          ' - ',
+          unique_direct_price_class_description
+        ),
+        unique_direct_price_class_description,
+        unique_direct_price_class_id
+      )
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN COALESCE(
+        CONCAT(
+          unique_inferred_price_class_id,
+          ' - ',
+          unique_inferred_price_class_description
+        ),
+        unique_inferred_price_class_description,
+        unique_inferred_price_class_id
+      )
+    ELSE NULL
+  END                                                      AS price_class,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN 'sales_order_order_location_price_class'
+    WHEN has_sales_orders AND distinct_location_price_class_count > 1
+      THEN 'sales_order_multiple_order_location_price_classes_conflict'
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN 'sales_order_price_signature_inferred'
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count > 1
+      THEN 'sales_order_price_signature_conflict'
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND customer_specific_price_match_count > 0
+      THEN 'sales_order_customer_specific_pricing_no_class'
+    WHEN has_sales_orders
+      THEN 'sales_order_no_price_class_evidence'
+    ELSE 'not_in_sales_orders'
+  END                                                      AS price_class_mapping_method,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN 'customer_locations.priceClassId'
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN 'sales_orders_v3.lines.unitPrice -> customer_sales_prices.priceCode'
+    ELSE NULL
+  END                                                      AS price_class_mapping_source_field,
+  CASE
+    WHEN has_sales_orders AND distinct_location_price_class_count = 1
+      THEN unique_direct_price_class_id
+    WHEN has_sales_orders
+     AND distinct_location_price_class_count = 0
+     AND inferred_price_class_count = 1
+      THEN unique_inferred_price_class_id
+    ELSE NULL
+  END                                                      AS price_class_mapping_source_code,
+  currency_id,
+  sales_account_id,
+  export_type,
+  credit_limit,
+  credit_days_past_due,
+  credit_terms,
+  credit_terms_description,
+  corporate_id,
+  location_id,
+  main_address_line1,
+  main_address_line2,
+  main_city,
+  main_postal_code,
+  main_state,
+  main_country,
+  main_contact_name,
+  main_contact_email,
+  main_contact_phone,
+  consolidate_invoices,
+  accept_auto_invoices,
+  exclude_debt_collection,
+  invoice_to_default_location,
+  print_invoices,
+  print_statements,
+  print_dunning_letters,
+  created_at,
+  last_modified_at,
+  'visma'                                                  AS source_system
+  FROM master_customers_enriched
+
+  UNION ALL
+
+  SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(r.tenant_id AS STRING), '|',
+    CAST(r.customer_id AS STRING)
+  ))                                                       AS customer_key,
+  r.tenant_id,
+  r.customer_id,
+  CAST(NULL AS STRING)                                     AS customer_internal_id,
+  CAST(NULL AS STRING)                                     AS customer_acumatica_id,
+  r.organization_name,
+  r.synced_at,
+  r.customer_name,
+  CAST(NULL AS STRING)                                     AS customer_class,
+  CAST(NULL AS STRING)                                     AS customer_class_description,
+  CAST(NULL AS STRING)                                     AS source_price_class_id,
+  CAST(NULL AS STRING)                                     AS source_price_class_description,
+  CAST(NULL AS STRING)                                     AS default_location_id,
+  CAST(NULL AS STRING)                                     AS default_location_price_class_id,
+  CAST(NULL AS STRING)                                     AS default_location_price_class_source,
+  CAST(NULL AS STRING)                                     AS customer_class_price_class_lookup_id,
+  CAST(NULL AS STRING)                                     AS customer_class_price_class_lookup_description,
+  COALESCE(so.sales_order_count, 0) > 0                    AS has_sales_orders,
+  COALESCE(so.sales_order_count, 0)                        AS sales_order_count,
+  so.last_sales_order_date,
+  COALESCE(direct.distinct_location_price_class_count, 0)  AS distinct_location_price_class_count,
+  COALESCE(direct.has_multiple_direct_price_classes, FALSE)
+                                                           AS has_multiple_location_price_classes,
+  COALESCE(inferred.inferred_price_class_count, 0)         AS inferred_price_class_count,
+  COALESCE(customer_specific.customer_specific_price_match_count, 0)
+                                                           AS customer_specific_price_match_count,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN direct.unique_direct_price_class_id
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN inferred.unique_inferred_price_class_id
+    ELSE NULL
+  END                                                      AS sales_order_unique_price_class_id,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN direct.unique_direct_price_class_description
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN inferred.unique_inferred_price_class_description
+    ELSE NULL
+  END                                                      AS sales_order_unique_price_class_description,
+  direct.sample_location_price_classes,
+  inferred.inferred_price_class_evidence,
+  customer_specific.customer_specific_price_evidence,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN direct.unique_direct_price_class_id
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN inferred.unique_inferred_price_class_id
+    ELSE NULL
+  END                                                      AS price_class_id,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN direct.unique_direct_price_class_description
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN inferred.unique_inferred_price_class_description
+    ELSE NULL
+  END                                                      AS price_class_description,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN COALESCE(
+        CONCAT(
+          direct.unique_direct_price_class_id,
+          ' - ',
+          direct.unique_direct_price_class_description
+        ),
+        direct.unique_direct_price_class_description,
+        direct.unique_direct_price_class_id
+      )
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN COALESCE(
+        CONCAT(
+          inferred.unique_inferred_price_class_id,
+          ' - ',
+          inferred.unique_inferred_price_class_description
+        ),
+        inferred.unique_inferred_price_class_description,
+        inferred.unique_inferred_price_class_id
+      )
+    ELSE NULL
+  END                                                      AS price_class,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN 'sales_order_order_location_price_class'
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) > 1
+      THEN 'sales_order_multiple_order_location_price_classes_conflict'
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN 'sales_order_price_signature_inferred'
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) > 1
+      THEN 'sales_order_price_signature_conflict'
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(customer_specific.customer_specific_price_match_count, 0) > 0
+      THEN 'sales_order_customer_specific_pricing_no_class'
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+      THEN 'sales_order_no_price_class_evidence'
+    ELSE 'not_in_sales_orders'
+  END                                                      AS price_class_mapping_method,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN 'customer_locations.priceClassId'
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN 'sales_orders_v3.lines.unitPrice -> customer_sales_prices.priceCode'
+    ELSE NULL
+  END                                                      AS price_class_mapping_source_field,
+  CASE
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 1
+      THEN direct.unique_direct_price_class_id
+    WHEN COALESCE(so.sales_order_count, 0) > 0
+     AND COALESCE(direct.distinct_location_price_class_count, 0) = 0
+     AND COALESCE(inferred.inferred_price_class_count, 0) = 1
+      THEN inferred.unique_inferred_price_class_id
+    ELSE NULL
+  END                                                      AS price_class_mapping_source_code,
+  CAST(NULL AS STRING)                                     AS currency_id,
+  CAST(NULL AS STRING)                                     AS sales_account_id,
+  CAST(NULL AS STRING)                                     AS export_type,
+  CAST(NULL AS FLOAT64)                                    AS credit_limit,
+  CAST(NULL AS INT64)                                      AS credit_days_past_due,
+  CAST(NULL AS STRING)                                     AS credit_terms,
+  CAST(NULL AS STRING)                                     AS credit_terms_description,
+  CAST(NULL AS STRING)                                     AS corporate_id,
+  CAST(NULL AS STRING)                                     AS location_id,
+  CAST(NULL AS STRING)                                     AS main_address_line1,
+  CAST(NULL AS STRING)                                     AS main_address_line2,
+  CAST(NULL AS STRING)                                     AS main_city,
+  CAST(NULL AS STRING)                                     AS main_postal_code,
+  CAST(NULL AS STRING)                                     AS main_state,
+  CAST(NULL AS STRING)                                     AS main_country,
+  CAST(NULL AS STRING)                                     AS main_contact_name,
+  CAST(NULL AS STRING)                                     AS main_contact_email,
+  CAST(NULL AS STRING)                                     AS main_contact_phone,
+  CAST(NULL AS BOOL)                                       AS consolidate_invoices,
+  CAST(NULL AS BOOL)                                       AS accept_auto_invoices,
+  CAST(NULL AS BOOL)                                       AS exclude_debt_collection,
+  CAST(NULL AS BOOL)                                       AS invoice_to_default_location,
+  CAST(NULL AS BOOL)                                       AS print_invoices,
+  CAST(NULL AS BOOL)                                       AS print_statements,
+  CAST(NULL AS BOOL)                                       AS print_dunning_letters,
+  CAST(NULL AS TIMESTAMP)                                  AS created_at,
+  CAST(NULL AS TIMESTAMP)                                  AS last_modified_at,
+  'visma'                                                  AS source_system
+  FROM missing_customer_refs AS r
+  LEFT JOIN sales_order_customer_activity AS so
+    ON so.tenant_id = r.tenant_id
+   AND so.customer_id = r.customer_id
+  LEFT JOIN direct_sales_order_price_class_resolved AS direct
+    ON direct.tenant_id = r.tenant_id
+   AND direct.customer_id = r.customer_id
+  LEFT JOIN inferred_sales_order_price_class_resolved AS inferred
+    ON inferred.tenant_id = r.tenant_id
+   AND inferred.customer_id = r.customer_id
+  LEFT JOIN customer_specific_price_hits AS customer_specific
+    ON customer_specific.tenant_id = r.tenant_id
+   AND customer_specific.customer_id = r.customer_id
+  WHERE r.customer_rank = 1
+),
+
+base_dimension_with_corporate_norm AS (
+  SELECT
+    b.*,
+    CASE
+      WHEN corporate_id_norm_raw IN (
+        '0', '00', '000000000', '0000000000', '999999999', '9999999999',
+        'NULL', 'NONE', 'NAN'
+      ) THEN NULL
+      ELSE corporate_id_norm_raw
+    END                                                    AS corporate_id_norm
+  FROM (
+    SELECT
+      b.*,
+      CASE
+        WHEN b.corporate_id IS NULL THEN NULL
+        ELSE NULLIF(
+          UPPER(REGEXP_REPLACE(TRIM(b.corporate_id), r'[^A-Z0-9]', '')),
+          ''
+        )
+      END                                                  AS corporate_id_norm_raw
+    FROM base_dimension AS b
+  ) AS b
+),
+
+safe_corporate_merge_groups AS (
+  SELECT
+    corporate_id_norm,
+    COUNT(DISTINCT tenant_id)                              AS group_tenant_count,
+    COUNTIF(price_class_id IS NOT NULL)                    AS supporting_customer_count,
+    COUNT(DISTINCT IF(price_class_id IS NOT NULL, tenant_id, NULL))
+                                                           AS supporting_tenant_count,
+    COUNT(DISTINCT IF(price_class_id IS NOT NULL, price_class_id, NULL))
+                                                           AS distinct_price_class_count,
+    ARRAY_AGG(DISTINCT price_class_id IGNORE NULLS ORDER BY price_class_id)
+                                                           AS supporting_price_class_ids,
+    ARRAY_AGG(
+      DISTINCT price_class_description IGNORE NULLS
+      ORDER BY price_class_description
+    )                                                      AS supporting_price_class_descriptions,
+    STRING_AGG(
+      DISTINCT CONCAT(organization_name, ':', customer_id, ':', customer_name),
+      ' | '
+      ORDER BY CONCAT(organization_name, ':', customer_id, ':', customer_name)
+      LIMIT 10
+    )                                                      AS sample_supporting_customers
+  FROM base_dimension_with_corporate_norm
+  WHERE corporate_id_norm IS NOT NULL
+  GROUP BY 1
+  HAVING group_tenant_count > 1
+     AND supporting_customer_count > 0
+     AND distinct_price_class_count = 1
+),
+
+safe_corporate_merge_candidates AS (
+  SELECT
+    b.customer_key,
+    b.tenant_id,
+    b.customer_id,
+    b.organization_name,
+    g.corporate_id_norm,
+    g.group_tenant_count,
+    g.supporting_tenant_count,
+    g.supporting_customer_count,
+    g.supporting_price_class_ids[OFFSET(0)]                AS candidate_price_class_id,
+    COALESCE(
+      codebook.price_class_description,
+      g.supporting_price_class_descriptions[SAFE_OFFSET(0)]
+    )                                                      AS candidate_price_class_description,
+    g.sample_supporting_customers
+  FROM base_dimension_with_corporate_norm AS b
+  JOIN safe_corporate_merge_groups AS g
+    ON g.corporate_id_norm = b.corporate_id_norm
+  LEFT JOIN tenant_price_class_codebook AS codebook
+    ON codebook.tenant_id = b.tenant_id
+   AND codebook.price_class_id = g.supporting_price_class_ids[OFFSET(0)]
+  WHERE b.price_class_id IS NULL
+    AND codebook.price_class_id IS NOT NULL
+)
+
+SELECT
+  b.customer_key,
+  b.tenant_id,
+  b.customer_id,
+  b.customer_internal_id,
+  b.customer_acumatica_id,
+  b.organization_name,
+  b.synced_at,
+  b.customer_name,
+  b.customer_class,
+  b.customer_class_description,
+  b.source_price_class_id,
+  b.source_price_class_description,
+  b.default_location_id,
+  b.default_location_price_class_id,
+  b.default_location_price_class_source,
+  b.customer_class_price_class_lookup_id,
+  b.customer_class_price_class_lookup_description,
+  b.has_sales_orders,
+  b.sales_order_count,
+  b.last_sales_order_date,
+  b.distinct_location_price_class_count,
+  b.has_multiple_location_price_classes,
+  b.inferred_price_class_count,
+  b.customer_specific_price_match_count,
+  b.sales_order_unique_price_class_id,
+  b.sales_order_unique_price_class_description,
+  b.sample_location_price_classes,
+  b.inferred_price_class_evidence,
+  b.customer_specific_price_evidence,
+  COALESCE(b.price_class_id, m.candidate_price_class_id)   AS price_class_id,
+  COALESCE(
+    b.price_class_description,
+    m.candidate_price_class_description
+  )                                                        AS price_class_description,
+  CASE
+    WHEN b.price_class_id IS NOT NULL THEN b.price_class
+    WHEN m.candidate_price_class_id IS NOT NULL
+      THEN COALESCE(
+        CONCAT(
+          m.candidate_price_class_id,
+          ' - ',
+          m.candidate_price_class_description
+        ),
+        m.candidate_price_class_description,
+        m.candidate_price_class_id
+      )
+    ELSE NULL
+  END                                                      AS price_class,
+  CASE
+    WHEN b.price_class_id IS NOT NULL
+      THEN b.price_class_mapping_method
+    WHEN m.candidate_price_class_id IS NOT NULL
+      THEN 'cross_tenant_corporate_id_safe_merge'
+    ELSE b.price_class_mapping_method
+  END                                                      AS price_class_mapping_method,
+  CASE
+    WHEN b.price_class_id IS NOT NULL
+      THEN b.price_class_mapping_source_field
+    WHEN m.candidate_price_class_id IS NOT NULL
+      THEN 'cross_tenant.corporate_id -> unique cross-tenant price_class'
+    ELSE b.price_class_mapping_source_field
+  END                                                      AS price_class_mapping_source_field,
+  CASE
+    WHEN b.price_class_id IS NOT NULL
+      THEN b.price_class_mapping_source_code
+    WHEN m.candidate_price_class_id IS NOT NULL
+      THEN m.candidate_price_class_id
+    ELSE b.price_class_mapping_source_code
+  END                                                      AS price_class_mapping_source_code,
+  m.corporate_id_norm                                      AS cross_tenant_merge_corporate_id_norm,
+  m.group_tenant_count                                     AS cross_tenant_merge_group_tenant_count,
+  m.candidate_price_class_id                               AS cross_tenant_merge_candidate_price_class_id,
+  m.candidate_price_class_description                      AS cross_tenant_merge_candidate_price_class_description,
+  m.supporting_tenant_count                                AS cross_tenant_merge_supporting_tenant_count,
+  m.supporting_customer_count                              AS cross_tenant_merge_supporting_customer_count,
+  m.sample_supporting_customers                            AS cross_tenant_merge_sample_customers,
+  b.currency_id,
+  b.sales_account_id,
+  b.export_type,
+  b.credit_limit,
+  b.credit_days_past_due,
+  b.credit_terms,
+  b.credit_terms_description,
+  b.corporate_id,
+  b.location_id,
+  b.main_address_line1,
+  b.main_address_line2,
+  b.main_city,
+  b.main_postal_code,
+  b.main_state,
+  b.main_country,
+  b.main_contact_name,
+  b.main_contact_email,
+  b.main_contact_phone,
+  b.consolidate_invoices,
+  b.accept_auto_invoices,
+  b.exclude_debt_collection,
+  b.invoice_to_default_location,
+  b.print_invoices,
+  b.print_statements,
+  b.print_dunning_letters,
+  b.created_at,
+  b.last_modified_at,
+  b.source_system
+FROM base_dimension_with_corporate_norm AS b
+LEFT JOIN safe_corporate_merge_candidates AS m
+  ON m.customer_key = b.customer_key

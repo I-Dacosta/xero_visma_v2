@@ -1,0 +1,73 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_purchase_order_line",
+  description: "Silver: Purchase order line items from Xero Accounting API. Grain: one row per tenant_id + purchase_order_id + line_item_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_purchase_order_line.sqlx
+-- Silver fact: Purchase order line items (Xero)
+-- Source:  dw_1_bronze_xero.xero_purchase_orders (LineItems[] unnested)
+-- Grain:   one row per tenant_id + purchase_order_id + line_item_id
+-- Note:    Tracking[] flattened inline (Xero max 2 per line).
+--          PO lines may not carry AccountID (only AccountCode).
+-- FK refs: purchase_order_id → dw_1_silver_xero.fact_purchase_order
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_purchase_orders")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS purchase_order_id,
+    line
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.LineItems')) AS line
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  purchase_order_id,
+
+  JSON_VALUE(line, '$.LineItemID')                                    AS line_item_id,
+  JSON_VALUE(line, '$.ItemCode')                                      AS item_code,
+  JSON_VALUE(line, '$.AccountCode')                                   AS account_code,
+
+  JSON_VALUE(line, '$.Description')                                   AS description,
+  SAFE_CAST(JSON_VALUE(line, '$.Quantity')      AS FLOAT64)           AS quantity,
+  SAFE_CAST(JSON_VALUE(line, '$.UnitAmount')    AS FLOAT64)           AS unit_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.LineAmount')    AS FLOAT64)           AS line_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.TaxAmount')     AS FLOAT64)           AS tax_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.DiscountRate')  AS FLOAT64)           AS discount_rate,
+  JSON_VALUE(line, '$.TaxType')                                       AS tax_type,
+
+  -- Tracking category 1
+  JSON_VALUE(line, '$.Tracking[0].TrackingCategoryID')                AS tracking_category_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Name')                              AS tracking_category_1_name,
+  JSON_VALUE(line, '$.Tracking[0].TrackingOptionID')                  AS tracking_option_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Option')                            AS tracking_option_1_name,
+
+  -- Tracking category 2
+  JSON_VALUE(line, '$.Tracking[1].TrackingCategoryID')                AS tracking_category_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Name')                              AS tracking_category_2_name,
+  JSON_VALUE(line, '$.Tracking[1].TrackingOptionID')                  AS tracking_option_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Option')                            AS tracking_option_2_name,
+
+  'xero'                                                              AS _source
+
+FROM unnested

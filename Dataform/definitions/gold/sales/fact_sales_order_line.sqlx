@@ -1,0 +1,175 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_sales",
+  name: "fact_sales_order_line",
+  description: "Sales order line fact at order-line grain. Includes customer, item, warehouse, salesperson, source business-unit logic, and both local-currency and NOK commercial amounts.",
+  tags: ["gold", "sales", "fact"]
+}
+
+-- =============================================================================
+-- Gold sales fact: Sales order lines
+-- Source: dw_1_silver_visma.fact_sales_order_line
+-- Grain: one row per tenant + order_id + line_nbr
+-- Key rule: sales_order_key is tenant + order_id, independent of BU
+-- =============================================================================
+
+WITH sales_order_line_base AS (
+  SELECT
+    f.*,
+    COALESCE(f.line_sales_person_id, f.sales_person_id)
+                                                  AS resolved_sales_person_id,
+    f.line_sales_person_name                      AS resolved_sales_person_name
+  FROM ${ref("dw_1_silver_visma", "fact_sales_order_line")} AS f
+),
+enriched AS (
+  SELECT
+    f.*,
+    mr.currency_market_rate_daily_key,
+    mr.market_currency_rate_key,
+    mr.market_rate_date,
+    mr.market_exchange_rate_to_nok,
+    mr.market_inverse_exchange_rate_from_nok,
+    mr.market_rate_source,
+    COALESCE(mr.has_market_rate, FALSE)           AS has_market_rate_to_nok,
+    COALESCE(mr.is_rate_filled_forward, FALSE)    AS is_market_rate_filled_forward
+  FROM sales_order_line_base AS f
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS mr
+    ON mr.date_key = FARM_FINGERPRINT(CAST(f.order_date AS STRING))
+   AND mr.currency_key = FARM_FINGERPRINT(CAST(f.currency_id AS STRING))
+)
+
+SELECT
+  FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+
+  FARM_FINGERPRINT(CONCAT(
+    CAST(f.tenant_id AS STRING), '|',
+    CAST(f.order_id AS STRING)
+  ))                                              AS sales_order_key,
+
+  FARM_FINGERPRINT(CAST(f.order_date AS STRING))  AS date_key,
+
+  FARM_FINGERPRINT(CAST(f.currency_id AS STRING)) AS currency_key,
+
+  CASE
+    WHEN f.customer_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.customer_id AS STRING)
+    ))
+  END                                             AS customer_key,
+
+  CASE
+    WHEN f.inventory_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.inventory_id AS STRING)
+    ))
+  END                                             AS item_key,
+
+  CASE
+    WHEN f.line_warehouse_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.business_unit_id AS STRING), '|',
+      CAST(f.line_warehouse_id AS STRING)
+    ))
+  END                                             AS warehouse_key,
+
+  CASE
+    WHEN f.resolved_sales_person_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.resolved_sales_person_id AS STRING)
+    ))
+  END                                             AS sales_person_key,
+
+  CASE
+    WHEN f.account_id IS NOT NULL THEN CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.account_id AS STRING)
+    )
+  END                                             AS account_key,
+
+  f.tenant_id,
+  f.business_unit_id,
+  f.order_id,
+  f.order_no,
+  f.order_type,
+  f.line_nbr,
+  f.line_id,
+  f.line_sequence,
+  f.line_sort_order,
+  f.line_type,
+  f.line_operation,
+  f.inventory_description,
+  f.line_description,
+  f.unit_of_measure,
+  f.customer_id,
+  f.inventory_id,
+  f.currency_id,
+  f.supplier_id,
+  f.supplier_name,
+  f.line_warehouse_id                              AS warehouse_id,
+  f.sales_person_id                               AS header_sales_person_id,
+  f.line_sales_person_id,
+  f.resolved_sales_person_id,
+  f.resolved_sales_person_name,
+  f.account_id                                     AS source_account_id,
+  f.subaccount_id,
+  f.subaccount_segment_1,
+  f.subaccount_segment_2,
+  f.subaccount_segment_3,
+  f.line_project_id                               AS project_id,
+  f.requested_on,
+  f.ship_on,
+  f.is_completed,
+  f.is_free_item,
+  f.business_unit_match_rule,
+  f.line_business_unit_strategy,
+  f.line_is_zero_value,
+  f.line_is_material,
+
+  f.line_order_qty                                AS order_qty,
+  f.line_open_qty                                 AS open_qty,
+  f.line_qty_on_shipments                         AS qty_on_shipments,
+  f.unit_price,
+  f.unit_price_base,
+  f.line_discount_percent                         AS discount_percent,
+  f.line_discount_amount                          AS discount_amount,
+  f.line_discount_amount_base                     AS discount_amount_base,
+  f.line_amount                                   AS amount,
+  f.line_amount_base                              AS amount_base,
+  f.unit_cost,
+  f.unit_cost_base,
+  f.average_cost,
+  f.discounted_unit_price,
+  f.discounted_unit_price_base,
+  f.currency_market_rate_daily_key,
+  f.market_currency_rate_key,
+  f.market_rate_date,
+  f.market_exchange_rate_to_nok,
+  f.market_inverse_exchange_rate_from_nok,
+  f.market_rate_source,
+  f.has_market_rate_to_nok,
+  f.is_market_rate_filled_forward,
+  SAFE_MULTIPLY(f.line_amount, f.market_exchange_rate_to_nok)
+                                                  AS amount_market_nok,
+  SAFE_MULTIPLY(
+    SAFE_MULTIPLY(f.line_order_qty, COALESCE(f.unit_cost, f.average_cost)),
+    f.market_exchange_rate_to_nok
+  )                                               AS cost_amount_market_nok,
+
+  CASE
+    WHEN f.business_unit_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.business_unit_id AS STRING)
+    ))
+  END                                             AS business_unit_key,
+  bu.entity_code,
+  bu.business_unit_name,
+  bu.group_name,
+
+  'visma' AS source_system
+
+FROM enriched AS f
+LEFT JOIN ${ref("dw_1_silver_visma", "dim_business_unit")} AS bu
+  ON  bu.tenant_id        = f.tenant_id
+  AND bu.business_unit_id = f.business_unit_id
+  AND f.order_date >= bu.bu_valid_from
+  AND (bu.bu_valid_to IS NULL OR f.order_date <= bu.bu_valid_to)

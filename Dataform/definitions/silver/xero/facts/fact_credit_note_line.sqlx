@@ -1,0 +1,82 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_credit_note_line",
+  description: "Silver: Credit note line items from Xero Accounting API. Grain: one row per tenant_id + credit_note_id + line_item_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_credit_note_line.sqlx
+-- Silver fact: Credit note line items (Xero)
+-- Source:  dw_1_bronze_xero.xero_credit_notes (LineItems[] unnested)
+-- Grain:   one row per tenant_id + credit_note_id + line_item_id
+-- Note:    Tracking[] within each line is flattened to first two categories
+--          (Xero supports up to 2 tracking categories per line item).
+-- FK refs: credit_note_id → dw_1_silver_xero.fact_credit_note
+--          account_id     → dw_1_silver_xero.dim_account
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_credit_notes")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS credit_note_id,
+    line
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.LineItems')) AS line
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  credit_note_id,
+
+  -- Natural key for this line
+  JSON_VALUE(line, '$.LineItemID')                                    AS line_item_id,
+
+  -- Account FK
+  JSON_VALUE(line, '$.AccountID')                                     AS account_id,
+  JSON_VALUE(line, '$.AccountCode')                                   AS account_code,
+
+  -- Item reference
+  JSON_VALUE(line, '$.ItemCode')                                      AS item_code,
+
+  -- Description & amounts
+  JSON_VALUE(line, '$.Description')                                   AS description,
+  SAFE_CAST(JSON_VALUE(line, '$.Quantity')   AS FLOAT64)              AS quantity,
+  SAFE_CAST(JSON_VALUE(line, '$.UnitAmount') AS FLOAT64)              AS unit_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.LineAmount') AS FLOAT64)              AS line_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.TaxAmount')  AS FLOAT64)              AS tax_amount,
+  JSON_VALUE(line, '$.TaxType')                                       AS tax_type,
+  SAFE_CAST(JSON_VALUE(line, '$.DiscountRate')   AS FLOAT64)          AS discount_rate,
+  SAFE_CAST(JSON_VALUE(line, '$.DiscountAmount') AS FLOAT64)          AS discount_amount,
+
+  -- Tracking category 1 (Xero supports up to 2 per line)
+  JSON_VALUE(line, '$.Tracking[0].TrackingCategoryID')                AS tracking_category_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Name')                              AS tracking_category_1_name,
+  JSON_VALUE(line, '$.Tracking[0].TrackingOptionID')                  AS tracking_option_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Option')                            AS tracking_option_1_name,
+
+  -- Tracking category 2
+  JSON_VALUE(line, '$.Tracking[1].TrackingCategoryID')                AS tracking_category_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Name')                              AS tracking_category_2_name,
+  JSON_VALUE(line, '$.Tracking[1].TrackingOptionID')                  AS tracking_option_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Option')                            AS tracking_option_2_name,
+
+  'xero'                                                              AS _source
+
+FROM unnested

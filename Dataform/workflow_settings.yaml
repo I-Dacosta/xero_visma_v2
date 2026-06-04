@@ -1,0 +1,5 @@
+defaultProject: prj-dw-dev
+defaultDataset: dw_1_silver_visma_global
+defaultAssertionDataset: dw_1_silver_visma_global_assertions
+defaultLocation: europe-north2
+dataformCoreVersion: 3.0.42

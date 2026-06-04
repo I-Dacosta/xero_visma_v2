@@ -1,0 +1,70 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_credit_note_allocation",
+  description: "Silver: Credit note allocations to invoices from Xero Accounting API. Grain: one row per tenant_id + credit_note_id + allocation_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_credit_note_allocation.sqlx
+-- Silver fact: Credit note allocations (Xero)
+-- Source:  dw_1_bronze_xero.xero_credit_notes (Allocations[] unnested)
+-- Grain:   one row per tenant_id + credit_note_id + allocation_id
+-- Note:    Each allocation records how much of a credit note has been applied
+--          to a specific invoice — essential for AR reconciliation.
+--          Date uses Xero's /Date(ms±offset)/ format.
+-- FK refs: credit_note_id → dw_1_silver_xero.fact_credit_note
+--          invoice_id     → dw_1_silver_xero.fact_invoice (future)
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_credit_notes")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS credit_note_id,
+    alloc
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Allocations')) AS alloc
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  credit_note_id,
+
+  -- Natural key for this allocation
+  JSON_VALUE(alloc, '$.AllocationID')                                 AS allocation_id,
+
+  -- Invoice FK (the invoice this credit note amount was applied to)
+  JSON_VALUE(alloc, '$.Invoice.InvoiceID')                            AS invoice_id,
+  JSON_VALUE(alloc, '$.Invoice.InvoiceNumber')                        AS invoice_number,
+
+  -- Amount applied
+  SAFE_CAST(JSON_VALUE(alloc, '$.Amount') AS FLOAT64)                 AS allocated_amount,
+
+  -- Date of allocation — Xero /Date(ms±offset)/ format
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(
+      REGEXP_EXTRACT(JSON_VALUE(alloc, '$.Date'),
+        r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS allocation_date,
+
+  SAFE_CAST(JSON_VALUE(alloc, '$.IsDeleted') AS BOOL)                 AS is_deleted,
+
+  'xero'                                                              AS _source
+
+FROM unnested

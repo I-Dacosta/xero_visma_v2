@@ -1,0 +1,94 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_shipment_line",
+  description: "Shipment detail lines flattened from JSON. Grain: one row per detail line (tenant + shipmentNumber + lineNbr).",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Shipment detail lines (flattened from JSON array)
+-- Source: visma_shipments -> shipmentDetailLines (JSON string)
+-- Grain: one row per detail line (tenant + shipmentNumber + lineNbr)
+-- Why: Maps to Power BI fctShipmentDetailLines. Tracks which items
+--      were shipped in what quantities from which warehouse/location.
+-- =============================================================================
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+    SELECT
+        h.tenantId                                          AS tenant_id,
+        CAST(NULL AS STRING)                                AS raw_business_unit_id,
+        CAST(NULL AS STRING)                                AS business_unit_id,
+        h.shipmentNumber                                    AS shipment_number,
+        h.shipmentType                                      AS shipment_type,
+        h.status,
+        COALESCE(
+          SAFE_CAST(h.shipmentDate AS DATE),
+          DATE(SAFE_CAST(h.shipmentDate AS DATETIME)),
+          DATE(SAFE_CAST(h.shipmentDate AS TIMESTAMP))
+        )                                                   AS shipment_date,
+
+        -- Line dimension FKs
+        COALESCE(JSON_VALUE(line, '$.inventory.id'), JSON_VALUE(line, '$."inventory.id"'), JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.id'), JSON_VALUE(line, '$.inventoryId')) AS inventory_id,
+        COALESCE(JSON_VALUE(line, '$.warehouse.id'), JSON_VALUE(line, '$."warehouse.id"'), JSON_VALUE(JSON_VALUE(line, '$.warehouse'), '$.id'), JSON_VALUE(line, '$.warehouse')) AS warehouse_id,
+        COALESCE(JSON_VALUE(line, '$.location.id'), JSON_VALUE(line, '$."location.id"'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.id'), JSON_VALUE(line, '$.location')) AS location_id,
+        JSON_VALUE(line, '$.lotSerialNbr')                   AS lot_serial_nbr,
+
+        -- Degenerate dimensions
+        COALESCE(JSON_VALUE(line, '$.lineNbr'), JSON_VALUE(line, '$.lineNumber'), JSON_VALUE(line, '$.sortOrder')) AS line_nbr,
+        JSON_VALUE(line, '$.description')                    AS line_description,
+        COALESCE(JSON_VALUE(line, '$.uom'), JSON_VALUE(line, '$.uoM'), JSON_VALUE(line, '$.unitOfMeasure')) AS unit_of_measure,
+
+        -- Measures
+        SAFE_CAST(JSON_VALUE(line, '$.shippedQty') AS NUMERIC) AS shipped_qty,
+        SAFE_CAST(JSON_VALUE(line, '$.orderedQty') AS NUMERIC) AS ordered_qty
+
+    FROM ${ref("visma_shipments")} AS h
+    CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.shipmentDetailLines)) AS line
+    WHERE h.isDeleted = false OR h.isDeleted IS NULL
+),
+enriched AS (
+  SELECT
+    source_data.*,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    CASE
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value = '0' THEN 'segment_zero_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'unresolved'
+    END AS business_unit_resolution_method,
+    ROW_NUMBER() OVER (
+      PARTITION BY source_data.tenant_id, source_data.shipment_number, source_data.line_nbr, source_data.inventory_id
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        business_unit_mapping.valid_from DESC,
+        COALESCE(source_data.shipped_qty, 0) DESC,
+        COALESCE(source_data.ordered_qty, 0) DESC
+    ) AS bu_match_rank
+  FROM source_data
+  LEFT JOIN business_unit_mapping
+    ON source_data.tenant_id = business_unit_mapping.tenant_id
+   AND source_data.shipment_date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = '0'
+   )
+)
+SELECT
+  enriched.* EXCEPT (business_unit_id, mapped_bu_id, mapped_bu_name, bu_match_rank),
+  COALESCE(enriched.mapped_bu_id, enriched.business_unit_id) AS business_unit_id,
+  enriched.mapped_bu_name AS business_unit_name
+FROM enriched
+WHERE bu_match_rank = 1

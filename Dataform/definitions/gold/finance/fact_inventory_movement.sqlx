@@ -1,0 +1,68 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_inventory_movement",
+  description: "Inventory movement header fact table with surrogate key FKs, covering adjustments, issues, receipts, and transfers.",
+  tags: ["gold", "finance", "fact"]
+}
+
+-- =============================================================================
+-- fact_inventory_movement.sqlx
+-- Gold finance fact: Inventory movement headers (adjustments, issues, receipts, transfers)
+-- Source: dw_1_silver_visma.fact_inventory_movement
+-- Grain: one row per movement header
+-- =============================================================================
+
+SELECT
+    -- Surrogate FKs (conformed dimensions from gold_common)
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))   AS company_key,
+
+    FARM_FINGERPRINT(
+        CAST(f.date AS STRING)
+    )                                               AS date_key,
+
+    CASE
+      WHEN f.source_warehouse_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.source_warehouse_id AS STRING)
+      ))
+    END                                             AS source_warehouse_key,
+
+    CASE
+      WHEN f.destination_warehouse_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.destination_warehouse_id AS STRING)
+      ))
+    END                                             AS destination_warehouse_key,
+
+    -- Degenerate dimensions
+    f.tenant_id,
+    f.business_unit_id,
+    f.business_unit_name,
+    f.movement_type,
+    f.reference_number,
+    f.batch_number,
+    f.branch_number,
+    f.status,
+    f.post_period,
+    f.description,
+    f.control_quantity,
+    f.is_hold,
+    f.source_warehouse_id,
+    f.source_warehouse_name,
+    f.destination_warehouse_id,
+    f.destination_warehouse_name,
+    f.attachments_raw,
+    f.metadata_raw,
+    f.source_timestamp_raw,
+
+    -- Measures
+    f.total_quantity,
+    f.total_amount,
+
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "fact_inventory_movement")} AS f
+    

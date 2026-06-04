@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_customer_overdue_charges",
+  description: "Bronze: Customer overdue/dunning charge documents from Visma Global API."
+}

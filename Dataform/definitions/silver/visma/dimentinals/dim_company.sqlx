@@ -1,0 +1,41 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_company",
+  description: "Silver: Company/branch dimension. One row per tenant + branch. Source: visma_branches.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_company.sqlx
+-- Silver dimension: Company / branch / business unit
+-- Source: dw_1_bronze_visma.visma_branches
+-- Grain: one row per tenantId + branchId (latest non-deleted record)
+-- =============================================================================
+
+SELECT
+    -- Sync metadata
+    tenantId                                            AS tenant_id,
+    syncedAt                                            AS synced_at,
+
+    -- Natural keys
+    CAST(branchId AS STRING)                            AS branch_id,
+    number                                              AS business_unit_id,   -- branch code = BU identifier
+    name                                                AS branch_name,
+    name                                                AS business_unit_name,
+
+    -- Attributes
+    organizationName                                    AS organization_name,
+    CAST(organizationId AS STRING)                      AS organization_id,
+    corporateId                                         AS corporate_id,
+    isActive                                            AS is_active,
+    isMainBranch                                        AS is_main_branch,
+    vatRegistrationId                                   AS vat_registration_id,
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)        AS last_modified_at
+
+FROM ${ref("dw_1_bronze_visma", "visma_branches")}
+WHERE isDeleted IS DISTINCT FROM TRUE
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, branchId
+    ORDER BY syncedAt DESC
+) = 1

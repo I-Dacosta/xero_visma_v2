@@ -1,0 +1,179 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_customer_combined",
+  description: "Conformed cross-tenant customer dimension. Deduplicates finance customers first by normalized corporate ID, then by exact normalized name plus country, and finally falls back to tenant plus customer when no safe shared identity exists.",
+  tags: ["gold", "common", "dimension", "customer", "conformed"]
+}
+
+WITH base_customers AS (
+  SELECT
+    customer_key,
+    tenant_id,
+    customer_id,
+    organization_name,
+    synced_at,
+    customer_name,
+    corporate_id,
+    main_country,
+    main_city,
+    price_class_id,
+    price_class_description,
+    CASE
+      WHEN corporate_id IS NULL THEN NULL
+      ELSE NULLIF(
+        UPPER(REGEXP_REPLACE(TRIM(corporate_id), r'[^A-Z0-9]', '')),
+        ''
+      )
+    END                                                   AS corporate_id_norm_raw,
+    NULLIF(
+      UPPER(REGEXP_REPLACE(TRIM(customer_name), r'[^A-Z0-9]', '')),
+      ''
+    )                                                      AS customer_name_norm,
+    NULLIF(UPPER(TRIM(main_country)), '')                  AS main_country_norm
+  FROM ${ref("dw_1_gold_finance", "dim_customer")}
+),
+
+normalized_customers AS (
+  SELECT
+    customer_key,
+    tenant_id,
+    customer_id,
+    organization_name,
+    synced_at,
+    customer_name,
+    corporate_id,
+    main_country,
+    main_city,
+    price_class_id,
+    price_class_description,
+    CASE
+      WHEN corporate_id_norm_raw IN (
+        '0', '00', '000000000', '0000000000', '999999999', '9999999999',
+        'NULL', 'NONE', 'NAN'
+      ) THEN NULL
+      ELSE corporate_id_norm_raw
+    END                                                   AS corporate_id_norm,
+    customer_name_norm,
+    main_country_norm
+  FROM base_customers
+),
+
+match_base AS (
+  SELECT
+    *,
+    CASE
+      WHEN corporate_id_norm IS NOT NULL THEN 'corporate_id'
+      WHEN customer_name_norm IS NOT NULL
+       AND main_country_norm IS NOT NULL THEN 'name_country'
+      ELSE 'tenant_customer'
+    END                                                   AS combined_match_method,
+    CASE
+      WHEN corporate_id_norm IS NOT NULL THEN corporate_id_norm
+      WHEN customer_name_norm IS NOT NULL
+       AND main_country_norm IS NOT NULL THEN CONCAT(
+         main_country_norm, '|', customer_name_norm
+       )
+      ELSE CONCAT(tenant_id, '|', customer_id)
+    END                                                   AS combined_match_value
+  FROM normalized_customers
+),
+
+group_metrics AS (
+  SELECT
+    combined_match_method,
+    combined_match_value,
+    CONCAT(combined_match_method, '|', combined_match_value)
+                                                          AS customer_combined_key,
+    COUNT(*)                                              AS customer_reference_count,
+    COUNT(DISTINCT tenant_id)                             AS tenant_count,
+    COUNTIF(price_class_id IS NOT NULL)                   AS price_class_populated_count,
+    COUNT(DISTINCT IF(price_class_id IS NOT NULL, price_class_id, NULL))
+                                                          AS distinct_price_class_count,
+    ARRAY_AGG(DISTINCT price_class_id IGNORE NULLS)       AS nonnull_price_class_ids,
+    ARRAY_AGG(
+      DISTINCT price_class_description IGNORE NULLS
+    )                                                     AS nonnull_price_class_descriptions,
+    STRING_AGG(
+      DISTINCT organization_name,
+      ' | '
+      ORDER BY organization_name
+      LIMIT 8
+    )                                                     AS sample_organizations,
+    STRING_AGG(
+      DISTINCT customer_name,
+      ' | '
+      ORDER BY customer_name
+      LIMIT 8
+    )                                                     AS sample_customer_names
+  FROM match_base
+  GROUP BY 1, 2, 3
+),
+
+representative_customer AS (
+  SELECT
+    CONCAT(combined_match_method, '|', combined_match_value)
+                                                          AS customer_combined_key,
+    tenant_id                                             AS representative_tenant_id,
+    customer_id                                           AS representative_customer_id,
+    customer_key                                          AS representative_customer_key,
+    organization_name                                     AS representative_organization_name,
+    customer_name                                         AS representative_customer_name,
+    corporate_id                                          AS representative_corporate_id,
+    corporate_id_norm                                     AS representative_corporate_id_norm,
+    main_country                                          AS representative_main_country,
+    main_country_norm                                     AS representative_main_country_norm,
+    main_city                                             AS representative_main_city,
+    ROW_NUMBER() OVER (
+      PARTITION BY combined_match_method, combined_match_value
+      ORDER BY
+        CASE WHEN price_class_id IS NOT NULL THEN 1 ELSE 0 END DESC,
+        CASE WHEN corporate_id_norm IS NOT NULL THEN 1 ELSE 0 END DESC,
+        synced_at DESC,
+        tenant_id,
+        customer_id
+    )                                                     AS representative_rank
+  FROM match_base
+)
+
+SELECT
+  gm.customer_combined_key,
+  gm.combined_match_method,
+  gm.combined_match_value,
+  rc.representative_tenant_id,
+  rc.representative_customer_id,
+  rc.representative_customer_key,
+  rc.representative_organization_name,
+  rc.representative_customer_name,
+  rc.representative_corporate_id,
+  rc.representative_corporate_id_norm,
+  rc.representative_main_country,
+  rc.representative_main_country_norm,
+  rc.representative_main_city,
+  gm.tenant_count,
+  gm.customer_reference_count,
+  gm.price_class_populated_count,
+  gm.distinct_price_class_count,
+  CASE
+    WHEN ARRAY_LENGTH(gm.nonnull_price_class_ids) = 1
+      THEN gm.nonnull_price_class_ids[OFFSET(0)]
+    ELSE NULL
+  END                                                     AS unified_price_class_id,
+  CASE
+    WHEN ARRAY_LENGTH(gm.nonnull_price_class_ids) = 1
+     AND ARRAY_LENGTH(gm.nonnull_price_class_descriptions) >= 1
+      THEN gm.nonnull_price_class_descriptions[OFFSET(0)]
+    ELSE NULL
+  END                                                     AS unified_price_class_description,
+  (gm.tenant_count > 1)                                   AS is_cross_tenant_customer,
+  (
+    gm.tenant_count > 1
+    AND ARRAY_LENGTH(gm.nonnull_price_class_ids) = 1
+  )                                                       AS has_safe_unified_price_class,
+  gm.sample_organizations,
+  gm.sample_customer_names,
+  'visma'                                                 AS source_system
+FROM group_metrics AS gm
+JOIN representative_customer AS rc
+  ON rc.customer_combined_key = gm.customer_combined_key
+ AND rc.representative_rank = 1

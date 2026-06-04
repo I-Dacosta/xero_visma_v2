@@ -1,0 +1,31 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "dim_fixed_asset",
+  description: "Fixed asset register dimension. Maps to Power BI dimFixedAsset.",
+  tags: ["gold", "finance", "dimension"]
+}
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(business_unit_id AS STRING), '|',
+        CAST(asset_id AS STRING)
+    ))                                              AS fixed_asset_key,
+    tenant_id,
+    business_unit_id,
+    asset_id,
+    asset_description,
+    class_id,
+    asset_type,
+    record_type,
+    is_depreciable,
+    is_tangible,
+    location,
+    quantity,
+    useful_life,
+    book_balance,
+    last_modified_at,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_fixed_asset")}

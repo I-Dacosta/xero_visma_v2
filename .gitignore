@@ -24,9 +24,13 @@ __pycache__/
 app/gcp-credentials.json
 **/gcp-credentials*.json
 **/*-credentials.json
+**/*credentials-object.json
 **/service-account*.json
 *.pem
 *.key
+
+token.json
+node_modules_backup*/
 
 # IDE / editor
 .vscode/

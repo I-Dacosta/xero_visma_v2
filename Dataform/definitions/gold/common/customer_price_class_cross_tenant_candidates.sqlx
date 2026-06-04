@@ -1,0 +1,98 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "customer_price_class_cross_tenant_candidates",
+  description: "Cross-tenant candidate mappings for missing customer price class. Only includes customers whose combined cross-tenant identity matches on corporate ID, has exactly one non-null price class, and whose target tenant already exposes the same code in visma_price_classes.",
+  tags: ["gold", "common", "customer", "price-class", "candidate"]
+}
+
+WITH tenant_price_class_codebook AS (
+  SELECT DISTINCT
+    tenantId                                               AS tenant_id,
+    id                                                     AS price_class_id,
+    description                                            AS price_class_description
+  FROM ${ref("dw_1_bronze_visma", "visma_price_classes")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+),
+
+candidate_base AS (
+  SELECT
+    b.customer_key,
+    b.tenant_id,
+    b.customer_id,
+    b.organization_name,
+    b.customer_name,
+    b.corporate_id,
+    b.corporate_id_norm,
+    b.main_country,
+    b.customer_combined_key,
+    b.combined_match_method,
+    b.combined_match_confidence,
+    b.combined_tenant_count,
+    b.combined_customer_reference_count,
+    b.combined_distinct_price_class_count,
+    b.combined_unified_price_class_id,
+    b.combined_unified_price_class_description
+  FROM ${ref("dw_1_gold_common", "bridge_customer_to_combined")} AS b
+  WHERE b.price_class_id IS NULL
+    AND b.is_cross_tenant_customer
+    AND b.has_safe_unified_price_class
+    AND b.combined_match_method = 'corporate_id'
+),
+
+supporting_members AS (
+  SELECT
+    customer_combined_key,
+    COUNTIF(price_class_id IS NOT NULL)                    AS supporting_rows_with_price_class,
+    COUNT(DISTINCT IF(price_class_id IS NOT NULL, tenant_id, NULL))
+                                                          AS supporting_tenants_with_price_class,
+    STRING_AGG(
+      DISTINCT IF(
+        price_class_id IS NOT NULL,
+        CONCAT(organization_name, ': ', customer_name),
+        NULL
+      ),
+      ' | '
+      ORDER BY IF(
+        price_class_id IS NOT NULL,
+        CONCAT(organization_name, ': ', customer_name),
+        NULL
+      )
+      LIMIT 8
+    )                                                     AS sample_supporting_customers
+  FROM ${ref("dw_1_gold_common", "bridge_customer_to_combined")}
+  GROUP BY 1
+)
+
+SELECT
+  c.customer_key,
+  c.tenant_id,
+  c.customer_id,
+  c.organization_name,
+  c.customer_name,
+  c.corporate_id,
+  c.corporate_id_norm,
+  c.main_country,
+  c.customer_combined_key,
+  c.combined_match_method,
+  c.combined_match_confidence,
+  c.combined_tenant_count,
+  c.combined_customer_reference_count,
+  sm.supporting_rows_with_price_class,
+  sm.supporting_tenants_with_price_class,
+  c.combined_unified_price_class_id                       AS candidate_price_class_id,
+  COALESCE(
+    codebook.price_class_description,
+    c.combined_unified_price_class_description
+  )                                                       AS candidate_price_class_description,
+  TRUE                                                    AS target_tenant_has_same_codebook_entry,
+  sm.sample_supporting_customers,
+  'cross_tenant_unique_price_class_with_target_codebook_support'
+                                                          AS candidate_reason,
+  'visma'                                                 AS source_system
+FROM candidate_base AS c
+JOIN tenant_price_class_codebook AS codebook
+  ON codebook.tenant_id = c.tenant_id
+ AND codebook.price_class_id = c.combined_unified_price_class_id
+LEFT JOIN supporting_members AS sm
+  ON sm.customer_combined_key = c.customer_combined_key

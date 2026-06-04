@@ -1,0 +1,212 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_inventory_movement_line",
+  description: "Inventory movement lines flattened from nested JSON arrays (adjustments, issues, receipts, transfers). Grain: one row per movement line (tenant + movement_type + reference_number + line_number).",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Inventory movement lines (flattened from JSON arrays)
+-- Sources:
+--   visma_inventory_adjustments  → adjusmentLines (JSON string)
+--   visma_inventory_issues       → issueLines (JSON string)
+--   visma_inventory_receipts     → receiptLines (JSON string)
+--   visma_inventory_transfers    → transferLines (JSON string)
+-- Grain: one row per movement line (tenant + movement_type + reference_number + line_number)
+--
+-- NOTE: "adjusmentLines" is intentionally misspelled to match the source schema.
+-- =============================================================================
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+    -- Adjustment lines
+    SELECT
+        h.tenantId                                                  AS tenant_id,
+      CAST(NULL AS STRING)                                        AS raw_business_unit_id,
+      CAST(NULL AS STRING)                                        AS business_unit_id,
+        'ADJUSTMENT'                                                AS movement_type,
+        h.referenceNumber                                           AS reference_number,
+        COALESCE(
+          SAFE_CAST(h.date AS DATE),
+          DATE(SAFE_CAST(h.date AS DATETIME)),
+          DATE(SAFE_CAST(h.date AS TIMESTAMP))
+        )                                                           AS movement_date,
+        COALESCE(JSON_VALUE(line, '$.lineNumber'), JSON_VALUE(line, '$.lineNbr'), JSON_VALUE(line, '$.sortOrder')) AS line_number,
+        COALESCE(JSON_VALUE(line, '$.inventory.id'), JSON_VALUE(line, '$."inventory.id"'), JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.id'), JSON_VALUE(line, '$.inventoryId')) AS inventory_id,
+        COALESCE(JSON_VALUE(line, '$.inventory.description'), JSON_VALUE(line, '$."inventory.description"'), JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.description')) AS inventory_description,
+        COALESCE(JSON_VALUE(line, '$.warehouse.id'), JSON_VALUE(line, '$."warehouse.id"'), JSON_VALUE(JSON_VALUE(line, '$.warehouse'), '$.id'), JSON_VALUE(line, '$.warehouse')) AS warehouse_id,
+        CAST(NULL AS STRING)                                        AS destination_warehouse_id,
+        COALESCE(JSON_VALUE(line, '$.location.id'), JSON_VALUE(line, '$."location.id"'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.id'), JSON_VALUE(line, '$.location')) AS location_id,
+        COALESCE(JSON_VALUE(line, '$.location.name'), JSON_VALUE(line, '$."location.name"'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.name')) AS location_name,
+        CAST(NULL AS STRING)                                        AS to_location_id,
+        CAST(NULL AS STRING)                                        AS to_location_name,
+        JSON_VALUE(line, '$.description')                           AS line_description,
+        COALESCE(JSON_VALUE(line, '$.uoM'), JSON_VALUE(line, '$.uom'), JSON_VALUE(line, '$.unitOfMeasure')) AS unit_of_measure,
+        JSON_VALUE(line, '$.lotSerialNumber')                       AS lot_serial_number,
+        SAFE_CAST(JSON_VALUE(line, '$.quantity') AS NUMERIC)        AS quantity,
+        SAFE_CAST(JSON_VALUE(line, '$.unitCost') AS NUMERIC)        AS unit_cost,
+        SAFE_CAST(JSON_VALUE(line, '$.amount') AS NUMERIC)          AS amount,
+        CAST(NULL AS STRING)                                        AS allocations_raw,
+        CAST(NULL AS INT64)                                         AS allocation_count,
+        CAST(NULL AS STRING)                                        AS reason_code_id,
+        CAST(NULL AS STRING)                                        AS reason_code_description
+    FROM ${ref("visma_inventory_adjustments")} AS h
+    CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.adjusmentLines)) AS line
+    WHERE h.isDeleted = false OR h.isDeleted IS NULL
+
+    UNION ALL
+
+    -- Issue lines
+    SELECT
+        h.tenantId                                                  AS tenant_id,
+      CAST(NULL AS STRING)                                        AS raw_business_unit_id,
+      CAST(NULL AS STRING)                                        AS business_unit_id,
+        'ISSUE'                                                     AS movement_type,
+        h.referenceNumber                                           AS reference_number,
+        COALESCE(
+          SAFE_CAST(h.date AS DATE),
+          DATE(SAFE_CAST(h.date AS DATETIME)),
+          DATE(SAFE_CAST(h.date AS TIMESTAMP))
+        )                                                           AS movement_date,
+        COALESCE(JSON_VALUE(line, '$.lineNumber'), JSON_VALUE(line, '$.lineNbr'), JSON_VALUE(line, '$.sortOrder')) AS line_number,
+        COALESCE(JSON_VALUE(line, '$.inventory.id'), JSON_VALUE(line, '$."inventory.id"'), JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.id'), JSON_VALUE(line, '$.inventoryId')) AS inventory_id,
+        COALESCE(JSON_VALUE(line, '$.inventory.description'), JSON_VALUE(line, '$."inventory.description"'), JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.description')) AS inventory_description,
+        COALESCE(JSON_VALUE(line, '$.warehouse.id'), JSON_VALUE(line, '$."warehouse.id"'), JSON_VALUE(JSON_VALUE(line, '$.warehouse'), '$.id'), JSON_VALUE(line, '$.warehouse')) AS warehouse_id,
+        CAST(NULL AS STRING)                                        AS destination_warehouse_id,
+        COALESCE(JSON_VALUE(line, '$.location.id'), JSON_VALUE(line, '$."location.id"'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.id'), JSON_VALUE(line, '$.location')) AS location_id,
+        COALESCE(JSON_VALUE(line, '$.location.name'), JSON_VALUE(line, '$."location.name"'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.name')) AS location_name,
+        CAST(NULL AS STRING)                                        AS to_location_id,
+        CAST(NULL AS STRING)                                        AS to_location_name,
+        JSON_VALUE(line, '$.description')                           AS line_description,
+        COALESCE(JSON_VALUE(line, '$.uoM'), JSON_VALUE(line, '$.uom'), JSON_VALUE(line, '$.unitOfMeasure')) AS unit_of_measure,
+        JSON_VALUE(line, '$.lotSerialNumber')                       AS lot_serial_number,
+        SAFE_CAST(JSON_VALUE(line, '$.quantity') AS NUMERIC)        AS quantity,
+        SAFE_CAST(JSON_VALUE(line, '$.unitCost') AS NUMERIC)        AS unit_cost,
+        SAFE_CAST(JSON_VALUE(line, '$.amount') AS NUMERIC)          AS amount,
+        CAST(NULL AS STRING)                                        AS allocations_raw,
+        CAST(NULL AS INT64)                                         AS allocation_count,
+        CAST(NULL AS STRING)                                        AS reason_code_id,
+        CAST(NULL AS STRING)                                        AS reason_code_description
+    FROM ${ref("visma_inventory_issues")} AS h
+    CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.issueLines)) AS line
+    WHERE h.isDeleted = false OR h.isDeleted IS NULL
+
+    UNION ALL
+
+    -- Receipt lines
+    SELECT
+        h.tenantId                                                  AS tenant_id,
+      CAST(NULL AS STRING)                                        AS raw_business_unit_id,
+      CAST(NULL AS STRING)                                        AS business_unit_id,
+        'RECEIPT'                                                   AS movement_type,
+        h.referenceNumber                                           AS reference_number,
+        COALESCE(
+          SAFE_CAST(h.date AS DATE),
+          DATE(SAFE_CAST(h.date AS DATETIME)),
+          DATE(SAFE_CAST(h.date AS TIMESTAMP))
+        )                                                           AS movement_date,
+        COALESCE(JSON_VALUE(line, '$.lineNumber'), JSON_VALUE(line, '$.lineNbr'), JSON_VALUE(line, '$.sortOrder')) AS line_number,
+        COALESCE(JSON_VALUE(line, '$.inventory.id'), JSON_VALUE(line, '$."inventory.id"'), JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.id'), JSON_VALUE(line, '$.inventoryId')) AS inventory_id,
+        COALESCE(JSON_VALUE(line, '$.inventory.description'), JSON_VALUE(line, '$."inventory.description"'), JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.description')) AS inventory_description,
+        COALESCE(JSON_VALUE(line, '$.warehouse.id'), JSON_VALUE(line, '$."warehouse.id"'), JSON_VALUE(JSON_VALUE(line, '$.warehouse'), '$.id'), JSON_VALUE(line, '$.warehouse')) AS warehouse_id,
+        CAST(NULL AS STRING)                                        AS destination_warehouse_id,
+        COALESCE(JSON_VALUE(line, '$.location.id'), JSON_VALUE(line, '$."location.id"'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.id'), JSON_VALUE(line, '$.location')) AS location_id,
+        COALESCE(JSON_VALUE(line, '$.location.name'), JSON_VALUE(line, '$."location.name"'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.name')) AS location_name,
+        CAST(NULL AS STRING)                                        AS to_location_id,
+        CAST(NULL AS STRING)                                        AS to_location_name,
+        JSON_VALUE(line, '$.description')                           AS line_description,
+        COALESCE(JSON_VALUE(line, '$.uoM'), JSON_VALUE(line, '$.uom'), JSON_VALUE(line, '$.unitOfMeasure')) AS unit_of_measure,
+        JSON_VALUE(line, '$.lotSerialNumber')                       AS lot_serial_number,
+        SAFE_CAST(JSON_VALUE(line, '$.quantity') AS NUMERIC)        AS quantity,
+        SAFE_CAST(JSON_VALUE(line, '$.unitCost') AS NUMERIC)        AS unit_cost,
+        SAFE_CAST(JSON_VALUE(line, '$.amount') AS NUMERIC)          AS amount,
+        CAST(NULL AS STRING)                                        AS allocations_raw,
+        CAST(NULL AS INT64)                                         AS allocation_count,
+        CAST(NULL AS STRING)                                        AS reason_code_id,
+        CAST(NULL AS STRING)                                        AS reason_code_description
+    FROM ${ref("visma_inventory_receipts")} AS h
+    CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.receiptLines)) AS line
+    WHERE h.isDeleted = false OR h.isDeleted IS NULL
+
+    UNION ALL
+
+    -- Transfer lines
+    SELECT
+        h.tenantId                                                  AS tenant_id,
+      CAST(NULL AS STRING)                                        AS raw_business_unit_id,
+      CAST(NULL AS STRING)                                        AS business_unit_id,
+        'TRANSFER'                                                  AS movement_type,
+        h.referenceNumber                                           AS reference_number,
+        COALESCE(
+          SAFE_CAST(h.date AS DATE),
+          DATE(SAFE_CAST(h.date AS DATETIME)),
+          DATE(SAFE_CAST(h.date AS TIMESTAMP))
+        )                                                           AS movement_date,
+        COALESCE(JSON_VALUE(line, '$.lineNumber'), JSON_VALUE(line, '$.lineNbr'), JSON_VALUE(line, '$.sortOrder')) AS line_number,
+        COALESCE(JSON_VALUE(line, '$.inventoryItem.number'), JSON_VALUE(JSON_VALUE(line, '$.inventoryItem'), '$.number'), JSON_VALUE(line, '$.inventoryId')) AS inventory_id,
+        COALESCE(JSON_VALUE(line, '$.inventoryItem.description'), JSON_VALUE(JSON_VALUE(line, '$.inventoryItem'), '$.description')) AS inventory_description,
+        JSON_VALUE(h.warehouse, '$.id')                             AS warehouse_id,
+        JSON_VALUE(h.toWarehouse, '$.id')                           AS destination_warehouse_id,
+        COALESCE(JSON_VALUE(line, '$.location.id'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.id')) AS location_id,
+        COALESCE(JSON_VALUE(line, '$.location.name'), JSON_VALUE(JSON_VALUE(line, '$.location'), '$.name')) AS location_name,
+        COALESCE(JSON_VALUE(line, '$.toLocation.id'), JSON_VALUE(JSON_VALUE(line, '$.toLocation'), '$.id')) AS to_location_id,
+        COALESCE(JSON_VALUE(line, '$.toLocation.name'), JSON_VALUE(JSON_VALUE(line, '$.toLocation'), '$.name')) AS to_location_name,
+        JSON_VALUE(line, '$.description')                           AS line_description,
+        COALESCE(JSON_VALUE(line, '$.uoM'), JSON_VALUE(line, '$.uom'), JSON_VALUE(line, '$.unitOfMeasure')) AS unit_of_measure,
+        JSON_VALUE(line, '$.lotSerialNumber')                       AS lot_serial_number,
+        SAFE_CAST(JSON_VALUE(line, '$.quantity') AS NUMERIC)        AS quantity,
+        CAST(NULL AS NUMERIC)                                       AS unit_cost,
+        CAST(NULL AS NUMERIC)                                       AS amount,
+        JSON_QUERY(line, '$.allocations')                           AS allocations_raw,
+        ARRAY_LENGTH(JSON_QUERY_ARRAY(line, '$.allocations'))       AS allocation_count,
+        COALESCE(JSON_VALUE(line, '$.reasonCode.id'), JSON_VALUE(JSON_VALUE(line, '$.reasonCode'), '$.id')) AS reason_code_id,
+        COALESCE(JSON_VALUE(line, '$.reasonCode.description'), JSON_VALUE(JSON_VALUE(line, '$.reasonCode'), '$.description')) AS reason_code_description
+    FROM ${ref("visma_inventory_transfers")} AS h
+    CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.transferLines)) AS line
+    WHERE h.isDeleted = false OR h.isDeleted IS NULL
+),
+enriched AS (
+  SELECT
+    source_data.*,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    CASE
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value = '0' THEN 'segment_zero_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'unresolved'
+    END AS business_unit_resolution_method,
+    ROW_NUMBER() OVER (
+      PARTITION BY source_data.tenant_id, source_data.movement_type, source_data.reference_number, source_data.line_number, source_data.inventory_id
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        business_unit_mapping.valid_from DESC,
+        COALESCE(source_data.amount, 0) DESC,
+        COALESCE(source_data.quantity, 0) DESC
+    ) AS bu_match_rank
+  FROM source_data
+  LEFT JOIN business_unit_mapping
+    ON source_data.tenant_id = business_unit_mapping.tenant_id
+   AND source_data.movement_date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = '0'
+   )
+)
+SELECT
+  enriched.* EXCEPT (business_unit_id, mapped_bu_id, mapped_bu_name, bu_match_rank),
+  COALESCE(enriched.mapped_bu_id, enriched.business_unit_id) AS business_unit_id,
+  enriched.mapped_bu_name AS business_unit_name
+FROM enriched
+WHERE bu_match_rank = 1

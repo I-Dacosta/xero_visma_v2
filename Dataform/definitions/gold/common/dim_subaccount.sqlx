@@ -1,0 +1,27 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_subaccount",
+  description: "Conformed subaccount segment dimension for reporting on IC, BU, and department segments.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(tenant_id AS STRING), '|',
+    CAST(COALESCE(subaccount_number, subaccount_id) AS STRING)
+  ))                                                AS subaccount_key,
+  tenant_id,
+  subaccount_id,
+  subaccount_number,
+  subaccount_description,
+  is_active,
+  segment1,
+  segment1_value_description,
+  segment2,
+  segment2_value_description,
+  segment3,
+  segment3_value_description,
+  last_modified_at,
+  'visma' AS source_system
+FROM ${ref("dw_1_silver_visma", "dim_subaccount")}

@@ -1,0 +1,25 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "seed_rls_sales_person",
+  description: "Manual override mapping between Power BI user principal names and Visma salespersons for salesperson row-level security. Applied on top of auto email-based salesperson mapping.",
+  tags: ["seed", "silver", "excel", "security", "rls"]
+}
+
+-- Maintain one row per user principal name + tenant + salesperson.
+-- Use this only for overrides or shared-access cases that are not covered by the
+-- salesperson directory email mapping.
+-- Example:
+-- STRUCT('user@aquatiq.com', '33f319b9-4d57-11ee-960c-025417856183', '159', 'sales_person', TRUE, 'Example row')
+
+SELECT *
+FROM UNNEST(
+  ARRAY<STRUCT<
+    user_principal_name STRING,
+    tenant_id STRING,
+    sales_person_id STRING,
+    access_scope STRING,
+    is_active BOOL,
+    notes STRING
+  >>[]
+)

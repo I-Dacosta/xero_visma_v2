@@ -1,0 +1,24 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "customer_price_class_gap_report_summary",
+  description: "Aggregated summary of remaining customer price-class gaps by tenant, reason, and recommended fix.",
+  tags: ["gold", "common", "customer", "price-class", "report", "summary"]
+}
+
+SELECT
+  organization_name,
+  gap_reason,
+  recommended_action,
+  COUNT(*)                                                 AS customer_count,
+  COUNTIF(has_sales_orders)                                AS customers_with_sales_orders,
+  SUM(COALESCE(sales_order_count, 0))                      AS total_sales_order_count,
+  STRING_AGG(
+    DISTINCT customer_name,
+    ' | '
+    ORDER BY customer_name
+    LIMIT 8
+  )                                                        AS sample_customers,
+  'visma'                                                  AS source_system
+FROM ${ref("dw_1_gold_common", "customer_price_class_gap_report")}
+GROUP BY 1, 2, 3

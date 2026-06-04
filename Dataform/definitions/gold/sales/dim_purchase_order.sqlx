@@ -1,0 +1,39 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_sales",
+  name: "dim_purchase_order",
+  description: "Purchase order header dimension for the sales star schema. Maps to Power BI dimPurchaseOrder.",
+  tags: ["gold", "sales", "dimension"]
+}
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.order_nbr AS STRING)
+    ))                                              AS purchase_order_key,
+
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+
+    f.tenant_id,
+    f.business_unit_id,
+    f.order_nbr,
+    f.order_type,
+    f.status,
+    f.order_date,
+    f.promised_date,
+    f.supplier_id,
+    f.supplier_ref,
+    f.warehouse_id,
+    f.currency_id,
+    f.branch_id,
+    f.description,
+    f.order_total,
+    f.order_total_base,
+    f.open_balance,
+    f.open_quantity,
+    f.exchange_rate,
+    f.last_modified_at,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "fact_purchase_order")} AS f

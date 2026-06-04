@@ -1,0 +1,159 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "seed_chart_of_accounts",
+  description: "Bootstrap Chart of Accounts seed. Used as fallback until reference_data.xlsx is ingested via bronze.",
+  tags: ["seed", "silver", "excel", "reference"]
+}
+
+-- Seed data matching reference_data.xlsx (ChartOfAccounts sheet)
+-- This table maps Visma Global account codes to the group reporting structure.
+-- account_code_3 is the most granular level and should be matched against general ledger account numbers.
+
+SELECT * FROM UNNEST([
+  -- ═══════════════════════════════════════════════════
+  -- P&L: Revenue - Operating Income
+  -- ═══════════════════════════════════════════════════
+  STRUCT('P&L' AS bs_pl, 'Revenue' AS fsli_1, 'Operating income' AS fsli_2, 'Operating income' AS fsli_3, TRUE AS ebitda_flag, TRUE AS net_income_flag, 'Operating' AS cf1, 'EBITDA' AS cf2, CAST(NULL AS STRING) AS cf3, CAST(NULL AS STRING) AS nwc, CAST(NULL AS STRING) AS capex, 3000 AS account_code_1, 3000 AS account_code_2, 3000 AS account_code_3),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Revenue', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3000, 3010),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Product sales', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3000, 3030),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Project', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3000, 3040),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Service', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3000, 3050),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Software', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3000, 3060),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Consult and hours', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3000, 3070),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3000, 3080),
+  STRUCT('P&L', 'Revenue', 'Operating income', 'Operating income', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3500, 3550),
+
+  -- P&L: Revenue - Other Operating Income
+  STRUCT('P&L', 'Revenue', 'Other operating income', 'Other operating income', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3100, 3100),
+  STRUCT('P&L', 'Revenue', 'Other operating income', 'Rent', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3100, 3110),
+  STRUCT('P&L', 'Revenue', 'Other operating income', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 3000, 3100, 3120),
+
+  -- ═══════════════════════════════════════════════════
+  -- P&L: Cost of Goods Sold
+  -- ═══════════════════════════════════════════════════
+  STRUCT('P&L', 'Cost of goods sold', 'Cogs', 'Cost of Goods', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4000, 4000),
+  STRUCT('P&L', 'Cost of goods sold', 'Cogs', 'Writedowns', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4000, 4010),
+  STRUCT('P&L', 'Cost of goods sold', 'Cogs', 'Other cogs', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4000, 4020),
+  STRUCT('P&L', 'Cost of goods sold', 'Transport and logistics', 'Transport', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4100, 4100),
+  STRUCT('P&L', 'Cost of goods sold', 'Transport and logistics', 'Warehouse costs', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4100, 4110),
+  STRUCT('P&L', 'Cost of goods sold', 'Transport and logistics', 'Other logistics', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4100, 4120),
+  STRUCT('P&L', 'Cost of goods sold', 'Other cogs', 'External hire', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4200, 4200),
+  STRUCT('P&L', 'Cost of goods sold', 'Other cogs', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4200, 4210),
+  STRUCT('P&L', 'Cost of goods sold', 'Cogs', 'Other cogs', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4300, 4300),
+  STRUCT('P&L', 'Cost of goods sold', 'Cogs', 'Other cogs', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4400, 4400),
+  STRUCT('P&L', 'Cost of goods sold', 'Other cogs', 'Other cogs', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4700, 4700),
+  STRUCT('P&L', 'Cost of goods sold', 'Other cogs', 'Other cogs', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 4000, 4900, 4900),
+
+  -- ═══════════════════════════════════════════════════
+  -- P&L: Personnel Expenses
+  -- ═══════════════════════════════════════════════════
+  STRUCT('P&L', 'Personnel expenses', 'Salary', 'Salary', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5000, 5000),
+  STRUCT('P&L', 'Personnel expenses', 'Salary', 'Overtime', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5000, 5010),
+  STRUCT('P&L', 'Personnel expenses', 'Salary', 'Social Fee', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5000, 5020),
+  STRUCT('P&L', 'Personnel expenses', 'Salary', 'Vacation', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5000, 5030),
+  STRUCT('P&L', 'Personnel expenses', 'Salary', 'Other benefits', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5000, 5040),
+  STRUCT('P&L', 'Personnel expenses', 'Salary', 'Pension', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5000, 5050),
+  STRUCT('P&L', 'Personnel expenses', 'Other personnel', 'Courses and Education', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5200, 5200),
+  STRUCT('P&L', 'Personnel expenses', 'Other personnel', 'Gifts', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5200, 5210),
+  STRUCT('P&L', 'Personnel expenses', 'Other personnel', 'Other personnel', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5200, 5220),
+  STRUCT('P&L', 'Personnel expenses', 'Salary', 'Social Fee', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 5000, 5400, 5400),
+
+  -- ═══════════════════════════════════════════════════
+  -- P&L: Other Operating Expenses
+  -- ═══════════════════════════════════════════════════
+  STRUCT('P&L', 'Other operating expenses', 'Travel and accommodation', 'Travel', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6100, 6100, 6100),
+  STRUCT('P&L', 'Other operating expenses', 'Travel and accommodation', 'Accommodation', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6100, 6100, 6110),
+  STRUCT('P&L', 'Other operating expenses', 'Travel and accommodation', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6100, 6100, 6120),
+  STRUCT('P&L', 'Other operating expenses', 'Marketing', 'Marketing', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6200, 6200, 6200),
+  STRUCT('P&L', 'Other operating expenses', 'Marketing', 'Exhibitions', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6200, 6200, 6210),
+  STRUCT('P&L', 'Other operating expenses', 'Rental', 'External rent', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6300, 6300, 6300),
+  STRUCT('P&L', 'Other operating expenses', 'Group costs', 'Internal house rental', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6400, 6400, 6400),
+  STRUCT('P&L', 'Other operating expenses', 'Group costs', 'Group Fee', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6400, 6400, 6410),
+  STRUCT('P&L', 'Other operating expenses', 'Group costs', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6400, 6400, 6420),
+  STRUCT('P&L', 'Other operating expenses', 'IT', 'Licenses', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6500, 6500, 6500),
+  STRUCT('P&L', 'Other operating expenses', 'IT', 'Software', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6500, 6500, 6510),
+  STRUCT('P&L', 'Other operating expenses', 'IT', 'Hardware', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6500, 6500, 6520),
+  STRUCT('P&L', 'Other operating expenses', 'Insurance', 'Insurance', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6600, 6600, 6600),
+  STRUCT('P&L', 'Other operating expenses', 'Operating expenses', 'Clothing', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6700, 6700, 6700),
+  STRUCT('P&L', 'Other operating expenses', 'Operating expenses', 'Equipment', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6700, 6700, 6710),
+  STRUCT('P&L', 'Other operating expenses', 'Operating expenses', 'Tools', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6700, 6700, 6720),
+  STRUCT('P&L', 'Other operating expenses', 'External services', 'Auditors', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6800, 6800, 6800),
+  STRUCT('P&L', 'Other operating expenses', 'External services', 'Legal', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6800, 6800, 6810),
+  STRUCT('P&L', 'Other operating expenses', 'External services', 'Accounting', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6800, 6800, 6820),
+  STRUCT('P&L', 'Other operating expenses', 'Maintenance', 'Equipment', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6900, 6900, 6900),
+  STRUCT('P&L', 'Other operating expenses', 'Maintenance', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 6900, 6900, 6910),
+  STRUCT('P&L', 'Other operating expenses', 'Properties', 'Rental', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 7000, 7000, 7000),
+  STRUCT('P&L', 'Other operating expenses', 'Properties', 'Maintenance', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 7000, 7000, 7010),
+  STRUCT('P&L', 'Other operating expenses', 'Properties', 'Security', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 7000, 7000, 7020),
+  STRUCT('P&L', 'Other operating expenses', 'Properties', 'Electricity', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 7000, 7000, 7030),
+  STRUCT('P&L', 'Other operating expenses', 'Other', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 7100, 7100, 7100),
+  STRUCT('P&L', 'Other operating expenses', 'Other', 'Other', TRUE, TRUE, 'Operating', 'EBITDA', NULL, NULL, NULL, 7700, 7700, 7700),
+
+  -- ═══════════════════════════════════════════════════
+  -- P&L: D&A, Financial, Tax
+  -- ═══════════════════════════════════════════════════
+  STRUCT('P&L', 'D&A', 'Depreciation', 'Depreciation', FALSE, TRUE, 'Operating', 'D&A', NULL, NULL, NULL, 6000, 6000, 6000),
+  STRUCT('P&L', 'D&A', 'Depreciation', 'Amortization', FALSE, TRUE, 'Operating', 'D&A', NULL, NULL, NULL, 6000, 6000, 6010),
+  STRUCT('P&L', 'Write down shares', 'Write down shares', 'Write down shares', FALSE, TRUE, 'Investing', NULL, NULL, NULL, NULL, 7990, 7990, 7990),
+  STRUCT('P&L', 'Net financial income/expenses', 'Financial income', 'Interest income', FALSE, TRUE, 'Financing', 'Financial', NULL, NULL, NULL, 8000, 8000, 8000),
+  STRUCT('P&L', 'Net financial income/expenses', 'Financial income', 'Agio', FALSE, TRUE, 'Financing', 'Financial', NULL, NULL, NULL, 8000, 8000, 8010),
+  STRUCT('P&L', 'Net financial income/expenses', 'Financial income', 'Other financial income', FALSE, TRUE, 'Financing', 'Financial', NULL, NULL, NULL, 8000, 8000, 8020),
+  STRUCT('P&L', 'Net financial income/expenses', 'Financial expenses', 'Interest expenses', FALSE, TRUE, 'Financing', 'Financial', NULL, NULL, NULL, 8100, 8100, 8100),
+  STRUCT('P&L', 'Net financial income/expenses', 'Financial expenses', 'Disagio', FALSE, TRUE, 'Financing', 'Financial', NULL, NULL, NULL, 8100, 8100, 8110),
+  STRUCT('P&L', 'Net financial income/expenses', 'Financial expenses', 'Other financial expenses', FALSE, TRUE, 'Financing', 'Financial', NULL, NULL, NULL, 8100, 8100, 8120),
+  STRUCT('P&L', 'Tax', 'Tax on ordinary result', 'Tax on ordinary result', FALSE, FALSE, 'Operating', 'Tax', NULL, NULL, NULL, 8500, 8500, 8500),
+  STRUCT('P&L', 'Net Income', 'Net Income', 'Net Income', FALSE, TRUE, NULL, NULL, NULL, NULL, NULL, 15000, 15000, 15000),
+
+  -- ═══════════════════════════════════════════════════
+  -- Balance Sheet: Assets
+  -- ═══════════════════════════════════════════════════
+  STRUCT('BS', 'Fixed assets', 'Intangible assets', 'Goodwill', FALSE, FALSE, 'Investing', NULL, NULL, NULL, 'x', 1100, 1100, 1100),
+  STRUCT('BS', 'Fixed assets', 'Intangible assets', 'R&D', FALSE, FALSE, 'Investing', NULL, NULL, NULL, 'x', 1100, 1100, 1110),
+  STRUCT('BS', 'Fixed assets', 'Intangible assets', 'Other intangible', FALSE, FALSE, 'Investing', NULL, NULL, NULL, 'x', 1100, 1100, 1120),
+  STRUCT('BS', 'Fixed assets', 'Tangible assets', 'Equipment', FALSE, FALSE, 'Investing', NULL, NULL, NULL, 'x', 1200, 1200, 1200),
+  STRUCT('BS', 'Fixed assets', 'Tangible assets', 'Vehicles', FALSE, FALSE, 'Investing', NULL, NULL, NULL, 'x', 1200, 1200, 1210),
+  STRUCT('BS', 'Fixed assets', 'Tangible assets', 'Office equipment', FALSE, FALSE, 'Investing', NULL, NULL, NULL, 'x', 1200, 1200, 1220),
+  STRUCT('BS', 'Fixed assets', 'Financial assets', 'Shares in subsidiaries', FALSE, FALSE, 'Investing', NULL, NULL, NULL, NULL, 1300, 1300, 1300),
+  STRUCT('BS', 'Fixed assets', 'Financial assets', 'Other financial assets', FALSE, FALSE, 'Investing', NULL, NULL, NULL, NULL, 1300, 1300, 1310),
+  STRUCT('BS', 'Inventory', 'Inventory', 'Inventory', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 1400, 1400, 1400),
+  STRUCT('BS', 'Receivables', 'Accounts receivable', 'Accounts receivable', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 1500, 1500, 1500),
+  STRUCT('BS', 'Receivables', 'Accounts receivable', 'Group AR', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 1500, 1500, 1510),
+  STRUCT('BS', 'Receivables', 'Other receivables', 'Other receivables', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 1500, 1600, 1600),
+  STRUCT('BS', 'Other current assets', 'Investments', 'Short-term investments', FALSE, FALSE, 'Investing', NULL, NULL, NULL, NULL, 1700, 1700, 1700),
+  STRUCT('BS', 'Other current assets', 'Other accruals', 'Other accruals', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 1700, 1700, 1790),
+  STRUCT('BS', 'Other current assets', 'Cash and bank', 'Cash and bank deposits', FALSE, FALSE, 'Financing', 'Cash', NULL, NULL, NULL, 1900, 1900, 1900),
+  STRUCT('BS', 'Other current assets', 'Cash and bank', 'Restricted cash', FALSE, FALSE, 'Financing', 'Cash', NULL, NULL, NULL, 1900, 1900, 1910),
+
+  -- ═══════════════════════════════════════════════════
+  -- Balance Sheet: Equity
+  -- ═══════════════════════════════════════════════════
+  STRUCT('BS', 'Equity', 'Paid-in capital', 'Share capital', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2000, 2000, 2000),
+  STRUCT('BS', 'Equity', 'Paid-in capital', 'Share premium', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2000, 2000, 2010),
+  STRUCT('BS', 'Equity', 'Paid-in capital', 'Own shares', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2000, 2000, 2020),
+  STRUCT('BS', 'Equity', 'Paid-in capital', 'CTA', FALSE, FALSE, 'Currency', 'Equity', NULL, NULL, NULL, 2000, 2000, 2030),
+  STRUCT('BS', 'Equity', 'Retained earnings', 'CTA', FALSE, FALSE, 'Currency', 'Equity', NULL, NULL, NULL, 2050, 2050, 2050),
+  STRUCT('BS', 'Equity', 'Retained earnings', 'Retained earnings', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2050, 2050, 2060),
+  STRUCT('BS', 'Equity', 'Retained earnings', 'Dividends', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2050, 2050, 2070),
+  STRUCT('BS', 'Equity', 'Retained earnings', 'Other transactions', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2050, 2050, 2080),
+  STRUCT('BS', 'Equity', 'Retained earnings', 'Profit/loss for period', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2050, 2050, 2090),
+
+  -- ═══════════════════════════════════════════════════
+  -- Balance Sheet: Liabilities
+  -- ═══════════════════════════════════════════════════
+  STRUCT('BS', 'Tax provisions', 'Tax payable', 'Tax payable', FALSE, FALSE, 'Operating', 'Tax', NULL, NULL, NULL, 2100, 2100, 2100),
+  STRUCT('BS', 'Tax provisions', 'Deferred tax', 'Deferred tax', FALSE, FALSE, 'Operating', 'Tax', NULL, NULL, NULL, 2100, 2120, 2120),
+  STRUCT('BS', 'Long-term liabilities', 'Financial institution', 'Financial institution', FALSE, FALSE, 'Financing', 'Debt', NULL, NULL, NULL, 2200, 2200, 2200),
+  STRUCT('BS', 'Long-term liabilities', 'Intercompany loans', 'Intercompany loans', FALSE, FALSE, 'Financing', 'Debt', NULL, NULL, NULL, 2200, 2200, 2210),
+  STRUCT('BS', 'Long-term liabilities', 'Other long-term', 'Other long-term liabilities', FALSE, FALSE, 'Financing', 'Debt', NULL, NULL, NULL, 2200, 2200, 2220),
+  STRUCT('BS', 'Short-term liabilities', 'ICP', 'Intercompany payables', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 2400, 2400, 2400),
+  STRUCT('BS', 'Short-term liabilities', 'Accounts payable', 'Accounts payable', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 2450, 2450, 2450),
+  STRUCT('BS', 'Short-term liabilities', 'Accounts payable', 'Group accounts payable', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 2450, 2450, 2460),
+  STRUCT('BS', 'Short-term liabilities', 'Tax payable', 'Tax payable', FALSE, FALSE, 'Operating', 'Tax', NULL, NULL, NULL, 2500, 2500, 2500),
+  STRUCT('BS', 'Short-term liabilities', 'Short-term bank', 'Short-term bank liabilities', FALSE, FALSE, 'Financing', 'Debt', NULL, NULL, NULL, 2500, 2500, 2510),
+  STRUCT('BS', 'Short-term liabilities', 'Short-term bank', 'Short-term bank liabilities', FALSE, FALSE, 'Financing', 'Debt', NULL, NULL, NULL, 2500, 2380, 2380),
+  STRUCT('BS', 'Short-term liabilities', 'Dividend payable', 'Dividend payable', FALSE, FALSE, 'Financing', 'Equity', NULL, NULL, NULL, 2600, 2600, 2600),
+  STRUCT('BS', 'Short-term liabilities', 'Public duties', 'Public duties payable', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 2700, 2700, 2700),
+  STRUCT('BS', 'Short-term liabilities', 'Public duties', 'Public duties payable', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 2800, 2800, 2800),
+  STRUCT('BS', 'Short-term liabilities', 'Other short-term', 'Other short-term liabilities', FALSE, FALSE, 'Operating', NULL, NULL, 'x', NULL, 2900, 2900, 2900)
+])

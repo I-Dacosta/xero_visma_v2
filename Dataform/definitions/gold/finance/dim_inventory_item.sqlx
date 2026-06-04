@@ -1,0 +1,10 @@
+config {
+  type: "view",
+  schema: "dw_1_gold_finance",
+  name: "dim_inventory_item",
+  description: "Compatibility view over dw_1_gold_common.dim_inventory_item. Inventory items are tenant-scoped and no longer modeled as business-unit-owned items.",
+  tags: ["gold", "finance", "dimension", "compatibility"]
+}
+
+SELECT *
+FROM ${ref("dw_1_gold_common", "dim_inventory_item")}

@@ -1,0 +1,124 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_sales",
+  name: "dim_sales_order",
+  description: "Sales order header dimension at tenant plus order grain. Used for order-level customer, status, warehouse, salesperson, and reporting business-unit context in the sales star schema.",
+  tags: ["gold", "sales", "dimension"]
+}
+
+-- =============================================================================
+-- Gold sales dimension: Sales order headers
+-- Source: dw_1_silver_visma.fact_sales_order
+-- Grain: one row per tenant + order_id
+-- Key rule: sales_order_key is independent of business_unit_id so mixed-BU
+--           headers still join cleanly to line facts.
+-- =============================================================================
+
+WITH sales_order_base AS (
+  SELECT
+    f.*,
+    COALESCE(f.business_unit_id, f.representative_business_unit_id)
+                                                  AS reporting_business_unit_id,
+    COALESCE(f.business_unit_name, f.representative_business_unit_name)
+                                                  AS reporting_business_unit_name,
+    COALESCE(f.sales_person_id, f.representative_sales_person_id)
+                                                  AS reporting_sales_person_id
+  FROM ${ref("dw_1_silver_visma", "fact_sales_order")} AS f
+)
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(f.tenant_id AS STRING), '|',
+    CAST(f.order_id AS STRING)
+  ))                                              AS sales_order_key,
+
+  FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))   AS company_key,
+
+  FARM_FINGERPRINT(CAST(f.order_date AS STRING))  AS date_key,
+
+  FARM_FINGERPRINT(CAST(f.currency_id AS STRING)) AS currency_key,
+
+  CASE
+    WHEN f.customer_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.customer_id AS STRING)
+      ))
+  END                                             AS customer_key,
+
+  CASE
+    WHEN f.reporting_business_unit_id IS NOT NULL
+      AND f.header_warehouse_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.reporting_business_unit_id AS STRING), '|',
+        CAST(f.header_warehouse_id AS STRING)
+      ))
+  END                                             AS warehouse_key,
+
+  CASE
+    WHEN f.reporting_sales_person_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.reporting_sales_person_id AS STRING)
+      ))
+  END                                             AS sales_person_key,
+
+  f.tenant_id,
+  f.business_unit_id,
+  f.business_unit_name,
+  f.representative_business_unit_id,
+  f.representative_business_unit_name,
+  f.reporting_business_unit_id,
+  f.reporting_business_unit_name,
+  f.source_consistent_business_unit_id,
+  f.source_consistent_business_unit_name,
+  f.effective_consistent_business_unit_id,
+  f.effective_consistent_business_unit_name,
+  f.line_business_unit_count,
+  f.has_multiple_line_business_units,
+  f.effective_line_business_unit_count,
+  f.has_multiple_effective_line_business_units,
+  f.source_material_line_count,
+  f.unresolved_source_material_line_count,
+  f.effective_material_line_count,
+  f.unresolved_effective_material_line_count,
+  f.header_business_unit_selection_method,
+
+  f.order_no,
+  f.order_id,
+  f.order_type,
+  f.status,
+  f.order_date,
+  f.due_date,
+  f.request_date,
+  f.cancel_by_date,
+  f.customer_id,
+  f.customer_name,
+  f.customer_order,
+  f.customer_ref_no,
+
+  f.sales_person_id,
+  f.sales_person_name,
+  f.representative_sales_person_id,
+  f.representative_sales_person_name,
+  f.line_sales_person_count,
+  f.sales_person_resolution_method,
+
+  f.header_warehouse_id                             AS warehouse_id,
+  f.currency_id,
+  f.branch_id,
+  f.order_description                              AS description,
+  f.hold,
+  f.order_total,
+  f.order_total_base,
+  f.order_discount_total                           AS discount_total,
+  f.order_discount_total_base                      AS discount_total_base,
+  f.order_tax_total                                AS tax_total,
+  f.order_tax_total_base                           AS tax_total_base,
+  f.order_cost_total                               AS cost_total,
+  f.order_cost_total_base                          AS cost_total_base,
+  f.header_order_qty                               AS order_qty,
+  f.exchange_rate,
+  f.last_modified_at,
+
+  'visma' AS source_system
+
+FROM sales_order_base AS f

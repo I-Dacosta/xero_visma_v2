@@ -1,0 +1,11 @@
+config {
+  type: "view",
+  schema: "dw_1_silver_visma",
+  name: "fact_inventory_transfer_line",
+  description: "Inventory transfer lines filtered from the unified inventory movement line fact.",
+  tags: ["silver", "visma", "fact", "inventory", "transfer"]
+}
+
+SELECT *
+FROM ${ref("dw_1_silver_visma", "fact_inventory_movement_line")}
+WHERE movement_type = 'TRANSFER'

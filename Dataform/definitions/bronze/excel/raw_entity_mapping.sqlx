@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_excel",
+  name: "raw_entity_mapping",
+  description: "Raw entity mapping data ingested from reference_data.xlsx (EntityMapping sheet). Deduplicated via MERGE on (company_id), all STRING types."
+}

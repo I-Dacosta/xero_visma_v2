@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_lot_serial_classes",
+  description: "Bronze: Lot/serial number tracking class configurations from Visma Global API."
+}

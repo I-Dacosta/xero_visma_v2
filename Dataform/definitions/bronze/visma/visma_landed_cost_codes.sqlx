@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_landed_cost_codes",
+  description: "Bronze: Import/landed cost tracking codes from Visma Global API."
+}

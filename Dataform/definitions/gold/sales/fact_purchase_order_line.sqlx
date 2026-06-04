@@ -1,0 +1,104 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_sales",
+  name: "fact_purchase_order_line",
+  description: "Purchase order line fact with surrogate keys. Maps to Power BI fctPurchaseOrderLineExt.",
+  tags: ["gold", "sales", "fact"]
+}
+
+WITH purchase_order_line_base AS (
+  SELECT *
+  FROM ${ref("dw_1_silver_visma", "fact_purchase_order_line")}
+),
+enriched AS (
+  SELECT
+    f.*,
+    mr.currency_market_rate_daily_key,
+    mr.market_currency_rate_key,
+    mr.market_rate_date,
+    mr.market_exchange_rate_to_nok,
+    mr.market_inverse_exchange_rate_from_nok,
+    mr.market_rate_source,
+    COALESCE(mr.has_market_rate, FALSE)            AS has_market_rate_to_nok,
+    COALESCE(mr.is_rate_filled_forward, FALSE)     AS is_market_rate_filled_forward
+  FROM purchase_order_line_base AS f
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_currency_market_rate_to_nok_daily")} AS mr
+    ON mr.date_key = FARM_FINGERPRINT(CAST(f.order_date AS STRING))
+   AND mr.currency_key = FARM_FINGERPRINT(CAST(f.currency_id AS STRING))
+)
+
+SELECT
+  FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+
+  FARM_FINGERPRINT(CONCAT(
+    CAST(f.tenant_id AS STRING), '|',
+    CAST(f.business_unit_id AS STRING), '|',
+    CAST(f.order_nbr AS STRING)
+  ))                                              AS purchase_order_key,
+
+  FARM_FINGERPRINT(CAST(f.order_date AS STRING))  AS date_key,
+
+  FARM_FINGERPRINT(CAST(f.currency_id AS STRING)) AS currency_key,
+
+  CASE
+    WHEN f.inventory_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.inventory_id AS STRING)
+    ))
+  END                                             AS item_key,
+
+  CASE
+    WHEN f.supplier_id IS NOT NULL THEN FARM_FINGERPRINT(CONCAT(
+      CAST(f.tenant_id AS STRING), '|',
+      CAST(f.business_unit_id AS STRING), '|',
+      CAST(f.supplier_id AS STRING)
+    ))
+  END                                             AS supplier_key,
+
+  FARM_FINGERPRINT(CONCAT(
+    CAST(f.tenant_id AS STRING), '|',
+    CAST(f.business_unit_id AS STRING), '|',
+    CAST(f.warehouse_id AS STRING)
+  ))                                              AS warehouse_key,
+
+  f.order_nbr,
+  f.order_type,
+  f.supplier_id,
+  f.supplier_name,
+  f.supplier,
+  f.currency_id,
+  f.order_date,
+  f.line_nbr,
+  f.line_type,
+  f.inventory_id,
+  f.line_description,
+  f.unit_of_measure,
+  f.promised_date,
+  f.requested_date,
+  f.is_completed,
+  f.account_id,
+  f.subaccount_id,
+  f.project_id,
+  f.order_qty,
+  f.received_qty,
+  f.open_qty,
+  f.unit_cost,
+  f.unit_cost_base,
+  f.amount,
+  f.amount_base,
+  f.discount_percent,
+  f.currency_market_rate_daily_key,
+  f.market_currency_rate_key,
+  f.market_rate_date,
+  f.market_exchange_rate_to_nok,
+  f.market_inverse_exchange_rate_from_nok,
+  f.market_rate_source,
+  f.has_market_rate_to_nok,
+  f.is_market_rate_filled_forward,
+  SAFE_MULTIPLY(f.amount, f.market_exchange_rate_to_nok)
+                                                  AS amount_market_nok,
+  SAFE_MULTIPLY(f.unit_cost, f.market_exchange_rate_to_nok)
+                                                  AS unit_cost_market_nok,
+  'visma' AS source_system
+
+FROM enriched AS f

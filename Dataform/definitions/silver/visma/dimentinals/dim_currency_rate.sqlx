@@ -1,0 +1,75 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_currency_rate",
+  description: "Silver: Tenant-specific exchange rates from the Visma API. Grain: one row per tenantId + rateType + effectiveDate + fromCurrencyId + toCurrencyId (latest non-deleted record).",
+  tags: ["silver", "visma", "dimension", "currency"]
+}
+
+-- =============================================================================
+-- dim_currency_rate.sqlx
+-- Silver dimension: Visma API exchange rates
+-- Source: dw_1_bronze_visma.visma_currency_rates
+-- Grain: one row per tenantId + rateType + effectiveDate + fromCurrencyId + toCurrencyId
+--
+-- multDiv: Visma convention for how to apply the rate.
+--   'M' (multiply) → to_amount = from_amount * rate
+--   'D' (divide)   → to_amount = from_amount / rate
+-- We normalise this to a standard to-NOK exchange_rate so downstream
+-- consumers don't need to branch on multDiv.
+-- =============================================================================
+
+WITH latest_rates AS (
+  SELECT
+    tenantId                                              AS tenant_id,
+    organizationName                                      AS organization_name,
+    id                                                    AS rate_id,
+    fromCurrencyId                                        AS from_currency_id,
+    toCurrencyId                                          AS to_currency_id,
+    SAFE_CAST(effectiveDate AS DATE)                      AS effective_date,
+    rateType                                              AS rate_type,
+    CAST(rate AS NUMERIC)                                 AS rate,
+    CAST(rateReciprocal AS NUMERIC)                       AS rate_reciprocal,
+    multDiv                                               AS mult_div,
+    -- Normalise to a standard direct exchange rate (from_currency → to_currency).
+    -- When multDiv = 'M': amount_to = amount_from * rate  → rate IS already direct.
+    -- When multDiv = 'D': amount_to = amount_from / rate  → direct rate = 1 / rate.
+    CASE
+      WHEN multDiv = 'M' THEN CAST(rate AS NUMERIC)
+      WHEN multDiv = 'D' THEN SAFE_DIVIDE(1, CAST(rate AS NUMERIC))
+    END                                                   AS exchange_rate,
+    SAFE_CAST(timeStamp AS TIMESTAMP)                     AS visma_timestamp,
+    SAFE_CAST(syncedAt AS TIMESTAMP)                      AS synced_at,
+    businessUnitId                                        AS business_unit_id,
+    businessUnitName                                      AS business_unit_name
+  FROM ${ref("dw_1_bronze_visma", "visma_currency_rates")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, rateType, effectiveDate, fromCurrencyId, toCurrencyId
+    ORDER BY syncedAt DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  organization_name,
+  rate_id,
+  from_currency_id,
+  to_currency_id,
+  effective_date,
+  rate_type,
+  rate,
+  rate_reciprocal,
+  mult_div,
+  exchange_rate,
+  SAFE_DIVIDE(1, exchange_rate)                           AS inverse_exchange_rate,
+  visma_timestamp,
+  synced_at,
+  business_unit_id,
+  business_unit_name,
+  ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, from_currency_id, to_currency_id, rate_type
+    ORDER BY effective_date DESC, synced_at DESC
+  ) = 1                                                   AS is_latest_rate_for_pair
+FROM latest_rates
+

@@ -1,0 +1,43 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_currency",
+  description: "Silver: Currencies configured in the Xero organisation. Grain: one row per tenant_id + currency_code (latest record by last_seen_at).",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_currency.sqlx
+-- Silver dimension: Currencies (Xero)
+-- Source:  dw_1_bronze_xero.xero_currencies
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + currency_code (latest by last_seen_at)
+-- Note:    record_id = currency code (e.g. "AUD"). No dates in this payload.
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                       AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_currencies")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.Code')                        AS currency_code,
+  JSON_VALUE(payload, '$.Description')                 AS currency_description,
+
+  'xero'                                               AS _source
+
+FROM raw

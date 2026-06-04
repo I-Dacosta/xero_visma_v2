@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_expense_claims",
+  description: "Bronze: Employee expense claim documents with detail lines from Visma Global API."
+}

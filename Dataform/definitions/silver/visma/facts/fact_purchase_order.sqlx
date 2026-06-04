@@ -1,0 +1,214 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_purchase_order",
+  description: "Silver: Purchase order header fact with historized business unit mapping by order date and representative line subaccount.",
+  tags: ["silver", "visma", "fact"]
+}
+
+WITH subaccount_dim AS (
+  SELECT
+    tenant_id,
+    subaccount_id,
+    segment2 AS segment2_value
+  FROM ${ref("dw_1_silver_visma", "dim_subaccount")}
+),
+
+business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_base AS (
+  SELECT *
+  FROM ${ref("dw_1_bronze_visma", "visma_purchase_orders")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+),
+
+representative_line_subaccounts AS (
+  SELECT
+    src.tenantId AS tenant_id,
+    src.orderNbr AS order_nbr,
+    src.orderType AS order_type,
+    COALESCE(
+      JSON_VALUE(line_json, '$.sub.segments[1].segmentValue'),
+      JSON_VALUE(line_json, '$.subaccount.segments[1].segmentValue'),
+      JSON_VALUE(line_json, '$.subaccount.2'),
+      sd.segment2_value
+    ) AS source_segment_2_value
+  FROM source_base AS src
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(src.lines)) AS line_json WITH OFFSET AS line_offset
+  LEFT JOIN subaccount_dim AS sd
+    ON src.tenantId = sd.tenant_id
+   AND COALESCE(
+     JSON_VALUE(line_json, '$.sub.subaccountNumber'),
+     CAST(SAFE_CAST(JSON_VALUE(line_json, '$.sub.subaccountId') AS INT64) AS STRING),
+     JSON_VALUE(JSON_VALUE(line_json, '$.sub'), '$.subaccountNumber'),
+     JSON_VALUE(line_json, '$.subaccount.subaccountNumber'),
+     CAST(SAFE_CAST(JSON_VALUE(line_json, '$.subaccount.subaccountId') AS INT64) AS STRING),
+     JSON_VALUE(line_json, '$.subaccountId'),
+     JSON_VALUE(line_json, '$.subaccount')
+   ) = sd.subaccount_id
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY src.tenantId, src.orderType, src.orderNbr
+    ORDER BY SAFE_CAST(JSON_VALUE(line_json, '$.lineNbr') AS INT64), line_offset
+  ) = 1
+),
+
+base AS (
+  SELECT
+    src.tenantId AS tenant_id,
+    src.syncedAt AS synced_at,
+    src.organizationName AS organization_name,
+    COALESCE(JSON_VALUE(src.businessUnitId, '$.id'), CAST(src.businessUnitId AS STRING)) AS source_business_unit_id,
+    src.businessUnitName AS source_business_unit_name,
+
+    src.orderNbr AS order_nbr,
+    src.orderType AS order_type,
+    src.status,
+
+    COALESCE(
+      JSON_VALUE(src.supplier, '$.id'),
+      JSON_VALUE(src.supplier, '$.acctCD'),
+      JSON_VALUE(src.supplier, '$.number'),
+      src.supplier
+    ) AS supplier_id,
+    JSON_VALUE(src.supplier, '$.name') AS supplier_name,
+    src.supplierRef AS supplier_ref,
+
+    COALESCE(
+      JSON_VALUE(src.branch, '$.branchId'),
+      JSON_VALUE(src.branch, '$.id'),
+      JSON_VALUE(src.branch, '$.number'),
+      src.branch
+    ) AS branch_id,
+    COALESCE(JSON_VALUE(src.currency, '$.id'), src.currency) AS currency_id,
+
+    COALESCE(
+      SAFE_CAST(src.date AS DATE),
+      DATE(SAFE_CAST(src.date AS DATETIME)),
+      DATE(SAFE_CAST(src.date AS TIMESTAMP))
+    ) AS order_date,
+    COALESCE(
+      SAFE_CAST(src.promisedOn AS DATE),
+      DATE(SAFE_CAST(src.promisedOn AS DATETIME)),
+      DATE(SAFE_CAST(src.promisedOn AS TIMESTAMP))
+    ) AS promised_date,
+
+    src.description AS description,
+    src.hold AS hold,
+    src.exchangeRate AS exchange_rate,
+
+    COALESCE(
+      JSON_VALUE(src.location, '$.locationId'),
+      JSON_VALUE(src.location, '$.id')
+    ) AS location_id,
+    COALESCE(
+      JSON_VALUE(src.warehouse, '$.id'),
+      JSON_VALUE(src.warehouse, '$.warehouseId'),
+      JSON_VALUE(src.shipTo, '$.warehouseId'),
+      JSON_VALUE(src.shipTo, '$.id'),
+      src.warehouse
+    ) AS warehouse_id,
+    COALESCE(JSON_VALUE(src.terms, '$.id'), src.terms) AS credit_terms_id,
+
+    JSON_VALUE(src.shippingAddress, '$.addressLine1') AS shipping_address_line1,
+    JSON_VALUE(src.shippingAddress, '$.city') AS shipping_city,
+    JSON_VALUE(src.shippingAddress, '$.postalCode') AS shipping_postal_code,
+    JSON_VALUE(src.shippingAddress, '$.country.id') AS shipping_country,
+
+    src.orderTotal AS order_total,
+    src.orderTotalInBaseCurrency AS order_total_base,
+    src.lineTotal AS line_total,
+    src.lineTotalInBaseCurrency AS line_total_base,
+    src.taxTotal AS tax_total,
+    src.taxTotalInBaseCurrency AS tax_total_base,
+    src.vatExemptTotal AS vat_exempt_total,
+    src.openBalance AS open_balance,
+    src.openQuantity AS open_quantity,
+
+    SAFE_CAST(src.lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+  FROM source_base AS src
+),
+
+enriched AS (
+  SELECT
+    b.*,
+    rls.source_segment_2_value,
+    bm.business_unit_id AS mapped_business_unit_id,
+    bm.business_unit_name AS mapped_business_unit_name,
+    CASE
+      WHEN bm.business_unit_id IS NULL THEN 'no_mapping'
+      WHEN bm.source_segment_2_value IS NOT NULL AND rls.source_segment_2_value IS NOT NULL THEN 'subaccount_segment2_match'
+      WHEN bm.source_segment_2_value IS NOT NULL THEN 'segment_zero_match'
+      ELSE 'tenant_default_match'
+    END AS business_unit_match_rule,
+    ROW_NUMBER() OVER (
+      PARTITION BY b.tenant_id, b.order_type, b.order_nbr
+      ORDER BY
+        CASE WHEN bm.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        bm.valid_from DESC
+    ) AS bu_match_rank
+  FROM base AS b
+  LEFT JOIN representative_line_subaccounts AS rls
+    ON b.tenant_id = rls.tenant_id
+   AND b.order_nbr = rls.order_nbr
+   AND b.order_type = rls.order_type
+  LEFT JOIN business_unit_mapping AS bm
+    ON b.tenant_id = bm.tenant_id
+   AND b.order_date BETWEEN bm.valid_from AND bm.valid_to
+   AND (
+     bm.source_segment_2_value IS NULL
+     OR bm.source_segment_2_value = COALESCE(rls.source_segment_2_value, '0')
+   )
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  organization_name,
+  source_business_unit_id,
+  source_business_unit_name,
+  COALESCE(mapped_business_unit_id, source_business_unit_id) AS business_unit_id,
+  COALESCE(mapped_business_unit_name, source_business_unit_name, organization_name) AS business_unit_name,
+  source_segment_2_value,
+  business_unit_match_rule,
+
+  order_nbr,
+  order_type,
+  status,
+  supplier_id,
+  supplier_name,
+  supplier_ref,
+  branch_id,
+  currency_id,
+  order_date,
+  promised_date,
+  description,
+  hold,
+  exchange_rate,
+  location_id,
+  warehouse_id,
+  credit_terms_id,
+  shipping_address_line1,
+  shipping_city,
+  shipping_postal_code,
+  shipping_country,
+  order_total,
+  order_total_base,
+  line_total,
+  line_total_base,
+  tax_total,
+  tax_total_base,
+  vat_exempt_total,
+  open_balance,
+  open_quantity,
+  last_modified_at
+FROM enriched
+WHERE bu_match_rank = 1

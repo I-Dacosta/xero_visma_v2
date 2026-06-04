@@ -1,0 +1,65 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_linked_transaction",
+  description: "Silver: Linked transactions (billable expenses) from Xero Accounting API. Grain: one row per tenant_id + linked_transaction_id (latest record by last_seen_at).",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_linked_transaction.sqlx
+-- Silver fact: Linked transactions / billable expenses (Xero)
+-- Source:  dw_1_bronze_xero.xero_linked_transactions
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + linked_transaction_id (latest by last_seen_at)
+-- Note:    Fully flat payload — no nested arrays.
+--          UpdatedDateUTC uses /Date(ms+0000)/ format.
+--          Type is always BILLABLEEXPENSE.
+--          SourceTransactionTypeCode: ACCPAY (bill) or ACCREC (invoice).
+-- FK refs: contact_id            → dw_1_silver_xero.dim_contact
+--          source_transaction_id → dw_1_silver_xero.fact_invoice
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_linked_transactions")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.LinkedTransactionID')                        AS linked_transaction_id,
+  record_id                                                            AS linked_transaction_internal_id,
+
+  -- Source document (the bill/invoice being recharged)
+  JSON_VALUE(payload, '$.SourceTransactionID')                        AS source_transaction_id,
+  JSON_VALUE(payload, '$.SourceLineItemID')                           AS source_line_item_id,
+  JSON_VALUE(payload, '$.SourceTransactionTypeCode')                  AS source_transaction_type,
+
+  -- Target contact (who is being billed)
+  JSON_VALUE(payload, '$.ContactID')                                  AS contact_id,
+
+  -- Type & status
+  JSON_VALUE(payload, '$.Type')                                       AS linked_transaction_type,
+  JSON_VALUE(payload, '$.Status')                                     AS status,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.UpdatedDateUTC'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS updated_at,
+
+  'xero'                                                              AS _source
+
+FROM raw

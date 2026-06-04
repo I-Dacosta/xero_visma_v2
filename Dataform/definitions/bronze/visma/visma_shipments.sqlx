@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_shipments",
+  description: "Bronze: Outbound shipment headers and detail lines from Visma Global API."
+}

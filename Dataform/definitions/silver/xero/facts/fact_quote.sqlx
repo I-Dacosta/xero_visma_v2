@@ -1,0 +1,92 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_quote",
+  description: "Silver: Quote headers from Xero Accounting API. Grain: one row per tenant_id + quote_id (latest record by last_seen_at).",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_quote.sqlx
+-- Silver fact: Quote headers (Xero)
+-- Source:  dw_1_bronze_xero.xero_quotes
+--          Envelope schema: tenant_id | record_id | payload (JSON) |
+--                           first_seen_at | last_seen_at | synced_at
+-- Grain:   one row per tenant_id + quote_id (latest by last_seen_at)
+-- ⚠️ IMPORTANT: Quote dates have NO timezone offset — /Date(ms)/ not /Date(ms+0000)/
+--    Use the permissive regex: r'/Date\((\d+)(?:[+-]\d{4})?\)/'
+-- Note:    LineItems[] → fact_quote_line (can be very large — 100+ items)
+-- FK refs: contact_id        → dw_1_silver_xero.dim_contact
+--          branding_theme_id → dw_1_silver_xero.dim_branding_theme
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_quotes")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.QuoteID')                                    AS quote_id,
+  record_id                                                            AS quote_internal_id,
+  JSON_VALUE(payload, '$.QuoteNumber')                                AS quote_number,
+
+  -- Foreign keys
+  JSON_VALUE(payload, '$.Contact.ContactID')                          AS contact_id,
+  JSON_VALUE(payload, '$.Contact.Name')                               AS contact_name,
+  JSON_VALUE(payload, '$.Contact.EmailAddress')                       AS contact_email,
+  JSON_VALUE(payload, '$.BrandingThemeID')                            AS branding_theme_id,
+
+  -- Status & terms
+  JSON_VALUE(payload, '$.Status')                                     AS status,
+  JSON_VALUE(payload, '$.LineAmountTypes')                            AS line_amount_types,
+  JSON_VALUE(payload, '$.Reference')                                  AS reference,
+  JSON_VALUE(payload, '$.Terms')                                      AS terms,
+
+  -- ⚠️ Permissive date regex — quotes omit the timezone offset
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.Date'),
+      r'/Date\((\d+)(?:[+-]\d{4})?\)/') AS INT64)
+  )                                                                   AS quote_date,
+  DATE(PARSE_DATETIME('%Y-%m-%dT%H:%M:%S',
+    JSON_VALUE(payload, '$.DateString')))                             AS quote_date_local,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.ExpiryDate'),
+      r'/Date\((\d+)(?:[+-]\d{4})?\)/') AS INT64)
+  )                                                                   AS expiry_date,
+  DATE(PARSE_DATETIME('%Y-%m-%dT%H:%M:%S',
+    JSON_VALUE(payload, '$.ExpiryDateString')))                       AS expiry_date_local,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.UpdatedDateUTC'),
+      r'/Date\((\d+)(?:[+-]\d{4})?\)/') AS INT64)
+  )                                                                   AS updated_at,
+
+  -- Currency
+  JSON_VALUE(payload, '$.CurrencyCode')                               AS currency_code,
+  SAFE_CAST(JSON_VALUE(payload, '$.CurrencyRate') AS FLOAT64)         AS currency_rate,
+
+  -- Amounts
+  SAFE_CAST(JSON_VALUE(payload, '$.SubTotal')      AS FLOAT64)        AS sub_total,
+  SAFE_CAST(JSON_VALUE(payload, '$.TotalTax')      AS FLOAT64)        AS total_tax,
+  SAFE_CAST(JSON_VALUE(payload, '$.Total')         AS FLOAT64)        AS total,
+  SAFE_CAST(JSON_VALUE(payload, '$.TotalDiscount') AS FLOAT64)        AS total_discount,
+
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.LineItems'))              AS line_item_count,
+
+  'xero'                                                              AS _source
+
+FROM raw

@@ -1,0 +1,59 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_invoice_payment",
+  description: "Silver: Payments applied to invoices from Xero Accounting API. Grain: one row per tenant_id + invoice_id + payment_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_invoice_payment.sqlx
+-- Silver fact: Invoice payment links (Xero)
+-- Source:  dw_1_bronze_xero.xero_invoices (Payments[] unnested)
+-- Grain:   one row per tenant_id + invoice_id + payment_id
+-- Note:    Date uses /Date(ms+0000)/ format.
+-- FK refs: invoice_id → dw_1_silver_xero.fact_invoice
+--          payment_id → dw_1_silver_xero.fact_payment
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_invoices")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS invoice_id,
+    pmt
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Payments')) AS pmt
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  invoice_id,
+
+  JSON_VALUE(pmt, '$.PaymentID')                                      AS payment_id,
+  SAFE_CAST(JSON_VALUE(pmt, '$.Amount')       AS FLOAT64)             AS amount,
+  SAFE_CAST(JSON_VALUE(pmt, '$.CurrencyRate') AS FLOAT64)             AS currency_rate,
+  JSON_VALUE(pmt, '$.Reference')                                      AS reference,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(pmt, '$.Date'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS payment_date,
+
+  'xero'                                                              AS _source
+
+FROM unnested

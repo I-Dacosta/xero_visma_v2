@@ -1,0 +1,28 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_location",
+  description: "Conformed location dimension with surrogate key.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+SELECT
+    FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(business_unit_id AS STRING), '|',
+        CAST(location_id AS STRING)
+    ))                                          AS location_key,
+  FARM_FINGERPRINT(CONCAT(
+    CAST(tenant_id AS STRING), '|',
+    CAST(location_id AS STRING)
+  ))                                          AS location_tenant_key,
+    tenant_id,
+    business_unit_id,
+    location_id,
+    location_name,
+    is_active,
+    vat_zone,
+    corporate_id,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "dim_location")}

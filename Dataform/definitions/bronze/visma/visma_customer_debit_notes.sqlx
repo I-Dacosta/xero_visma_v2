@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_customer_debit_notes",
+  description: "Bronze: Customer debit note (AR debit adjustment) headers and lines from Visma Global API."
+}

@@ -1,0 +1,46 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_business_unit",
+  description: "Conformed business-unit dimension. One row per tenant plus canonical business unit, used for BU reporting independently of the company dimension.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+WITH current_business_unit AS (
+  SELECT
+    tenant_id,
+    business_unit_id,
+    segment2,
+    business_unit_name,
+    organization_name,
+    entity_code,
+    group_name,
+    visma_branch_id,
+    visma_branch_number,
+    visma_branch_name,
+    bu_valid_from,
+    bu_valid_to
+  FROM ${ref("dw_1_silver_visma", "dim_business_unit")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, business_unit_id
+    ORDER BY COALESCE(bu_valid_to, DATE '9999-12-31') DESC, bu_valid_from DESC
+  ) = 1
+)
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(tenant_id AS STRING), '|',
+    CAST(business_unit_id AS STRING)
+  ))                                                AS business_unit_key,
+  tenant_id,
+  business_unit_id,
+  segment2                                          AS business_unit_code,
+  business_unit_name,
+  organization_name,
+  entity_code,
+  group_name,
+  visma_branch_id                                   AS branch_id,
+  visma_branch_number                               AS branch_number,
+  visma_branch_name                                 AS branch_name,
+  'visma' AS source_system
+FROM current_business_unit

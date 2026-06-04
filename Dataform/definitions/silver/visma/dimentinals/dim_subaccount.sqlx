@@ -1,0 +1,73 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_subaccount",
+  description: "Silver: GL subaccount segment code dimension. Source: visma_subaccounts.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_subaccount.sqlx
+-- Silver dimension: GL subaccount segment codes
+-- Source: dw_1_bronze_visma.visma_subaccounts
+-- Grain: one row per tenantId + subaccountId (latest non-deleted record)
+-- segments is a JSON array of segment key/value pairs.
+-- Extract segment 1/2/3 values + value descriptions into dedicated columns.
+-- =============================================================================
+
+SELECT
+    -- Sync metadata
+    tenantId                                            AS tenant_id,
+    syncedAt                                            AS synced_at,
+    organizationName                                    AS organization_name,
+
+    -- Natural keys
+    CAST(subaccountId AS STRING)                        AS subaccount_id,
+    subaccountNumber                                    AS subaccount_number,
+
+    -- Attributes
+    description                                         AS subaccount_description,
+    active                                              AS is_active,
+
+    -- segments is a JSON array like:
+    -- [{"segmentId":1,"segmentDescription":"IC","segmentValue":"56","segmentValueDescription":"..."}, ...]
+    -- Expose parsed columns for segment 1/2/3.
+
+    (SELECT JSON_VALUE(seg, '$.segmentValue')
+     FROM UNNEST(JSON_EXTRACT_ARRAY(segments)) AS seg
+     WHERE JSON_VALUE(seg, '$.segmentId') = '1'
+     LIMIT 1)                                           AS segment1,
+
+    (SELECT JSON_VALUE(seg, '$.segmentValueDescription')
+     FROM UNNEST(JSON_EXTRACT_ARRAY(segments)) AS seg
+     WHERE JSON_VALUE(seg, '$.segmentId') = '1'
+     LIMIT 1)                                           AS segment1_value_description,
+
+    (SELECT JSON_VALUE(seg, '$.segmentValue')
+     FROM UNNEST(JSON_EXTRACT_ARRAY(segments)) AS seg
+     WHERE JSON_VALUE(seg, '$.segmentId') = '2'
+     LIMIT 1)                                           AS segment2,
+
+    (SELECT JSON_VALUE(seg, '$.segmentValueDescription')
+     FROM UNNEST(JSON_EXTRACT_ARRAY(segments)) AS seg
+     WHERE JSON_VALUE(seg, '$.segmentId') = '2'
+     LIMIT 1)                                           AS segment2_value_description,
+
+    (SELECT JSON_VALUE(seg, '$.segmentValue')
+     FROM UNNEST(JSON_EXTRACT_ARRAY(segments)) AS seg
+     WHERE JSON_VALUE(seg, '$.segmentId') = '3'
+     LIMIT 1)                                           AS segment3,
+
+    (SELECT JSON_VALUE(seg, '$.segmentValueDescription')
+     FROM UNNEST(JSON_EXTRACT_ARRAY(segments)) AS seg
+     WHERE JSON_VALUE(seg, '$.segmentId') = '3'
+     LIMIT 1)                                           AS segment3_value_description,
+
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)        AS last_modified_at
+
+FROM ${ref("dw_1_bronze_visma", "visma_subaccounts")}
+WHERE isDeleted IS DISTINCT FROM TRUE
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, subaccountId
+    ORDER BY syncedAt DESC
+) = 1

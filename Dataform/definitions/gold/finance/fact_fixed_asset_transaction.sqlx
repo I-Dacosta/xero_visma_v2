@@ -1,0 +1,41 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "fact_fixed_asset_transaction",
+  description: "Fixed asset transaction fact with surrogate keys. Maps to Power BI fctFixedAssetTransaction.",
+  tags: ["gold", "finance", "fact"]
+}
+
+-- =============================================================================
+-- Gold finance fact: Fixed asset transactions
+-- Source: dw_1_silver_visma.fact_fixed_asset_transaction
+-- Why: Maps to Power BI fctFixedAssetTransaction. Joins to dimFixedAsset,
+--      dimBranch, dimCompany, dimDate for asset lifecycle analysis.
+-- =============================================================================
+
+SELECT
+    FARM_FINGERPRINT(CAST(f.tenant_id AS STRING))  AS company_key,
+
+    FARM_FINGERPRINT(CAST(f.transaction_date AS STRING)) AS date_key,
+
+    FARM_FINGERPRINT(CONCAT(
+        CAST(f.tenant_id AS STRING), '|',
+        CAST(f.business_unit_id AS STRING), '|',
+        CAST(f.asset_id AS STRING)
+    ))                                              AS fixed_asset_key,
+
+    f.asset_id,
+    f.branch_id,
+    f.book_id,
+    f.ref_no,
+    f.line_no,
+    f.batch_no,
+    f.transaction_type,
+    f.transaction_date,
+    f.transaction_period_id,
+    f.transaction_description,
+    f.origin,
+    f.transaction_amount,
+    'visma' AS source_system
+
+FROM ${ref("dw_1_silver_visma", "fact_fixed_asset_transaction")} AS f

@@ -1,0 +1,153 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_supplier_invoice",
+  description: "Supplier invoice headers from Visma. Grain: one row per invoice (tenant + reference_number). Header level only -- invoice lines are in fact_supplier_invoice_line.",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Supplier invoice headers
+-- Source: visma_supplier_invoices
+-- Grain: one row per invoice (tenant + reference_number)
+-- Note: Header level only -- invoice lines are in fact_supplier_invoice_line.
+-- =============================================================================
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+  SELECT
+    -- Grain / multi-tenant keys
+    tenantId                                        AS tenant_id,
+    CAST(NULL AS STRING)                            AS raw_business_unit_id,
+    CAST(NULL AS STRING)                            AS business_unit_id,
+
+    -- Dimension FKs
+      SAFE_CAST(COALESCE(JSON_VALUE(supplier, '$.number'), JSON_VALUE(supplier, '$.id'), JSON_VALUE(supplier, '$.internalId')) AS STRING) AS supplier_id,
+      currencyId                                      AS currency_id,
+      branchNumber                                    AS branch_id,
+      SAFE_CAST(COALESCE(JSON_VALUE(location, '$.id'), JSON_VALUE(location, '$.number')) AS STRING) AS location_id,
+      creditTerms                                     AS credit_terms_id,
+      SAFE_CAST(COALESCE(JSON_VALUE(paymentMethod, '$.id'), JSON_VALUE(paymentMethod, '$.number')) AS STRING) AS payment_method_id,
+
+    -- Degenerate dimensions
+      referenceNumber                                 AS reference_number,
+      documentType                                    AS document_type,
+      COALESCE(
+        SAFE_CAST(date AS DATE),
+        DATE(SAFE_CAST(date AS DATETIME)),
+        DATE(SAFE_CAST(date AS TIMESTAMP))
+      )                                               AS date,
+      COALESCE(
+        SAFE_CAST(dueDate AS DATE),
+        DATE(SAFE_CAST(dueDate AS DATETIME)),
+        DATE(SAFE_CAST(dueDate AS TIMESTAMP))
+      )                                               AS due_date,
+      financialPeriod                                 AS financial_period,
+      postPeriod                                      AS post_period,
+      status,
+      supplierReference                               AS supplier_reference,
+      approvalStatus                                  AS approval_status,
+      COALESCE(
+        SAFE_CAST(payDate AS DATE),
+        DATE(SAFE_CAST(payDate AS DATETIME)),
+        DATE(SAFE_CAST(payDate AS TIMESTAMP))
+      )                                               AS pay_date,
+
+    -- Measures
+      SAFE_CAST(balance AS NUMERIC)                   AS balance,
+      SAFE_CAST(balanceInCurrency AS NUMERIC)         AS balance_in_currency,
+      SAFE_CAST(vatTotal AS NUMERIC)                  AS vat_total,
+      SAFE_CAST(vatTotalInCurrency AS NUMERIC)        AS vat_total_in_currency,
+      SAFE_CAST(cashDiscount AS NUMERIC)              AS cash_discount,
+      SAFE_CAST(cashDiscountInCurrency AS NUMERIC)    AS cash_discount_in_currency,
+      SAFE_CAST(detailTotal AS NUMERIC)               AS detail_total,
+      SAFE_CAST(detailTotalInCurrency AS NUMERIC)     AS detail_total_in_currency,
+      SAFE_CAST(discountTotal AS NUMERIC)             AS discount_total,
+      SAFE_CAST(discountTotalInCurrency AS NUMERIC)   AS discount_total_in_currency,
+      SAFE_CAST(exchangeRate AS NUMERIC)              AS exchange_rate,
+      SAFE_CAST(roundingDiff AS NUMERIC)              AS rounding_diff,
+      SAFE_CAST(roundingDiffInCurrency AS NUMERIC)    AS rounding_diff_in_currency,
+
+    -- Audit
+      SAFE_CAST(createdDateTime AS TIMESTAMP)         AS created_at,
+      SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+    FROM ${ref("visma_supplier_invoices")}
+    WHERE isDeleted = false OR isDeleted IS NULL
+  ),
+
+resolved_business_unit AS (
+  SELECT
+    src.*,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    CASE
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value = '0' THEN 'segment_zero_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'unresolved'
+    END AS business_unit_resolution_method,
+    ROW_NUMBER() OVER (
+      PARTITION BY src.tenant_id, src.reference_number
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        business_unit_mapping.valid_from DESC
+    ) AS bu_match_rank
+  FROM source_data AS src
+  LEFT JOIN business_unit_mapping
+    ON src.tenant_id = business_unit_mapping.tenant_id
+   AND src.date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = '0'
+   )
+)
+
+  SELECT
+    src.tenant_id,
+    src.raw_business_unit_id,
+    COALESCE(src.mapped_bu_id, src.business_unit_id) AS business_unit_id,
+    src.mapped_bu_name AS business_unit_name,
+    src.business_unit_resolution_method,
+    src.supplier_id,
+    src.currency_id,
+    src.branch_id,
+    src.location_id,
+    src.credit_terms_id,
+    src.payment_method_id,
+    src.reference_number,
+    src.document_type,
+    src.date,
+    src.due_date,
+    src.financial_period,
+    src.post_period,
+    src.status,
+    src.supplier_reference,
+    src.approval_status,
+    src.pay_date,
+    src.balance,
+    src.balance_in_currency,
+    src.vat_total,
+    src.vat_total_in_currency,
+    src.cash_discount,
+    src.cash_discount_in_currency,
+    src.detail_total,
+    src.detail_total_in_currency,
+    src.discount_total,
+    src.discount_total_in_currency,
+    src.exchange_rate,
+    src.rounding_diff,
+    src.rounding_diff_in_currency,
+    src.created_at,
+    src.last_modified_at
+  FROM resolved_business_unit AS src
+  WHERE src.bu_match_rank = 1

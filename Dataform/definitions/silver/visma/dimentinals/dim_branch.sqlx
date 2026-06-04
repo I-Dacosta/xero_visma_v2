@@ -1,0 +1,33 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_branch",
+  description: "Silver: Branch dimension from visma_branches. One row per tenant + branch.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_branch.sqlx
+-- Source: dw_1_bronze_visma.visma_branches
+-- Grain: one row per tenantId + branchId (latest non-deleted record)
+-- =============================================================================
+
+SELECT
+  tenantId AS tenant_id,
+  syncedAt AS synced_at,
+  CAST(branchId AS STRING) AS branch_id,
+  number AS branch_number,
+  name AS branch_name,
+  organizationName AS organization_name,
+  CAST(organizationId AS STRING) AS organization_id,
+  corporateId AS corporate_id,
+  IFNULL(isActive, FALSE) AS is_active,
+  IFNULL(isMainBranch, FALSE) AS is_main_branch,
+  vatRegistrationId AS vat_registration_id,
+  SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+FROM ${ref("dw_1_bronze_visma", "visma_branches")}
+WHERE isDeleted IS DISTINCT FROM TRUE
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY tenantId, branchId
+  ORDER BY syncedAt DESC
+) = 1

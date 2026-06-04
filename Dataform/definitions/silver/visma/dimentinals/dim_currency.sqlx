@@ -1,0 +1,97 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_currency",
+  description: "Silver: Tenant currency dimension conformed to ISO currency code and aligned to the staging market-rate feed by currency code.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_currency.sqlx
+-- Silver dimension: Currency reference data
+-- Source: dw_1_bronze_visma.visma_currencies
+-- Grain: one row per tenantId + currencyId (latest non-deleted record)
+-- Visma is the source of tenant currency availability.
+-- The external market-rate feed lives in dw_1_staging_currency_n2.HistoryratesPowerBI,
+-- but that dataset is in a different BigQuery region. We therefore store the
+-- deterministic currency-code mapping in silver and keep the actual rate model
+-- on the same-region Visma rate source until the staging feed is mirrored into
+-- europe-north2.
+-- =============================================================================
+
+WITH latest_currency AS (
+  SELECT
+    tenantId                                            AS tenant_id,
+    syncedAt                                            AS synced_at,
+    organizationName                                    AS organization_name,
+    id                                                  AS currency_id,
+    description                                         AS source_currency_description,
+    symbol                                              AS source_symbol,
+    decimalPrecision                                    AS decimal_precision,
+    isBaseCurrency                                      AS is_base_currency,
+    isUsedForAccounting                                 AS is_used_for_accounting
+  FROM ${ref("dw_1_bronze_visma", "visma_currencies")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, id
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+currency_reference AS (
+  SELECT * FROM UNNEST([
+    STRUCT('AUD' AS currency_code, 'Australian dollar' AS standard_currency_name, 'A$' AS standard_symbol),
+    STRUCT('CAD', 'Canadian dollar', 'C$'),
+    STRUCT('CHF', 'Swiss franc', 'CHF'),
+    STRUCT('CLP', 'Chilean peso', 'CLP'),
+    STRUCT('DKK', 'Danish krone', 'DKK'),
+    STRUCT('EUR', 'Euro', '€'),
+    STRUCT('GBP', 'British pound', '£'),
+    STRUCT('ISK', 'Icelandic krona', 'ISK'),
+    STRUCT('JPY', 'Japanese yen', '¥'),
+    STRUCT('NOK', 'Norwegian krone', 'NOK'),
+    STRUCT('NZD', 'New Zealand dollar', 'NZ$'),
+    STRUCT('SEK', 'Swedish krona', 'SEK'),
+    STRUCT('USD', 'US dollar', '$')
+  ])
+),
+staging_market_feed AS (
+  SELECT * FROM UNNEST([
+    STRUCT('AUD' AS currency_code, 'NOK' AS quote_currency_code, 'dw_1_staging_currency_n2.HistoryratesPowerBI' AS market_rate_source),
+    STRUCT('BRL', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('CAD', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('CLP', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('DKK', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('EUR', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('GBP', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('IDR', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('ISK', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('JPY', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('NZD', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('SEK', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI'),
+    STRUCT('USD', 'NOK', 'dw_1_staging_currency_n2.HistoryratesPowerBI')
+  ])
+)
+
+SELECT
+  c.tenant_id,
+  c.synced_at,
+  c.organization_name,
+  c.currency_id,
+  c.currency_id                                        AS currency_code,
+  c.source_currency_description                        AS currency_description,
+  r.standard_currency_name,
+  c.source_symbol                                      AS source_symbol,
+  COALESCE(c.source_symbol, r.standard_symbol, c.currency_id)
+                                                      AS symbol,
+  r.standard_symbol,
+  c.decimal_precision,
+  c.is_base_currency,
+  c.is_used_for_accounting,
+  m.currency_code IS NOT NULL                          AS has_staging_market_rate,
+  m.quote_currency_code                                AS staging_market_quote_currency_code,
+  m.market_rate_source                                 AS staging_market_rate_source
+FROM latest_currency AS c
+LEFT JOIN currency_reference AS r
+  ON r.currency_code = c.currency_id
+LEFT JOIN staging_market_feed AS m
+  ON m.currency_code = c.currency_id

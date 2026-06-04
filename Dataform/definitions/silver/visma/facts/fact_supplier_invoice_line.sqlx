@@ -1,0 +1,200 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_supplier_invoice_line",
+  description: "Supplier invoice lines flattened from nested JSON array. Grain: one row per invoice line (tenant + reference_number + line_number).",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Supplier invoice lines (flattened from JSON array)
+-- Source: visma_supplier_invoices → invoiceLines (JSON string)
+-- Grain: one row per invoice line (tenant + reference_number + line_number)
+-- =============================================================================
+
+WITH subaccount_dim AS (
+  SELECT
+    tenant_id,
+    subaccount_id,
+    segment2 AS segment2_value
+  FROM ${ref("dw_1_silver_visma", "dim_subaccount")}
+),
+
+business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+  SELECT
+    -- Header grain / multi-tenant keys
+    h.tenantId                                          AS tenant_id,
+    CAST(NULL AS STRING)                                AS raw_business_unit_id,
+    CAST(NULL AS STRING)                                AS business_unit_id,
+    h.referenceNumber                                   AS reference_number,
+    h.documentType                                      AS document_type,
+    SAFE_CAST(COALESCE(
+      JSON_VALUE(h.supplier, '$.number'),
+      JSON_VALUE(h.supplier, '$.id'),
+      JSON_VALUE(h.supplier, '$.internalId')
+    ) AS STRING)                                        AS supplier_id,
+    h.currencyId                                        AS currency_id,
+    COALESCE(
+      SAFE_CAST(h.date AS DATE),
+      DATE(SAFE_CAST(h.date AS TIMESTAMP))
+    )                                                   AS document_date,
+
+    -- Dimension FKs (from line)
+    COALESCE(
+      JSON_VALUE(line, '$.inventoryNumber'),
+      JSON_VALUE(line, '$.inventory.number'),
+      JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.number'),
+      JSON_VALUE(line, '$.inventory.id'),
+      JSON_VALUE(line, '$."inventory.id"'),
+      JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.id'),
+      JSON_VALUE(line, '$.inventoryId')
+    )                                                   AS inventory_id,
+    COALESCE(
+      JSON_VALUE(line, '$.account.number'),
+      JSON_VALUE(line, '$."account.number"'),
+      JSON_VALUE(JSON_VALUE(line, '$.account'), '$.number'),
+      JSON_VALUE(line, '$.account.id'),
+      JSON_VALUE(line, '$."account.id"'),
+      JSON_VALUE(JSON_VALUE(line, '$.account'), '$.id'),
+      JSON_VALUE(line, '$.account'),
+      JSON_VALUE(line, '$.salesAccountId'),
+      JSON_VALUE(line, '$."salesAccountId"')
+    )                                                   AS account_id,
+    COALESCE(
+      JSON_VALUE(line, '$.subaccount.id'),
+      JSON_VALUE(line, '$."subaccount.id"'),
+      JSON_VALUE(JSON_VALUE(line, '$.subaccount'), '$.id'),
+      JSON_VALUE(line, '$.subaccount.subaccountNumber'),
+      JSON_VALUE(line, '$.subaccount.subaccountId'),
+      JSON_VALUE(line, '$.subaccount'),
+      CONCAT(
+        JSON_VALUE(line, '$.subaccount.1'),
+        JSON_VALUE(line, '$.subaccount.2'),
+        JSON_VALUE(line, '$.subaccount.3')
+      )
+    )                                                   AS subaccount_id,
+    COALESCE(
+      JSON_VALUE(line, '$.subaccount.segments[1].segmentValue'),
+      JSON_VALUE(line, '$.subaccount.2')
+    )                                                   AS source_segment_2_value,
+    COALESCE(
+      JSON_VALUE(line, '$.project.id'),
+      JSON_VALUE(line, '$."project.id"'),
+      JSON_VALUE(JSON_VALUE(line, '$.project'), '$.id'),
+      JSON_VALUE(line, '$.project'),
+      JSON_VALUE(line, '$.projectTaskId'),
+      JSON_VALUE(line, '$."projectTaskId"')
+    )                                                   AS project_id,
+    COALESCE(
+      JSON_VALUE(line, '$.branchNumber.number'),
+      JSON_VALUE(JSON_VALUE(line, '$.branchNumber'), '$.number'),
+      JSON_VALUE(line, '$.branch.number'),
+      JSON_VALUE(JSON_VALUE(line, '$.branch'), '$.number'),
+      JSON_VALUE(line, '$.branch.id'),
+      JSON_VALUE(line, '$."branch.id"'),
+      JSON_VALUE(JSON_VALUE(line, '$.branch'), '$.id'),
+      JSON_VALUE(line, '$.branch'),
+      JSON_VALUE(line, '$.warehouseId')
+    )                                                   AS branch_id,
+
+    -- Degenerate dimensions
+    COALESCE(
+      JSON_VALUE(line, '$.lineNumber'),
+      JSON_VALUE(line, '$.lineNbr'),
+      JSON_VALUE(line, '$.sortOrder')
+    )                                                   AS line_number,
+    COALESCE(
+      JSON_VALUE(line, '$.transactionDescription'),
+      JSON_VALUE(line, '$.lineDescription'),
+      JSON_VALUE(line, '$.description'),
+      JSON_VALUE(JSON_VALUE(line, '$.inventory'), '$.description')
+    )                                                   AS line_description,
+    COALESCE(
+      JSON_VALUE(line, '$.uoM'),
+      JSON_VALUE(line, '$.uom'),
+      JSON_VALUE(line, '$.unitOfMeasure')
+    )                                                   AS unit_of_measure,
+
+    -- Measures
+    SAFE_CAST(COALESCE(JSON_VALUE(line, '$.quantity'), JSON_VALUE(line, '$.orderQty')) AS NUMERIC) AS quantity,
+    SAFE_CAST(COALESCE(JSON_VALUE(line, '$.unitCost'), JSON_VALUE(line, '$.unitPrice')) AS NUMERIC) AS unit_cost,
+    SAFE_CAST(COALESCE(
+      JSON_VALUE(line, '$.costInCurrency'),
+      JSON_VALUE(line, '$.cost'),
+      JSON_VALUE(line, '$.amount'),
+      JSON_VALUE(line, '$.extendedPrice'),
+      JSON_VALUE(line, '$.lineTotalBeforeDiscount')
+    ) AS NUMERIC) AS amount
+  FROM ${ref("visma_supplier_invoices")} AS h
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(h.invoiceLines)) AS line
+  WHERE h.isDeleted = false OR h.isDeleted IS NULL
+),
+
+resolved_business_unit AS (
+  SELECT
+    src.*,
+    COALESCE(src.source_segment_2_value, subaccount_dim.segment2_value) AS accounting_segment_2_value,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY src.tenant_id, src.reference_number, src.line_number, src.inventory_id
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 0 ELSE 1 END,
+        business_unit_mapping.valid_from DESC
+    ) AS row_num
+  FROM source_data AS src
+  LEFT JOIN subaccount_dim
+    ON src.tenant_id = subaccount_dim.tenant_id
+   AND src.subaccount_id = subaccount_dim.subaccount_id
+  LEFT JOIN business_unit_mapping
+    ON src.tenant_id = business_unit_mapping.tenant_id
+   AND src.document_date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = COALESCE(src.source_segment_2_value, subaccount_dim.segment2_value, '0')
+   )
+)
+
+SELECT
+  src.tenant_id,
+  src.raw_business_unit_id,
+  src.accounting_segment_2_value,
+  COALESCE(
+    src.mapped_bu_id,
+    src.business_unit_id
+  ) AS business_unit_id,
+  src.mapped_bu_name AS business_unit_name,
+  CASE
+    WHEN src.mapped_bu_id IS NOT NULL AND src.accounting_segment_2_value IS NOT NULL THEN 'subaccount_segment2_match'
+    WHEN src.mapped_bu_id IS NOT NULL THEN 'tenant_default_match'
+    ELSE 'unresolved'
+  END AS business_unit_resolution_method,
+  src.supplier_id,
+  src.currency_id,
+  src.document_date,
+  src.reference_number,
+  src.document_type,
+  src.inventory_id,
+  src.account_id,
+  src.subaccount_id,
+  src.project_id,
+  src.branch_id,
+  src.line_number,
+  src.line_description,
+  src.unit_of_measure,
+  src.quantity,
+  src.unit_cost,
+  src.amount
+FROM resolved_business_unit AS src
+WHERE src.row_num = 1

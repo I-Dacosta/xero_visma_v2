@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_customer_payment_methods",
+  description: "Bronze: Customer-specific payment method options from Visma Global API."
+}

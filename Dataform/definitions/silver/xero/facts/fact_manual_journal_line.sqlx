@@ -1,0 +1,72 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_manual_journal_line",
+  description: "Silver: Manual journal line items from Xero Accounting API. Grain: one row per tenant_id + manual_journal_id + account_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_manual_journal_line.sqlx
+-- Silver fact: Manual journal lines (Xero)
+-- Source:  dw_1_bronze_xero.xero_manual_journals (JournalLines[] unnested)
+-- Grain:   one row per tenant_id + manual_journal_id + account_id
+--          (manual journal lines have no LineItemID — account_id is the key)
+-- Note:    Manual journal lines use Tracking[] (standard key, unlike system
+--          journals which use TrackingCategories[]).
+-- FK refs: manual_journal_id → dw_1_silver_xero.fact_manual_journal
+--          account_id        → dw_1_silver_xero.dim_account
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_manual_journals")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS manual_journal_id,
+    line
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.JournalLines')) AS line
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  manual_journal_id,
+
+  -- Account FK (no LineItemID on manual journal lines)
+  JSON_VALUE(line, '$.AccountID')                                     AS account_id,
+  JSON_VALUE(line, '$.AccountCode')                                   AS account_code,
+
+  JSON_VALUE(line, '$.Description')                                   AS description,
+  SAFE_CAST(JSON_VALUE(line, '$.LineAmount') AS FLOAT64)              AS line_amount,
+  SAFE_CAST(JSON_VALUE(line, '$.TaxAmount')  AS FLOAT64)              AS tax_amount,
+  JSON_VALUE(line, '$.TaxType')                                       AS tax_type,
+  SAFE_CAST(JSON_VALUE(line, '$.IsBlank')    AS BOOL)                 AS is_blank,
+
+  -- Tracking[] (standard key for manual journals)
+  JSON_VALUE(line, '$.Tracking[0].TrackingCategoryID')                AS tracking_category_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Name')                              AS tracking_category_1_name,
+  JSON_VALUE(line, '$.Tracking[0].TrackingOptionID')                  AS tracking_option_1_id,
+  JSON_VALUE(line, '$.Tracking[0].Option')                            AS tracking_option_1_name,
+  JSON_VALUE(line, '$.Tracking[1].TrackingCategoryID')                AS tracking_category_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Name')                              AS tracking_category_2_name,
+  JSON_VALUE(line, '$.Tracking[1].TrackingOptionID')                  AS tracking_option_2_id,
+  JSON_VALUE(line, '$.Tracking[1].Option')                            AS tracking_option_2_name,
+
+  'xero'                                                              AS _source
+
+FROM unnested
+WHERE SAFE_CAST(JSON_VALUE(line, '$.IsBlank') AS BOOL) IS DISTINCT FROM TRUE

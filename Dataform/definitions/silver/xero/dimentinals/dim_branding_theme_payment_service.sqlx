@@ -1,0 +1,55 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_branding_theme_payment_service",
+  description: "Silver: Payment service connections per branding theme from Xero Accounting API. Grain: one row per tenant_id + branding_theme_id + payment_service_id.",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_branding_theme_payment_service.sqlx
+-- Silver dimension: Payment services linked to branding themes (Xero)
+-- Source:  dw_1_bronze_xero.xero_branding_themes (PaymentServices[] unnested)
+-- Grain:   one row per tenant_id + branding_theme_id + payment_service_id
+-- FK refs: branding_theme_id → dw_1_silver_xero.dim_branding_theme
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_branding_themes")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id                                                        AS branding_theme_id,
+    svc
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.PaymentServices')) AS svc
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  branding_theme_id,
+
+  -- Natural key for this link
+  JSON_VALUE(svc, '$.PaymentServiceID')                               AS payment_service_id,
+
+  -- Attributes
+  JSON_VALUE(svc, '$.PaymentServiceName')                             AS payment_service_name,
+  JSON_VALUE(svc, '$.PaymentServiceType')                             AS payment_service_type,
+  JSON_VALUE(svc, '$.PaymentServiceUrl')                              AS payment_service_url,
+
+  'xero'                                                              AS _source
+
+FROM unnested

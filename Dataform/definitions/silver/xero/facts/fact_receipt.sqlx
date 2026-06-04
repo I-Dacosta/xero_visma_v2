@@ -1,0 +1,71 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_receipt",
+  description: "Silver: Standalone receipts from Xero Accounting API. Grain: one row per tenant_id + receipt_id (latest record by last_seen_at). Bronze table currently empty.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_receipt.sqlx
+-- Silver fact: Standalone receipts (Xero)
+-- Source:  dw_1_bronze_xero.xero_receipts (currently empty)
+-- Grain:   one row per tenant_id + receipt_id (latest by last_seen_at)
+-- Note:    Receipts are also accessible as nested objects within expense claims
+--          (fact_expense_claim_receipt). These are standalone receipt records.
+--          LineItems[] → fact_receipt_line (build when data arrives)
+-- FK refs: contact_id → dw_1_silver_xero.dim_contact
+--          user_id    → dw_1_silver_xero.dim_user
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at                                                      AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_receipts")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  first_seen_at,
+
+  JSON_VALUE(payload, '$.ReceiptID')                                  AS receipt_id,
+  record_id                                                            AS receipt_internal_id,
+  JSON_VALUE(payload, '$.Reference')                                  AS reference,
+  JSON_VALUE(payload, '$.Status')                                     AS status,
+  JSON_VALUE(payload, '$.LineAmountTypes')                            AS line_amount_types,
+  JSON_VALUE(payload, '$.Url')                                        AS url,
+
+  JSON_VALUE(payload, '$.Contact.ContactID')                          AS contact_id,
+  JSON_VALUE(payload, '$.Contact.Name')                               AS contact_name,
+  JSON_VALUE(payload, '$.User.UserID')                                AS user_id,
+  JSON_VALUE(payload, '$.User.EmailAddress')                          AS user_email,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.Date'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS receipt_date,
+
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(payload, '$.UpdatedDateUTC'),
+      r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS updated_at,
+
+  SAFE_CAST(JSON_VALUE(payload, '$.SubTotal') AS FLOAT64)             AS sub_total,
+  SAFE_CAST(JSON_VALUE(payload, '$.TotalTax') AS FLOAT64)             AS total_tax,
+  SAFE_CAST(JSON_VALUE(payload, '$.Total')    AS FLOAT64)             AS total,
+  SAFE_CAST(JSON_VALUE(payload, '$.HasAttachments') AS BOOL)          AS has_attachments,
+
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(payload, '$.LineItems'))              AS line_item_count,
+
+  'xero'                                                              AS _source
+
+FROM raw

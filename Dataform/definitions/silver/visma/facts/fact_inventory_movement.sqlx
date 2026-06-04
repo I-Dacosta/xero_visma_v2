@@ -1,0 +1,197 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_inventory_movement",
+  description: "Inventory movement headers (adjustments, issues, receipts, transfers) from Visma. Grain: one row per movement header (tenant + movement_type + reference_number).",
+  tags: ["silver", "visma", "fact"]
+}
+
+-- =============================================================================
+-- Silver fact: Inventory movement headers (adjustments, issues, receipts, transfers)
+-- Sources:
+--   visma_inventory_adjustments  (movement_type = 'ADJUSTMENT')
+--   visma_inventory_issues       (movement_type = 'ISSUE')
+--   visma_inventory_receipts     (movement_type = 'RECEIPT')
+--   visma_inventory_transfers    (movement_type = 'TRANSFER')
+-- Grain: one row per movement header (tenant + movement_type + reference_number)
+-- =============================================================================
+
+WITH business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_data AS (
+    -- Adjustments
+    SELECT
+        tenantId                                        AS tenant_id,
+      CAST(NULL AS STRING)                            AS raw_business_unit_id,
+      CAST(NULL AS STRING)                            AS business_unit_id,
+        'ADJUSTMENT'                                    AS movement_type,
+        referenceNumber                                 AS reference_number,
+        batchNumber                                     AS batch_number,
+        branchNumber                                    AS branch_number,
+        COALESCE(
+          SAFE_CAST(date AS DATE),
+          DATE(SAFE_CAST(date AS DATETIME)),
+          DATE(SAFE_CAST(date AS TIMESTAMP))
+        )                                               AS date,
+        status,
+        postPeriod                                      AS post_period,
+        description,
+        SAFE_CAST(totalQuantity AS NUMERIC)             AS total_quantity,
+        SAFE_CAST(totalCost AS NUMERIC)                 AS total_amount,
+        CAST(NULL AS NUMERIC)                           AS control_quantity,
+        CAST(NULL AS BOOL)                              AS is_hold,
+        CAST(NULL AS STRING)                            AS source_warehouse_id,
+        CAST(NULL AS STRING)                            AS source_warehouse_name,
+        CAST(NULL AS STRING)                            AS destination_warehouse_id,
+        CAST(NULL AS STRING)                            AS destination_warehouse_name,
+        CAST(NULL AS STRING)                            AS attachments_raw,
+        CAST(NULL AS STRING)                            AS metadata_raw,
+        CAST(NULL AS STRING)                            AS source_timestamp_raw,
+        SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+    FROM ${ref("visma_inventory_adjustments")}
+    WHERE isDeleted = false OR isDeleted IS NULL
+
+    UNION ALL
+
+    -- Issues
+    SELECT
+        tenantId                                        AS tenant_id,
+      CAST(NULL AS STRING)                            AS raw_business_unit_id,
+      CAST(NULL AS STRING)                            AS business_unit_id,
+        'ISSUE'                                         AS movement_type,
+        referenceNumber                                 AS reference_number,
+        batchNumber                                     AS batch_number,
+        branchNumber                                    AS branch_number,
+        COALESCE(
+          SAFE_CAST(date AS DATE),
+          DATE(SAFE_CAST(date AS DATETIME)),
+          DATE(SAFE_CAST(date AS TIMESTAMP))
+        )                                               AS date,
+        status,
+        postPeriod                                      AS post_period,
+        description,
+        SAFE_CAST(totalQuantity AS NUMERIC)             AS total_quantity,
+        SAFE_CAST(totalAmount AS NUMERIC)               AS total_amount,
+        CAST(NULL AS NUMERIC)                           AS control_quantity,
+        CAST(NULL AS BOOL)                              AS is_hold,
+        CAST(NULL AS STRING)                            AS source_warehouse_id,
+        CAST(NULL AS STRING)                            AS source_warehouse_name,
+        CAST(NULL AS STRING)                            AS destination_warehouse_id,
+        CAST(NULL AS STRING)                            AS destination_warehouse_name,
+        CAST(NULL AS STRING)                            AS attachments_raw,
+        CAST(NULL AS STRING)                            AS metadata_raw,
+        CAST(NULL AS STRING)                            AS source_timestamp_raw,
+        SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+    FROM ${ref("visma_inventory_issues")}
+    WHERE isDeleted = false OR isDeleted IS NULL
+
+    UNION ALL
+
+    -- Receipts
+    SELECT
+        tenantId                                        AS tenant_id,
+      CAST(NULL AS STRING)                            AS raw_business_unit_id,
+      CAST(NULL AS STRING)                            AS business_unit_id,
+        'RECEIPT'                                       AS movement_type,
+        referenceNumber                                 AS reference_number,
+        batchNumber                                     AS batch_number,
+        branchNumber                                    AS branch_number,
+        COALESCE(
+          SAFE_CAST(date AS DATE),
+          DATE(SAFE_CAST(date AS DATETIME)),
+          DATE(SAFE_CAST(date AS TIMESTAMP))
+        )                                               AS date,
+        status,
+        postPeriod                                      AS post_period,
+        description,
+        SAFE_CAST(totalQuantity AS NUMERIC)             AS total_quantity,
+        SAFE_CAST(totalCost AS NUMERIC)                 AS total_amount,
+        CAST(NULL AS NUMERIC)                           AS control_quantity,
+        CAST(NULL AS BOOL)                              AS is_hold,
+        CAST(NULL AS STRING)                            AS source_warehouse_id,
+        CAST(NULL AS STRING)                            AS source_warehouse_name,
+        CAST(NULL AS STRING)                            AS destination_warehouse_id,
+        CAST(NULL AS STRING)                            AS destination_warehouse_name,
+        CAST(NULL AS STRING)                            AS attachments_raw,
+        CAST(NULL AS STRING)                            AS metadata_raw,
+        CAST(NULL AS STRING)                            AS source_timestamp_raw,
+        SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+    FROM ${ref("visma_inventory_receipts")}
+    WHERE isDeleted = false OR isDeleted IS NULL
+
+    UNION ALL
+
+    -- Transfers
+    SELECT
+        tenantId                                        AS tenant_id,
+      CAST(NULL AS STRING)                            AS raw_business_unit_id,
+      CAST(NULL AS STRING)                            AS business_unit_id,
+        'TRANSFER'                                      AS movement_type,
+        referenceNumber                                 AS reference_number,
+        batchNumber                                     AS batch_number,
+        CAST(NULL AS STRING)                            AS branch_number,
+        COALESCE(
+          SAFE_CAST(date AS DATE),
+          DATE(SAFE_CAST(date AS DATETIME)),
+          DATE(SAFE_CAST(date AS TIMESTAMP))
+        )                                               AS date,
+        status,
+        postPeriod                                      AS post_period,
+        description,
+        SAFE_CAST(totalQuantity AS NUMERIC)             AS total_quantity,
+        CAST(NULL AS NUMERIC)                           AS total_amount,
+        SAFE_CAST(controlQuantity AS NUMERIC)           AS control_quantity,
+        hold                                            AS is_hold,
+        JSON_VALUE(warehouse, '$.id')                   AS source_warehouse_id,
+        JSON_VALUE(warehouse, '$.description')          AS source_warehouse_name,
+        JSON_VALUE(toWarehouse, '$.id')                 AS destination_warehouse_id,
+        JSON_VALUE(toWarehouse, '$.description')        AS destination_warehouse_name,
+        attachments                                     AS attachments_raw,
+        metadata                                        AS metadata_raw,
+        `timestamp`                                     AS source_timestamp_raw,
+        SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+    FROM ${ref("visma_inventory_transfers")}
+    WHERE isDeleted = false OR isDeleted IS NULL
+),
+enriched AS (
+  SELECT
+    source_data.*,
+    business_unit_mapping.business_unit_id AS mapped_bu_id,
+    business_unit_mapping.business_unit_name AS mapped_bu_name,
+    CASE
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL
+       AND business_unit_mapping.source_segment_2_value = '0' THEN 'segment_zero_match'
+      WHEN business_unit_mapping.business_unit_id IS NOT NULL THEN 'tenant_default_match'
+      ELSE 'unresolved'
+    END AS business_unit_resolution_method,
+    ROW_NUMBER() OVER (
+      PARTITION BY source_data.tenant_id, source_data.movement_type, source_data.reference_number
+      ORDER BY
+        CASE WHEN business_unit_mapping.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        business_unit_mapping.valid_from DESC,
+        source_data.last_modified_at DESC
+    ) AS bu_match_rank
+  FROM source_data
+  LEFT JOIN business_unit_mapping
+    ON source_data.tenant_id = business_unit_mapping.tenant_id
+   AND source_data.date BETWEEN business_unit_mapping.valid_from AND business_unit_mapping.valid_to
+   AND (
+     business_unit_mapping.source_segment_2_value IS NULL
+     OR business_unit_mapping.source_segment_2_value = '0'
+   )
+)
+SELECT
+  enriched.* EXCEPT (business_unit_id, mapped_bu_id, mapped_bu_name, bu_match_rank),
+  COALESCE(enriched.mapped_bu_id, enriched.business_unit_id) AS business_unit_id,
+  enriched.mapped_bu_name AS business_unit_name
+FROM enriched
+WHERE bu_match_rank = 1

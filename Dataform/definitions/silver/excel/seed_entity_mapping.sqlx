@@ -1,0 +1,46 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_excel",
+  name: "seed_entity_mapping",
+  description: "Bootstrap entity mapping seed. Used as fallback until reference_data.xlsx is ingested via bronze.",
+  tags: ["seed", "silver", "excel", "reference"]
+}
+
+-- Seed data for entity → business unit mapping.
+-- company_id sourced from Visma authoritative company list (IDs 1661–1672).
+-- tenant_id = first 8 chars of UUID from visma_subaccounts / dim_company.
+-- entity_valid_to = NULL means active; explicit date = ended/merged entity.
+--
+-- Post-2026 structure (from authoritative Python tenant config):
+--   AQUATIQ_AS (tenant 33f319b9) is parent and hosts 5 BUs:
+--     01 Chemistry, 02 Hygiene Systems, 03 Consult, 04 Food Technology & Aquaculture, 05 Commercial
+--   AQUATIQ_GROUP (tenant 7d2c489e) is group holding with 05 Group Services.
+-- Historical entities (ACHEM, CONSULT, AFF, AHS, SENSE) merged into AQUATIQ_AS on 2026-01-01.
+-- NOTE: company_id for Aquatiq Group AS is not yet known in Visma (set NULL until assigned).
+
+SELECT * FROM UNNEST([
+  -- Aquatiq AS (post-2026 parent) — 5 active BUs absorbed from merged entities
+  STRUCT(1661 AS company_id, 'AQUATIQ_AS' AS entity_code, 'Aquatiq AS' AS entity_name, '01' AS business_unit_code, 'Chemistry' AS business_unit_name, 'Aquatiq' AS group_name, '33f319b9' AS tenant_id, CAST(NULL AS DATE) AS entity_valid_to),
+  STRUCT(1661, 'AQUATIQ_AS', 'Aquatiq AS', '02', 'Hygiene Systems',                'Aquatiq', '33f319b9', CAST(NULL AS DATE)),
+  STRUCT(1661, 'AQUATIQ_AS', 'Aquatiq AS', '03', 'Consult',                        'Aquatiq', '33f319b9', CAST(NULL AS DATE)),
+  STRUCT(1661, 'AQUATIQ_AS', 'Aquatiq AS', '04', 'Food Technology & Aquaculture',  'Aquatiq', '33f319b9', CAST(NULL AS DATE)),
+  STRUCT(1661, 'AQUATIQ_AS', 'Aquatiq AS', '05', 'Commercial',                     'Aquatiq', '33f319b9', CAST(NULL AS DATE)),
+
+  -- Aquatiq Group AS — group holding (Group Services)
+  STRUCT(CAST(NULL AS INT64), 'AQUATIQ_GROUP', 'Aquatiq Group AS', '05', 'Group Services', 'Aquatiq', '7d2c489e', CAST(NULL AS DATE)),
+
+  -- Historical entities (merged/reorganised into Aquatiq AS per 2026 restructuring)
+  STRUCT(1665, 'ACHEM',   'Aquatiq Chemistry AS',       '01', 'Chemistry',                        'Aquatiq', 'd6dc7fbc', DATE '2025-12-31'),
+  STRUCT(1666, 'CONSULT', 'Aquatiq Consult AS',          '03', 'Consult',                         'Aquatiq', '9b1fa69b', DATE '2025-12-31'),
+  STRUCT(1668, 'AFF',     'Aquatiq Food Factory AS',     '02', 'Hygiene Systems',                 'Aquatiq', 'f630d6b0', DATE '2025-12-31'),
+  STRUCT(1669, 'AHS',     'Aquatiq Hygiene Systems AS',  '02', 'Hygiene Systems',                 'Aquatiq', '61320c0a', DATE '2025-12-31'),
+  STRUCT(1670, 'SENSE',   'Aquatiq Sense AS',            '04', 'Food Technology & Aquaculture',   'Aquatiq', 'bb6c024e', DATE '2025-12-31'),
+
+  -- Active entities (post-2026 structure, standalone legal entities)
+  STRUCT(1662, 'APHARMA',       'Aqua Pharma AS',              '01', 'Chemistry',                       'Aquatiq', 'ab0e5d06', CAST(NULL AS DATE)),
+  STRUCT(1663, 'APHARMA_GROUP', 'Aqua Pharma Group AS',        '01', 'Chemistry',                       'Aquatiq', 'ffa4a061', CAST(NULL AS DATE)),
+  STRUCT(1664, 'AQUATIQ_APS',   'Aquatiq Aps',                 '02', 'Hygiene Systems',                 'Aquatiq', 'd1507c4a', CAST(NULL AS DATE)),
+  STRUCT(1667, 'FOODAUTO',      'Aquatiq Food Automation ApS', '02', 'Hygiene Systems',                 'Aquatiq', 'bed46bb6', CAST(NULL AS DATE)),
+  STRUCT(1671, 'SENSILIST',     'Sensilist AS',                '04', 'Food Technology & Aquaculture',   'Aquatiq', 'eda0dd16', CAST(NULL AS DATE)),
+  STRUCT(1672, 'AQUATIQ_AB',    'Aquatiq AB',                  '02', 'Hygiene Systems',                 'Aquatiq', '2b6e5cd6', CAST(NULL AS DATE))
+])

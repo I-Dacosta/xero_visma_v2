@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_purchase_receipts",
+  description: "Bronze: Goods receipt notes from purchase orders (v2) from Visma Global API."
+}

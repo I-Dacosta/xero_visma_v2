@@ -1,0 +1,326 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_account",
+  description: "Silver: GL chart of accounts dimension enriched with a shared NO/SE/DK global account mapping and safe fallback classifications.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_account.sqlx
+-- Silver dimension: GL chart of accounts
+-- Source master: dw_1_bronze_visma.visma_accounts
+-- Primary mapping: exact company-scoped workbook mapping from Group mapping workbook
+-- Secondary mapping: NO/SE/DK breakpoint fallback, then chart-of-accounts exact/family fallback
+-- Grain: one row per tenant_id + account_cd (latest non-deleted record)
+-- =============================================================================
+
+WITH visma_accounts AS (
+  SELECT
+      tenantId                                            AS tenant_id,
+      syncedAt                                            AS synced_at,
+      organizationName                                    AS organization_name,
+
+      -- Natural keys
+      CAST(accountID AS STRING)                           AS account_id,
+      CAST(accountID AS STRING)                           AS account_internal_id,
+      CAST(accountCD AS STRING)                           AS account_cd,
+      SAFE_CAST(accountCD AS INT64)                       AS account_cd_numeric,
+
+      -- Classification
+      accountClass                                        AS account_class,
+      accountGroupCD                                      AS account_group_cd,
+      type                                                AS account_type,
+      controlAccountModule                                AS control_account_module,
+      taxCategory                                         AS tax_category,
+      postOption                                          AS post_option,
+      publicCode1                                         AS public_code,
+      publicCode1                                         AS public_code_1,
+
+      -- Attributes
+      description                                         AS account_description,
+      active                                              AS is_active,
+      cashAccount                                         AS is_cash_account,
+      allowManualEntry                                    AS allow_manual_entry,
+      useDefaultSub                                       AS use_default_sub,
+      useDefaultSub                                       AS use_default_subaccount,
+
+      -- Currency
+      currency                                            AS currency_id,
+
+      SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)        AS last_modified_at
+  FROM ${ref("dw_1_bronze_visma", "visma_accounts")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY tenantId, accountCD
+      ORDER BY syncedAt DESC, SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) DESC
+  ) = 1
+),
+
+global_account_mapping_scopes AS (
+  SELECT
+    mapping_scope,
+    organization_name,
+    country_code
+  FROM ${ref("dw_1_silver_excel", "seed_global_account_mapping_scope")}
+),
+
+tenant_account_mapping_profiles AS (
+  SELECT
+    v.tenant_id,
+    ANY_VALUE(v.organization_name)                             AS organization_name,
+    CASE
+      WHEN COUNTIF(s.organization_name IS NOT NULL) > 0
+        THEN 'global_no_se_dk_chart'
+      WHEN SAFE_DIVIDE(COUNTIF(LENGTH(v.account_cd) = 5), COUNT(*)) >= 0.5
+        THEN 'local_five_digit_chart'
+      ELSE 'group_excel_chart'
+    END                                                     AS account_mapping_profile
+  FROM visma_accounts AS v
+  LEFT JOIN global_account_mapping_scopes AS s
+    ON s.mapping_scope = 'NO_SE_DK'
+   AND s.organization_name = v.organization_name
+  GROUP BY v.tenant_id
+),
+
+company_account_mapping AS (
+  SELECT
+    organization_name,
+    local_account_code,
+    mapped_account_code_3
+  FROM ${ref("dw_1_silver_excel", "seed_company_account_mapping")}
+),
+
+chart_of_accounts AS (
+  SELECT
+    account_code_1,
+    account_code_2,
+    account_code_3,
+    bs_pl,
+    fsli_1,
+    fsli_2,
+    fsli_3,
+    ebitda_flag,
+    net_income_flag,
+    cf1,
+    cf2,
+    cf3,
+    nwc,
+    capex,
+    intercompany_flag,
+    _source                                             AS chart_of_accounts_source
+  FROM ${ref("dw_1_silver_excel", "chart_of_accounts")}
+),
+
+global_account_mapping AS (
+  SELECT
+    mapping_scope,
+    local_account_digits,
+    range_start_account_code,
+    range_end_account_code,
+    mapped_account_code_3,
+    mapped_account_description
+  FROM ${ref("dw_1_silver_excel", "global_account_mapping")}
+),
+
+safe_account_family_root_codes AS (
+  SELECT code AS account_code_2
+  FROM UNNEST([
+    1400,
+    1500,
+    1600,
+    1900,
+    2400,
+    2450,
+    2500,
+    2600,
+    2800,
+    2900,
+    3000,
+    3100,
+    4000,
+    4100,
+    4200,
+    4300,
+    4400,
+    4700,
+    4900,
+    5000,
+    5100,
+    5200,
+    5400,
+    6000,
+    6100,
+    6200,
+    6300,
+    6400,
+    6500,
+    6600,
+    6700,
+    6800,
+    6900,
+    7000,
+    7100,
+    7700,
+    8000,
+    8100,
+    2700
+  ]) AS code
+),
+
+chart_of_accounts_family_roots AS (
+  SELECT
+    account_code_1,
+    account_code_2,
+    account_code_3,
+    bs_pl,
+    fsli_1,
+    fsli_2,
+    fsli_3,
+    ebitda_flag,
+    net_income_flag,
+    cf1,
+    cf2,
+    cf3,
+    nwc,
+    capex,
+    intercompany_flag,
+    chart_of_accounts_source
+  FROM chart_of_accounts
+  WHERE account_code_3 = account_code_2
+    AND account_code_2 IN (SELECT account_code_2 FROM safe_account_family_root_codes)
+)
+
+SELECT
+    v.tenant_id,
+    v.synced_at,
+    v.organization_name,
+
+    v.account_id,
+    v.account_internal_id,
+    v.account_cd,
+    v.account_cd_numeric,
+
+    v.account_class,
+    v.account_group_cd,
+    v.account_type,
+    v.control_account_module,
+    v.tax_category,
+    v.post_option,
+    v.public_code,
+    v.public_code_1,
+
+    v.account_description,
+    v.is_active,
+    v.is_cash_account,
+    v.allow_manual_entry,
+    v.use_default_sub,
+    v.use_default_subaccount,
+    v.currency_id,
+    v.last_modified_at,
+
+    p.account_mapping_profile,
+
+    COALESCE(em.account_code_1, gm.account_code_1, c.account_code_1, r.account_code_1)
+                                                        AS account_code_1,
+    COALESCE(em.account_code_2, gm.account_code_2, c.account_code_2, r.account_code_2)
+                                                        AS account_code_2,
+    COALESCE(em.account_code_3, gm.account_code_3, c.account_code_3, r.account_code_3)
+                                                        AS account_code_3,
+    COALESCE(
+      em.bs_pl,
+      gm.bs_pl,
+      c.bs_pl,
+      r.bs_pl,
+      CASE
+        WHEN v.account_type IN ('Asset', 'Liability') THEN 'BS'
+        WHEN v.account_type IN ('Income', 'Expense') THEN 'P&L'
+      END
+    )                                                  AS bs_pl,
+    COALESCE(
+      em.fsli_1,
+      gm.fsli_1,
+      c.fsli_1,
+      r.fsli_1,
+      CASE
+        WHEN v.account_type = 'Asset' THEN 'Assets'
+        WHEN v.account_type = 'Liability' THEN 'Equity and liabilities'
+        WHEN v.account_type = 'Income' THEN 'Revenue'
+        WHEN v.account_type = 'Expense' THEN 'Operating expenses'
+      END
+    )                                                  AS fsli_1,
+    COALESCE(em.fsli_2, gm.fsli_2, c.fsli_2, r.fsli_2) AS fsli_2,
+    CASE
+      WHEN em.account_code_3 IS NOT NULL THEN em.fsli_3
+      WHEN gm.account_code_3 IS NOT NULL THEN gm.fsli_3
+      WHEN c.account_code_3 IS NOT NULL THEN c.fsli_3
+      WHEN r.account_code_3 IS NOT NULL THEN COALESCE(r.fsli_2, r.fsli_1, r.fsli_3)
+      ELSE NULL
+    END                                                 AS fsli_3,
+    COALESCE(em.ebitda_flag, gm.ebitda_flag, c.ebitda_flag, r.ebitda_flag)
+                                                        AS is_ebitda,
+    COALESCE(em.net_income_flag, gm.net_income_flag, c.net_income_flag, r.net_income_flag)
+                                                        AS is_net_income,
+    COALESCE(em.cf1, gm.cf1, c.cf1, r.cf1)             AS cf_1,
+    COALESCE(em.cf2, gm.cf2, c.cf2, r.cf2)             AS cf_2,
+    COALESCE(em.cf3, gm.cf3, c.cf3, r.cf3)             AS cf_3,
+    COALESCE(em.nwc, gm.nwc, c.nwc, r.nwc)             AS nwc,
+    COALESCE(em.capex, gm.capex, c.capex, r.capex)     AS capex,
+    COALESCE(em.intercompany_flag, gm.intercompany_flag, c.intercompany_flag, r.intercompany_flag)
+                                                        AS intercompany_flag,
+    COALESCE(
+      em.chart_of_accounts_source,
+      gm.chart_of_accounts_source,
+      c.chart_of_accounts_source,
+      r.chart_of_accounts_source
+    )                                                  AS chart_of_accounts_source,
+    (
+      em.account_code_3 IS NOT NULL
+      OR
+      gm.account_code_3 IS NOT NULL
+      OR c.account_code_3 IS NOT NULL
+      OR r.account_code_3 IS NOT NULL
+    )                                                  AS has_chart_of_accounts_mapping,
+    CASE
+      WHEN em.account_code_3 IS NOT NULL
+        THEN 'company_workbook_exact_match'
+      WHEN gm.account_code_3 IS NOT NULL
+       AND v.account_cd_numeric = g.range_start_account_code
+        THEN 'global_account_exact_match'
+      WHEN gm.account_code_3 IS NOT NULL
+        THEN 'global_previous_account_range_fallback'
+      WHEN c.account_code_3 IS NOT NULL
+        THEN 'exact_account_cd_match'
+      WHEN r.account_code_3 IS NOT NULL
+        THEN 'account_family_root_fallback'
+      WHEN v.account_type IN ('Asset', 'Liability', 'Income', 'Expense')
+        THEN 'native_account_type_fallback'
+      ELSE 'unmapped'
+    END                                                 AS account_mapping_method
+FROM visma_accounts AS v
+LEFT JOIN tenant_account_mapping_profiles AS p
+  ON p.tenant_id = v.tenant_id
+LEFT JOIN company_account_mapping AS m
+  ON m.organization_name = v.organization_name
+ AND m.local_account_code = v.account_cd_numeric
+LEFT JOIN chart_of_accounts AS em
+  ON m.mapped_account_code_3 = em.account_code_3
+LEFT JOIN global_account_mapping AS g
+  ON p.account_mapping_profile = 'global_no_se_dk_chart'
+ AND em.account_code_3 IS NULL
+ AND g.mapping_scope = 'NO_SE_DK'
+ AND v.account_cd_numeric IS NOT NULL
+ AND LENGTH(CAST(v.account_cd_numeric AS STRING)) = g.local_account_digits
+ AND v.account_cd_numeric BETWEEN g.range_start_account_code AND g.range_end_account_code
+LEFT JOIN chart_of_accounts AS gm
+  ON g.mapped_account_code_3 = gm.account_code_3
+LEFT JOIN chart_of_accounts AS c
+  ON p.account_mapping_profile IN ('group_excel_chart', 'global_no_se_dk_chart')
+ AND gm.account_code_3 IS NULL
+ AND v.account_cd_numeric = c.account_code_3
+LEFT JOIN chart_of_accounts_family_roots AS r
+  ON p.account_mapping_profile IN ('group_excel_chart', 'global_no_se_dk_chart')
+ AND gm.account_code_3 IS NULL
+ AND c.account_code_3 IS NULL
+ AND v.account_cd_numeric BETWEEN 1000 AND 9999
+ AND CAST(FLOOR(v.account_cd_numeric / 100) * 100 AS INT64) = r.account_code_2

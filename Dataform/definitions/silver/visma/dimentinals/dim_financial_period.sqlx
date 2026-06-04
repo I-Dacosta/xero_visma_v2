@@ -1,0 +1,67 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_financial_period",
+  description: "Fiscal calendar period dimension from Visma.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- Silver dimension: Fiscal calendar periods
+-- Source: visma_financial_periods
+-- Why: Links GL transactions, budgets, and balances to fiscal periods.
+--      Critical for time-intelligence DAX measures (YTD, MTD, YoY) in Power BI.
+--      The finPeriodID (YYYYMM format) is the standard period key used by
+--      all financial endpoints.
+-- =============================================================================
+
+WITH source_data AS (
+SELECT
+    tenantId                                    AS tenant_id,
+    period                                      AS financial_period_id,
+    description                                 AS period_description,
+    SAFE_CAST(startDate AS DATE)                AS start_date,
+    SAFE_CAST(endDate AS DATE)                  AS end_date,
+    EXTRACT(YEAR FROM SAFE_CAST(startDate AS DATE)) AS fiscal_year,
+    EXTRACT(MONTH FROM SAFE_CAST(startDate AS DATE)) AS fiscal_month,
+    closedInSupplierLedger                      AS is_closed_in_ap,
+    closedInCustomerLedger                      AS is_closed_in_ar,
+    closedInGeneralLedger                       AS is_closed_in_gl,
+    closedInFixedAssets                         AS is_closed_in_fa,
+    closedInInventoryManagement                 AS is_closed_in_in,
+    year
+
+FROM ${ref("visma_financial_periods")}
+WHERE isDeleted = false OR isDeleted IS NULL
+),
+current_tenant_business_unit AS (
+  SELECT
+         tenant_id,
+         business_unit_id,
+         business_unit_name,
+         ROW_NUMBER() OVER (
+           PARTITION BY tenant_id
+           ORDER BY
+             CASE
+               WHEN source_segment_2_value = '0' THEN 1
+               WHEN source_segment_2_value IS NULL THEN 2
+               ELSE 3
+             END,
+             COALESCE(valid_to, DATE '9999-12-31') DESC,
+             valid_from DESC
+         ) AS rn
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+  WHERE CURRENT_DATE() BETWEEN valid_from AND COALESCE(valid_to, DATE '9999-12-31')
+)
+SELECT
+  source_data.*,
+  current_tenant_business_unit.business_unit_id,
+  current_tenant_business_unit.business_unit_name
+FROM source_data
+LEFT JOIN current_tenant_business_unit
+  ON source_data.tenant_id = current_tenant_business_unit.tenant_id
+ AND current_tenant_business_unit.rn = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY source_data.tenant_id, source_data.financial_period_id
+  ORDER BY source_data.end_date DESC, source_data.start_date DESC, source_data.period_description DESC
+) = 1

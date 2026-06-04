@@ -1,0 +1,59 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "dim_contact_address",
+  description: "Silver: Addresses per Xero contact. Grain: one row per tenant_id + contact_id + address_type.",
+  tags: ["silver", "xero", "dimension"]
+}
+
+-- =============================================================================
+-- dim_contact_address.sqlx
+-- Silver dimension: Contact addresses (Xero)
+-- Source:  dw_1_bronze_xero.xero_contacts (Addresses[] unnested)
+-- Grain:   one row per tenant_id + contact_id + address_type
+--          (Xero allows one address per type: POBOX, STREET, DELIVERY, SALES)
+-- FK refs: contact_id → dw_1_silver_xero.dim_contact
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_contacts")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS contact_id,
+    addr
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Addresses')) AS addr
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  contact_id,
+
+  JSON_VALUE(addr, '$.AddressType')                                   AS address_type,
+  JSON_VALUE(addr, '$.AttentionTo')                                   AS attention_to,
+  JSON_VALUE(addr, '$.AddressLine1')                                  AS address_line_1,
+  JSON_VALUE(addr, '$.AddressLine2')                                  AS address_line_2,
+  JSON_VALUE(addr, '$.AddressLine3')                                  AS address_line_3,
+  JSON_VALUE(addr, '$.AddressLine4')                                  AS address_line_4,
+  JSON_VALUE(addr, '$.City')                                          AS city,
+  JSON_VALUE(addr, '$.Region')                                        AS region,
+  JSON_VALUE(addr, '$.PostalCode')                                    AS postal_code,
+  JSON_VALUE(addr, '$.Country')                                       AS country,
+
+  'xero'                                                              AS _source
+
+FROM unnested

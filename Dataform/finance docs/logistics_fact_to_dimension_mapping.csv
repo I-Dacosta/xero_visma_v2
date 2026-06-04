@@ -1,0 +1,21 @@
+Fact Table,Dimension Table,Join Key (Fact → Dimension)
+fctSalesOrderLineExt,dimSalesOrder,FK SalesOrder → PK SalesOrder
+fctSalesOrderLineExt,dimInventory,FK InventoryNumber → PK InventoryNumber
+fctSalesOrderLineExt,dimWarehouse,FK WarehouseID → PK warehouseID
+fctSalesOrderLineExt,dimSalesPerson,FK SalespersonID → PK salespersonID
+fctSalesOrderLineExt,dimSalesPerson_Customers,FK CustomerNumber → FK Customer InternalID
+fctSalesOrderLineExt,dimPriceClass,via Inventory → PriceClass
+fctSalesOrderLineExt,dimOwner,via SalesOrder → OwnerId
+fctSalesOrderLineExt,dimItemClass,via Inventory → ItemClassId
+fctSalesOrderLineExt,dimCostPriceStatistics,via Inventory → InventoryNumber
+fctSalesOrderLineExt,dimSalesOrder_Attachment,via SalesOrder → orderNo
+fctPurchaseOrderLineExt,dimPurchaseOrder,FK PurchaseOrder → PK PurchaseOrder
+fctPurchaseOrderLineExt,dimInventory,FK InventoryNumber → PK InventoryNumber
+fctPurchaseOrderLineExt,dimWarehouse,FK WarehouseID → PK warehouseID
+fctShipmentOrderLines,dimShipment,FK ShipmentNumber → PK shipmentNumber
+fctShipmentOrderLines,dimSalesOrder,FK OrderNumber → PK SalesOrder
+fctShipmentOrderLines,dimInventory,via ShipmentDetailLines → InventoryNumber
+fctShipmentDetailLines,dimShipment,FK ShipmentNumber → PK shipmentNumber
+fctShipmentDetailLines,dimInventory,FK InventoryNumber → PK InventoryNumber
+fctShipmentDetailLines,dimWarehouseDetail,via Inventory + Warehouse
+fctShipmentDetailLines,dimWarehouse_Locations,via WarehouseID + LocationId

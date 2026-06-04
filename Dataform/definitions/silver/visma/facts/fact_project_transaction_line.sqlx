@@ -1,0 +1,243 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_project_transaction_line",
+  description: "Silver: Project transaction lines flattened from visma_project_transactions. Grain: one row per tenant + module + reference_number + tran_id.",
+  tags: ["silver", "visma", "fact"]
+}
+
+WITH subaccount_dim AS (
+  SELECT
+    tenant_id,
+    subaccount_id,
+    subaccount_number,
+    segment2 AS segment2_value
+  FROM ${ref("dw_1_silver_visma", "dim_subaccount")}
+),
+
+business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+source_base AS (
+  SELECT * EXCEPT (rn)
+  FROM (
+    SELECT
+      src.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY src.tenantId, src.module, src.refNbr
+        ORDER BY
+          COALESCE(src.refreshedAt, src.syncedAt) DESC,
+          COALESCE(src.firstSyncedAt, src.syncedAt) DESC,
+          src.syncedAt DESC
+      ) AS rn
+    FROM ${ref("dw_1_bronze_visma", "visma_project_transactions")} AS src
+    WHERE src.isDeleted IS DISTINCT FROM TRUE
+  )
+  WHERE rn = 1
+),
+
+line_base AS (
+  SELECT
+    src.tenantId AS tenant_id,
+    src.syncedAt AS synced_at,
+    src.organizationName AS organization_name,
+    COALESCE(JSON_VALUE(src.businessUnitId, '$.id'), CAST(src.businessUnitId AS STRING)) AS source_business_unit_id,
+    src.businessUnitName AS source_business_unit_name,
+    src.refNbr AS reference_number,
+    src.module,
+    src.status,
+    src.description AS header_description,
+
+    CAST(line_offset + 1 AS STRING) AS line_number,
+    SAFE_CAST(JSON_VALUE(line_json, '$.tranId') AS INT64) AS tran_id,
+    COALESCE(
+      SAFE_CAST(JSON_VALUE(line_json, '$.date') AS DATE),
+      DATE(SAFE_CAST(JSON_VALUE(line_json, '$.date') AS DATETIME)),
+      DATE(SAFE_CAST(JSON_VALUE(line_json, '$.date') AS TIMESTAMP))
+    ) AS transaction_date,
+    TRIM(COALESCE(
+      JSON_VALUE(line_json, '$.inventoryId.number'),
+      JSON_VALUE(line_json, '$.inventory.number'),
+      JSON_VALUE(line_json, '$.inventoryItem.number'),
+      JSON_VALUE(line_json, '$.inventoryId')
+    )) AS inventory_id,
+    COALESCE(
+      JSON_VALUE(line_json, '$.inventoryId.description'),
+      JSON_VALUE(line_json, '$.inventory.description'),
+      JSON_VALUE(line_json, '$.inventoryItem.description')
+    ) AS inventory_description,
+    JSON_VALUE(line_json, '$.description') AS line_description,
+    COALESCE(
+      JSON_VALUE(line_json, '$.uom'),
+      JSON_VALUE(line_json, '$.uoM'),
+      JSON_VALUE(line_json, '$.unitOfMeasure')
+    ) AS unit_of_measure,
+    SAFE_CAST(JSON_VALUE(line_json, '$.quantity') AS NUMERIC) AS quantity,
+    SAFE_CAST(JSON_VALUE(line_json, '$.unitRate') AS NUMERIC) AS unit_rate,
+    SAFE_CAST(JSON_VALUE(line_json, '$.amount') AS NUMERIC) AS amount,
+    SAFE_CAST(JSON_VALUE(line_json, '$.billable') AS BOOL) AS is_billable,
+    SAFE_CAST(JSON_VALUE(line_json, '$.released') AS BOOL) AS is_released,
+    SAFE_CAST(JSON_VALUE(line_json, '$.allocated') AS BOOL) AS is_allocated,
+    SAFE_CAST(JSON_VALUE(line_json, '$.billableQuantity') AS NUMERIC) AS billable_quantity,
+    JSON_VALUE(line_json, '$.financialPeriod') AS financial_period,
+    JSON_VALUE(line_json, '$.batchNbr') AS batch_number,
+    SAFE_CAST(JSON_VALUE(line_json, '$.useBillableQty') AS BOOL) AS use_billable_quantity,
+    CASE
+      WHEN STARTS_WITH(COALESCE(JSON_VALUE(line_json, '$.startDate'), ''), '0001-01-01') THEN NULL
+      ELSE COALESCE(
+        SAFE_CAST(JSON_VALUE(line_json, '$.startDate') AS DATE),
+        DATE(SAFE_CAST(JSON_VALUE(line_json, '$.startDate') AS DATETIME)),
+        DATE(SAFE_CAST(JSON_VALUE(line_json, '$.startDate') AS TIMESTAMP))
+      )
+    END AS start_date,
+    CASE
+      WHEN STARTS_WITH(COALESCE(JSON_VALUE(line_json, '$.endDate'), ''), '0001-01-01') THEN NULL
+      ELSE COALESCE(
+        SAFE_CAST(JSON_VALUE(line_json, '$.endDate') AS DATE),
+        DATE(SAFE_CAST(JSON_VALUE(line_json, '$.endDate') AS DATETIME)),
+        DATE(SAFE_CAST(JSON_VALUE(line_json, '$.endDate') AS TIMESTAMP))
+      )
+    END AS end_date,
+    SAFE_CAST(JSON_VALUE(line_json, '$.lastModifiedDateTime') AS TIMESTAMP) AS line_last_modified_at,
+    SAFE_CAST(JSON_VALUE(line_json, '$.overtimeMultiplier') AS NUMERIC) AS overtime_multiplier,
+
+    COALESCE(
+      JSON_VALUE(line_json, '$.project.id'),
+      JSON_VALUE(line_json, '$.project.projectId')
+    ) AS project_id,
+    COALESCE(
+      JSON_VALUE(line_json, '$.project.description'),
+      JSON_VALUE(line_json, '$.project.name')
+    ) AS project_name,
+    COALESCE(
+      JSON_VALUE(line_json, '$.projectTask.id'),
+      JSON_VALUE(line_json, '$.projectTask.taskId')
+    ) AS project_task_id,
+    COALESCE(
+      JSON_VALUE(line_json, '$.projectTask.description'),
+      JSON_VALUE(line_json, '$.projectTask.name')
+    ) AS project_task_name,
+
+    JSON_VALUE(line_json, '$.debitAccount.type') AS debit_account_type,
+    TRIM(COALESCE(
+      JSON_VALUE(line_json, '$.debitAccount.number'),
+      JSON_VALUE(line_json, '$.debitAccount.id')
+    )) AS debit_account_cd,
+    JSON_VALUE(line_json, '$.debitAccount.description') AS debit_account_description,
+    COALESCE(
+      JSON_VALUE(line_json, '$.debitSubaccount.id'),
+      JSON_VALUE(line_json, '$.debitSubaccount.subaccountNumber')
+    ) AS debit_subaccount_id,
+    COALESCE(
+      JSON_VALUE(line_json, '$.branch.number'),
+      JSON_VALUE(line_json, '$.branch.id')
+    ) AS branch_id,
+
+    TRIM(COALESCE(
+      JSON_VALUE(line_json, '$.customerVendor.number'),
+      JSON_VALUE(line_json, '$.customerVendor.id')
+    )) AS customer_vendor_id,
+    JSON_VALUE(line_json, '$.customerVendor.name') AS customer_vendor_name,
+    TRIM(JSON_VALUE(line_json, '$.accountGroup.number')) AS account_group_number,
+    JSON_VALUE(line_json, '$.accountGroup.name') AS account_group_name,
+    TRIM(JSON_VALUE(line_json, '$.debitAccountGroup.number')) AS debit_account_group_number,
+    JSON_VALUE(line_json, '$.debitAccountGroup.name') AS debit_account_group_name
+  FROM source_base AS src
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(src.lines)) AS line_json WITH OFFSET AS line_offset
+),
+
+enriched AS (
+  SELECT
+    l.*,
+    sd.segment2_value AS source_segment_2_value,
+    bm.business_unit_id AS mapped_business_unit_id,
+    bm.business_unit_name AS mapped_business_unit_name,
+    CASE
+      WHEN bm.business_unit_id IS NULL THEN 'no_mapping'
+      WHEN bm.source_segment_2_value IS NOT NULL THEN 'subaccount_segment2_match'
+      ELSE 'tenant_default_match'
+    END AS business_unit_match_rule,
+    ROW_NUMBER() OVER (
+      PARTITION BY l.tenant_id, l.module, l.reference_number, COALESCE(CAST(l.tran_id AS STRING), l.line_number)
+      ORDER BY
+        CASE WHEN bm.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        bm.valid_from DESC,
+        l.line_last_modified_at DESC
+    ) AS bu_match_rank
+  FROM line_base AS l
+  LEFT JOIN subaccount_dim AS sd
+    ON l.tenant_id = sd.tenant_id
+   AND (
+     l.debit_subaccount_id = sd.subaccount_id
+     OR l.debit_subaccount_id = sd.subaccount_number
+   )
+  LEFT JOIN business_unit_mapping AS bm
+    ON l.tenant_id = bm.tenant_id
+   AND l.transaction_date BETWEEN bm.valid_from AND bm.valid_to
+   AND (
+     bm.source_segment_2_value IS NULL
+     OR bm.source_segment_2_value = COALESCE(sd.segment2_value, '0')
+   )
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  organization_name,
+  source_business_unit_id,
+  source_business_unit_name,
+  COALESCE(mapped_business_unit_id, source_business_unit_id) AS business_unit_id,
+  COALESCE(mapped_business_unit_name, source_business_unit_name, organization_name) AS business_unit_name,
+  source_segment_2_value,
+  business_unit_match_rule,
+
+  reference_number,
+  module,
+  status,
+  header_description,
+  line_number,
+  tran_id,
+  transaction_date,
+  inventory_id,
+  inventory_description,
+  line_description,
+  unit_of_measure,
+  quantity,
+  unit_rate,
+  amount,
+  is_billable,
+  is_released,
+  is_allocated,
+  billable_quantity,
+  financial_period,
+  batch_number,
+  use_billable_quantity,
+  start_date,
+  end_date,
+  line_last_modified_at,
+  overtime_multiplier,
+  project_id,
+  project_name,
+  project_task_id,
+  project_task_name,
+  debit_account_type,
+  debit_account_cd,
+  debit_account_description,
+  debit_subaccount_id,
+  branch_id,
+  customer_vendor_id,
+  customer_vendor_name,
+  account_group_number,
+  account_group_name,
+  debit_account_group_number,
+  debit_account_group_name
+FROM enriched
+WHERE bu_match_rank = 1

@@ -1,0 +1,124 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_finance",
+  name: "dim_account",
+  description: "Finance account dimension at tenant plus account grain. Includes all accounts from the account master, whether or not they occur in GL transactions, and exposes the enriched hierarchy used for FSLI, P&L, balance-sheet, EBITDA, cash-flow, and working-capital reporting.",
+  tags: ["gold", "finance", "dimension"]
+}
+
+-- =============================================================================
+-- Gold finance dimension: Chart of accounts
+-- Source: dw_1_silver_visma.dim_account
+-- Grain: one row per tenant + account_cd
+-- Why: Account is tenant-scoped in Visma. It is not a business-unit dimension.
+-- =============================================================================
+
+WITH account_base AS (
+  SELECT
+    tenant_id,
+    synced_at,
+    organization_name,
+    account_id,
+    account_cd,
+    account_cd_numeric,
+    account_class,
+    account_group_cd,
+    account_type,
+    control_account_module,
+    tax_category,
+    post_option,
+    public_code,
+    public_code_1,
+    account_description,
+    is_active,
+    is_cash_account,
+    allow_manual_entry,
+    use_default_sub,
+    use_default_subaccount,
+    currency_id,
+    account_mapping_profile,
+    last_modified_at,
+    account_code_1,
+    account_code_2,
+    account_code_3,
+    bs_pl,
+    fsli_1,
+    fsli_2,
+    fsli_3,
+    is_ebitda,
+    is_net_income,
+    cf_1,
+    cf_2,
+    cf_3,
+    nwc,
+    capex,
+    intercompany_flag,
+    chart_of_accounts_source,
+    has_chart_of_accounts_mapping,
+    account_mapping_method
+  FROM ${ref("dw_1_silver_visma", "dim_account")}
+)
+
+SELECT
+  CONCAT(
+    CAST(a.tenant_id AS STRING), '|',
+    CAST(a.account_cd AS STRING)
+  )                                               AS account_key,
+
+  FARM_FINGERPRINT(CONCAT(
+    CAST(a.currency_id AS STRING)
+  ))                                              AS currency_key,
+
+  a.tenant_id,
+  a.organization_name,
+
+  -- Local Visma account code used as the conformed reporting account number
+  a.account_cd,
+  a.account_cd_numeric,
+
+  -- Source system internal id from Visma account master
+  a.account_id                                     AS source_account_id,
+
+  a.account_description,
+  a.account_class,
+  a.account_group_cd,
+  a.account_type,
+  a.currency_id,
+  a.account_mapping_profile,
+  a.is_active,
+  a.is_cash_account,
+  a.allow_manual_entry,
+  a.use_default_sub,
+  a.use_default_subaccount,
+  a.control_account_module,
+  a.post_option,
+  a.public_code,
+  a.public_code_1,
+  a.tax_category,
+  a.synced_at,
+  a.last_modified_at,
+
+  a.bs_pl,
+  a.fsli_1,
+  a.fsli_2,
+  a.fsli_3,
+  a.is_ebitda,
+  a.is_net_income,
+  a.cf_1,
+  a.cf_2,
+  a.cf_3,
+  (UPPER(TRIM(COALESCE(a.nwc, ''))) IN ('X', 'TRUE', '1', 'YES'))
+                                                  AS is_nwc,
+  (UPPER(TRIM(COALESCE(a.capex, ''))) IN ('X', 'TRUE', '1', 'YES'))
+                                                  AS is_capex,
+  a.intercompany_flag,
+  a.account_code_1,
+  a.account_code_2,
+  a.account_code_3,
+  a.chart_of_accounts_source,
+  a.has_chart_of_accounts_mapping                 AS has_hierarchy,
+  a.account_mapping_method,
+
+  'visma' AS source_system
+
+FROM account_base AS a

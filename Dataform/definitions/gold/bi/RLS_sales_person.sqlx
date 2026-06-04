@@ -1,0 +1,101 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_bi",
+  name: "RLS_sales_person",
+  description: "Power BI row-level security bridge for salesperson-based access. Maps user principal names to tenant-specific salespersons using active salesperson directory emails plus manual override rows.",
+  tags: ["gold", "bi", "security", "rls"]
+}
+
+WITH manual_mapping AS (
+  SELECT
+    LOWER(TRIM(user_principal_name))                AS user_principal_name,
+    tenant_id,
+    sales_person_id,
+    COALESCE(access_scope, 'sales_person')          AS access_scope,
+    COALESCE(is_active, TRUE)                       AS is_active,
+    notes,
+    'manual_seed'                                   AS mapping_source,
+    1                                               AS mapping_priority
+  FROM ${ref("dw_1_silver_excel", "seed_rls_sales_person")}
+  WHERE user_principal_name IS NOT NULL
+    AND tenant_id IS NOT NULL
+    AND sales_person_id IS NOT NULL
+),
+auto_mapping AS (
+  SELECT
+    LOWER(TRIM(email))                              AS user_principal_name,
+    tenant_id,
+    sales_person_id,
+    'sales_person'                                  AS access_scope,
+    TRUE                                            AS is_active,
+    'Auto-mapped from active salesperson directory email' AS notes,
+    'sales_person_directory_email'                  AS mapping_source,
+    2                                               AS mapping_priority
+  FROM ${ref("dw_1_gold_common", "dim_sales_person")}
+  WHERE email IS NOT NULL
+    AND TRIM(email) <> ''
+    AND is_active = TRUE
+),
+seed_mapping AS (
+  SELECT
+    user_principal_name,
+    tenant_id,
+    sales_person_id,
+    access_scope,
+    is_active,
+    notes,
+    mapping_source
+  FROM (
+    SELECT * FROM manual_mapping
+    UNION ALL
+    SELECT * FROM auto_mapping
+  )
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY user_principal_name, tenant_id, sales_person_id
+    ORDER BY mapping_priority
+  ) = 1
+),
+enriched AS (
+  SELECT
+    m.*,
+    FARM_FINGERPRINT(CAST(m.tenant_id AS STRING))   AS company_key,
+    sp.sales_person_key,
+    sp.sales_person_name,
+    sp.home_business_unit_id,
+    sp.home_business_unit_name,
+    sp.is_active                                    AS sales_person_is_active,
+    c.organization_name                             AS company_name,
+    c.entity_code,
+    c.entity_name
+  FROM seed_mapping AS m
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_sales_person")} AS sp
+    ON sp.tenant_id = m.tenant_id
+   AND sp.sales_person_id = m.sales_person_id
+  LEFT JOIN ${ref("dw_1_gold_common", "dim_company")} AS c
+    ON c.company_key = FARM_FINGERPRINT(CAST(m.tenant_id AS STRING))
+)
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(user_principal_name AS STRING), '|',
+    CAST(tenant_id AS STRING), '|',
+    CAST(sales_person_id AS STRING)
+  ))                                                AS rls_sales_person_key,
+  user_principal_name,
+  tenant_id,
+  company_key,
+  company_name,
+  entity_code,
+  entity_name,
+  sales_person_key,
+  sales_person_id,
+  sales_person_name,
+  home_business_unit_id,
+  home_business_unit_name,
+  access_scope,
+  is_active,
+  COALESCE(sales_person_is_active, FALSE)           AS has_active_sales_person_match,
+  notes,
+  mapping_source,
+  'visma' AS source_system
+FROM enriched

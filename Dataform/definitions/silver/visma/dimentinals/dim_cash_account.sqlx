@@ -1,0 +1,55 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_cash_account",
+  description: "Silver: Cash/bank account master dimension. Source: visma_cash_accounts.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+-- =============================================================================
+-- dim_cash_account.sqlx
+-- Silver dimension: Cash and bank account master data
+-- Source: dw_1_bronze_visma.visma_cash_accounts
+-- Grain: one row per tenantId + cashAccountNumber (latest non-deleted record)
+-- entryTypes is a JSON array of allowed entry type codes.
+-- account/subaccount are JSON references extracted to their IDs.
+-- =============================================================================
+
+SELECT
+    -- Sync metadata
+    tenantId                                            AS tenant_id,
+    syncedAt                                            AS synced_at,
+    organizationName                                    AS organization_name,
+
+    -- Natural key
+    number                                              AS cash_account_number,
+
+    -- Attributes
+    description                                         AS cash_account_description,
+
+    -- JSON: account → {accountCD, description}
+    COALESCE(
+        JSON_VALUE(account, '$.accountCD'),
+        account
+    )                                                   AS gl_account_cd,
+
+    -- JSON: subaccount → {subaccountNumber}
+    COALESCE(
+        JSON_VALUE(subaccount, '$.subaccountNumber'),
+        subaccount
+    )                                                   AS gl_subaccount_number,
+
+    -- JSON: currency → {id}
+    COALESCE(
+        JSON_VALUE(currency, '$.id'),
+        currency
+    )                                                   AS currency_id,
+
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)        AS last_modified_at
+
+FROM ${ref("dw_1_bronze_visma", "visma_cash_accounts")}
+WHERE isDeleted IS DISTINCT FROM TRUE
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, number
+    ORDER BY syncedAt DESC
+) = 1

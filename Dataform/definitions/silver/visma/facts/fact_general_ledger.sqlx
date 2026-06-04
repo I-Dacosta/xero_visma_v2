@@ -1,0 +1,165 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "fact_general_ledger",
+  description: "Silver: Flat general ledger transaction lines with historized business unit mapping by accounting date.",
+  tags: ["silver", "visma", "fact"]
+}
+
+WITH subaccount_dim AS (
+  SELECT
+    tenant_id,
+    subaccount_id,
+    subaccount_number,
+    segment2 AS segment2_value,
+    segment3 AS department_code
+  FROM ${ref("dw_1_silver_visma", "dim_subaccount")}
+),
+
+business_unit_mapping AS (
+  SELECT
+    tenant_id,
+    source_segment_2_value,
+    business_unit_id,
+    business_unit_name,
+    valid_from,
+    COALESCE(valid_to, DATE '9999-12-31') AS valid_to
+  FROM ${ref("dw_1_silver_excel", "business_unit_mapping")}
+),
+
+customer_document_project_map AS (
+  SELECT
+    tenantId AS tenant_id,
+    referenceNumber AS ref_number,
+    ANY_VALUE(JSON_VALUE(project, '$.id')) AS project_id
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_documents")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND JSON_VALUE(project, '$.id') IS NOT NULL
+  GROUP BY 1, 2
+  HAVING COUNT(DISTINCT JSON_VALUE(project, '$.id')) = 1
+),
+
+base AS (
+  SELECT
+    tenantId AS tenant_id,
+    syncedAt AS synced_at,
+    organizationName AS organization_name,
+
+    batchNumber AS batch_number,
+    refNumber AS ref_number,
+    CAST(lineNumber AS STRING) AS line_number,
+
+    COALESCE(JSON_VALUE(account, '$.number'), CAST(account AS STRING)) AS account_cd,
+    JSON_VALUE(account, '$.type') AS account_type,
+    subaccount AS subaccount_id,
+    COALESCE(JSON_VALUE(branch, '$.number'), CAST(branch AS STRING)) AS branch_id,
+    COALESCE(JSON_VALUE(ledger, '$.id'), CAST(ledger AS STRING)) AS ledger,
+    currency AS currency_id,
+    module,
+
+    COALESCE(
+      DATE(SAFE_CAST(tranDate AS DATETIME)),
+      DATE(SAFE_CAST(tranDate AS TIMESTAMP)),
+      SAFE.PARSE_DATE('%Y%m', period)
+    ) AS transaction_date,
+    period AS financial_period,
+
+    description,
+
+    debitAmount AS debit_amount,
+    creditAmount AS credit_amount,
+    begBalance AS beginning_balance,
+    endingBalance AS ending_balance,
+
+    currDebitAmount AS debit_amount_currency,
+    currCreditAmount AS credit_amount_currency,
+    currBegBalance AS beginning_balance_currency,
+    currEndingBalance AS ending_balance_currency,
+
+    SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) AS last_modified_at
+  FROM ${ref("dw_1_bronze_visma", "visma_general_ledger_transactions")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+),
+
+enriched AS (
+  SELECT
+    b.*,
+    cdp.project_id,
+    sd.segment2_value AS source_segment_2_value,
+    sd.department_code AS department_code,
+    bm.business_unit_id AS mapped_business_unit_id,
+    bm.business_unit_name AS mapped_business_unit_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY b.tenant_id, b.batch_number, b.ref_number, b.line_number
+      ORDER BY
+        CASE WHEN bm.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+        bm.valid_from DESC
+    ) AS bu_match_rank
+  FROM base AS b
+  LEFT JOIN customer_document_project_map AS cdp
+    ON b.module = 'AR'
+   AND b.tenant_id = cdp.tenant_id
+   AND b.ref_number = cdp.ref_number
+  LEFT JOIN subaccount_dim AS sd
+    ON b.tenant_id = sd.tenant_id
+   AND (b.subaccount_id = sd.subaccount_id OR b.subaccount_id = sd.subaccount_number)
+  LEFT JOIN business_unit_mapping AS bm
+    ON b.tenant_id = bm.tenant_id
+   AND b.transaction_date BETWEEN bm.valid_from AND bm.valid_to
+   AND (
+     bm.source_segment_2_value IS NULL
+     OR bm.source_segment_2_value = COALESCE(sd.segment2_value, '0')
+   )
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  organization_name,
+  COALESCE(mapped_business_unit_id, CONCAT(tenant_id, '|UNMAPPED')) AS business_unit_id,
+  COALESCE(mapped_business_unit_name, organization_name) AS business_unit_name,
+
+  batch_number,
+  ref_number,
+  line_number,
+
+  account_cd,
+  account_cd AS account_id,
+  account_type,
+  subaccount_id,
+  branch_id,
+  ledger,
+  currency_id,
+  module,
+
+  -- Department link: resolved via subaccount join (tenant_id + subaccount_id);
+  -- department_code = dim_subaccount.segment3. department_key is computed with
+  -- the SAME FARM_FINGERPRINT formula as dim_department, so it joins 1:1 to it.
+  department_code AS department_id,
+  CASE
+    WHEN department_code IS NOT NULL THEN
+      FARM_FINGERPRINT(CONCAT(
+        CAST(tenant_id AS STRING), '|',
+        CAST(department_code AS STRING)
+      ))
+    ELSE NULL
+  END AS department_key,
+
+  transaction_date,
+  financial_period,
+  description,
+  project_id,
+
+  debit_amount,
+  credit_amount,
+  beginning_balance,
+  ending_balance,
+
+  debit_amount_currency,
+  credit_amount_currency,
+  beginning_balance_currency,
+  ending_balance_currency,
+
+  last_modified_at
+FROM enriched
+WHERE bu_match_rank = 1

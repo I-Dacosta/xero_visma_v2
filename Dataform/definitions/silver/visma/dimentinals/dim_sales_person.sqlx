@@ -1,0 +1,166 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_visma",
+  name: "dim_sales_person",
+  description: "Silver: Salesperson master dimension. Source: visma_sales_persons enriched with salesperson directory contact details from Selgere 20260420.xlsx.",
+  tags: ["silver", "visma", "dimension"]
+}
+
+WITH salesperson AS (
+  SELECT
+      tenantId                                        AS tenant_id,
+      syncedAt                                        AS synced_at,
+      organizationName                                AS organization_name,
+      salespersonID                                   AS sales_person_id,
+      name                                            AS sales_person_name,
+      commissionPct                                   AS commission_pct,
+      isActive                                        AS is_active,
+      COALESCE(
+          JSON_VALUE(salesSub, '$.id'),
+          salesSub
+      )                                               AS sales_sub_account,
+      CASE
+          WHEN NULLIF(
+              REGEXP_REPLACE(
+                  COALESCE(JSON_VALUE(salesSub, '$.id'), salesSub, ''),
+                  r'[^0-9]',
+                  ''
+              ),
+              ''
+          ) IS NOT NULL THEN SUBSTR(
+              LPAD(
+                  REGEXP_REPLACE(
+                      COALESCE(JSON_VALUE(salesSub, '$.id'), salesSub, ''),
+                      r'[^0-9]',
+                      ''
+                  ),
+                  6,
+                  '0'
+              ),
+              1,
+              2
+          )
+      END                                             AS sales_sub_account_segment_1,
+      CASE
+          WHEN NULLIF(
+              REGEXP_REPLACE(
+                  COALESCE(JSON_VALUE(salesSub, '$.id'), salesSub, ''),
+                  r'[^0-9]',
+                  ''
+              ),
+              ''
+          ) IS NOT NULL THEN SUBSTR(
+              LPAD(
+                  REGEXP_REPLACE(
+                      COALESCE(JSON_VALUE(salesSub, '$.id'), salesSub, ''),
+                      r'[^0-9]',
+                      ''
+                  ),
+                  6,
+                  '0'
+              ),
+              3,
+              1
+          )
+      END                                             AS sales_sub_account_segment_2,
+      CASE
+          WHEN NULLIF(
+              REGEXP_REPLACE(
+                  COALESCE(JSON_VALUE(salesSub, '$.id'), salesSub, ''),
+                  r'[^0-9]',
+                  ''
+              ),
+              ''
+          ) IS NOT NULL THEN SUBSTR(
+              LPAD(
+                  REGEXP_REPLACE(
+                      COALESCE(JSON_VALUE(salesSub, '$.id'), salesSub, ''),
+                      r'[^0-9]',
+                      ''
+                  ),
+                  6,
+                  '0'
+              ),
+              4,
+              3
+          )
+      END                                             AS sales_sub_account_segment_3,
+      SAFE_CAST(createdDateTime AS TIMESTAMP)         AS created_at,
+      SAFE_CAST(lastModifiedDateTime AS TIMESTAMP)    AS last_modified_at
+  FROM ${ref("dw_1_bronze_visma", "visma_sales_persons")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY tenantId, salespersonID
+      ORDER BY syncedAt DESC, SAFE_CAST(lastModifiedDateTime AS TIMESTAMP) DESC
+  ) = 1
+),
+mapped_salesperson AS (
+  SELECT
+      salesperson.tenant_id,
+      salesperson.synced_at,
+      salesperson.organization_name,
+      salesperson.sales_person_id,
+      salesperson.sales_person_name,
+      salesperson.commission_pct,
+      salesperson.is_active,
+      salesperson.sales_sub_account,
+      salesperson.sales_sub_account_segment_1,
+      salesperson.sales_sub_account_segment_2,
+      salesperson.sales_sub_account_segment_3,
+      mapped_bu.business_unit_id                          AS home_business_unit_id,
+      mapped_bu.business_unit_name                        AS home_business_unit_name,
+      CASE
+          WHEN mapped_bu.business_unit_id IS NOT NULL
+            AND mapped_bu.source_segment_2_value IS NOT NULL
+            THEN 'sales_sub_segment2_match'
+          WHEN mapped_bu.business_unit_id IS NOT NULL
+            THEN 'tenant_default_match'
+          ELSE 'no_match'
+      END                                                 AS home_business_unit_match_rule,
+      salesperson.created_at,
+      salesperson.last_modified_at
+  FROM salesperson
+  LEFT JOIN ${ref("dw_1_silver_excel", "business_unit_mapping")} AS mapped_bu
+      ON salesperson.tenant_id = mapped_bu.tenant_id
+     AND DATE(COALESCE(salesperson.last_modified_at, salesperson.synced_at))
+          BETWEEN mapped_bu.valid_from AND COALESCE(mapped_bu.valid_to, DATE '9999-12-31')
+     AND (
+          mapped_bu.source_segment_2_value IS NULL
+          OR mapped_bu.source_segment_2_value = NULLIF(salesperson.sales_sub_account_segment_2, '')
+     )
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY salesperson.tenant_id, salesperson.sales_person_id
+      ORDER BY
+          CASE WHEN mapped_bu.source_segment_2_value IS NOT NULL THEN 1 ELSE 0 END DESC,
+          mapped_bu.valid_from DESC
+  ) = 1
+)
+SELECT
+    mapped_salesperson.tenant_id,
+    mapped_salesperson.synced_at,
+    mapped_salesperson.organization_name,
+    mapped_salesperson.sales_person_id,
+    mapped_salesperson.sales_person_name,
+    directory.employee_id,
+    directory.phone,
+    directory.email,
+    directory.legacy_sales_person_id,
+    CASE
+      WHEN directory.sales_person_id IS NOT NULL THEN 'excel_directory_match'
+      ELSE 'no_directory_match'
+    END                                                 AS directory_match_rule,
+    mapped_salesperson.commission_pct,
+    mapped_salesperson.is_active,
+    mapped_salesperson.sales_sub_account,
+    mapped_salesperson.sales_sub_account_segment_1,
+    mapped_salesperson.sales_sub_account_segment_2,
+    mapped_salesperson.sales_sub_account_segment_3,
+    mapped_salesperson.home_business_unit_id,
+    mapped_salesperson.home_business_unit_name,
+    mapped_salesperson.home_business_unit_match_rule,
+    mapped_salesperson.created_at,
+    mapped_salesperson.last_modified_at
+FROM mapped_salesperson
+LEFT JOIN ${ref("dw_1_silver_excel", "seed_sales_person_directory")} AS directory
+  ON directory.tenant_id = mapped_salesperson.tenant_id
+ AND directory.sales_person_id = mapped_salesperson.sales_person_id

@@ -1,0 +1,314 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "bridge_customer_price_class_period",
+  description: "Period-aware customer to price-class bridge. Each row represents a contiguous validity window for a (tenant, customer, price_class) derived from the class's own effectiveDate/expirationDate in customer_sales_prices, gated by evidence that the customer was active under the class inside that window. Outside of any window the customer is implicitly on base price.",
+  tags: ["gold", "common", "customer", "price-class", "bridge", "period"]
+}
+
+-- =============================================================================
+-- bridge_customer_price_class_period.sqlx
+-- Grain: one row per (tenant_id, customer_id, price_class_id, valid_from, valid_to)
+-- Period source: dw_1_bronze_visma.visma_customer_sales_prices
+--   priceType = 'CustomerPriceClass' rows give per-inventoryId validity windows
+--   per (tenantId, priceCode); we gap-detect to produce disjoint class windows.
+-- Membership evidence (same rules as dw_1_gold_common.bridge_customer_price_class):
+--   * sales_order_order_location_price_class:
+--       customer ordered at a location whose customer_locations.priceClassId = class
+--   * sales_order_price_signature_inferred:
+--       customer has a clean (no manual price / no manual discount / no breakQty /
+--       no promotion) sales-order line whose unit_price matches the class's price
+--       for the same inventoryId, with order_date inside the class window
+-- For each evidence row we attach the matching disjoint class window. Customer
+-- is assigned to the class for the *entire* window (rule: kunde tilhører klassen
+-- for hele vinduet, ikke kun datoer hvor de tilfeldigvis handlet).
+-- =============================================================================
+
+WITH tenant_price_class_codebook AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    id                                                     AS price_class_id,
+    description                                            AS price_class_description
+  FROM ${ref("dw_1_bronze_visma", "visma_price_classes")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, id
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_customer_locations AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    locationId                                             AS location_id,
+    priceClassId                                           AS price_class_id
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_locations")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, customerId, locationId
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+latest_sales_orders AS (
+  SELECT *
+  FROM ${ref("dw_1_bronze_visma", "visma_sales_orders_v3")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND customerId IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenantId, COALESCE(orderNo, orderId), COALESCE(orderType, type)
+    ORDER BY syncedAt DESC
+  ) = 1
+),
+
+-- -------------------------------------------------------------------------
+-- 1) Build disjoint validity windows per (tenant, price_class) by gap-merging
+--    the per-inventoryId rows from visma_customer_sales_prices.
+-- -------------------------------------------------------------------------
+price_class_raw_intervals AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    priceCode                                              AS price_class_id,
+    -- Bronze stores effectiveDate/expirationDate as TIMESTAMP-shaped strings
+    -- like '2023-09-25T00:00:00'. SAFE_CAST(... AS DATE) returns NULL for
+    -- that format — you must go through TIMESTAMP first. Skipping this step
+    -- previously stripped every CustomerPriceClass row and rebuilt the
+    -- bridge with 0 rows.
+    DATE(SAFE_CAST(effectiveDate AS TIMESTAMP))            AS d_from,
+    -- Sentinel for open-ended expirationDate. Must leave headroom for the
+    -- gap-detection DATE_ADD(prev_max_d_to, INTERVAL 1 DAY) further down —
+    -- BigQuery's max DATE is 9999-12-31, so we use 9999-12-30 here to avoid
+    -- the +1 DAY overflow that would otherwise cause runtime failure.
+    COALESCE(DATE(SAFE_CAST(expirationDate AS TIMESTAMP)),
+             DATE '9999-12-30')                            AS d_to
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND priceType = 'CustomerPriceClass'
+    AND priceCode IS NOT NULL
+    AND SAFE_CAST(effectiveDate AS TIMESTAMP) IS NOT NULL
+),
+
+price_class_intervals_ordered AS (
+  SELECT
+    tenant_id,
+    price_class_id,
+    d_from,
+    d_to,
+    MAX(d_to) OVER (
+      PARTITION BY tenant_id, price_class_id
+      ORDER BY d_from, d_to
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    )                                                      AS prev_max_d_to
+  FROM price_class_raw_intervals
+),
+
+price_class_intervals_grouped AS (
+  SELECT
+    tenant_id,
+    price_class_id,
+    d_from,
+    d_to,
+    SUM(CASE
+          WHEN prev_max_d_to IS NULL
+            OR d_from > DATE_ADD(prev_max_d_to, INTERVAL 1 DAY)
+          THEN 1 ELSE 0
+        END) OVER (
+      PARTITION BY tenant_id, price_class_id
+      ORDER BY d_from, d_to
+    )                                                      AS window_group
+  FROM price_class_intervals_ordered
+),
+
+price_class_windows AS (
+  SELECT
+    tenant_id,
+    price_class_id,
+    MIN(d_from)                                            AS valid_from,
+    MAX(d_to)                                              AS valid_to
+  FROM price_class_intervals_grouped
+  GROUP BY tenant_id, price_class_id, window_group
+),
+
+-- -------------------------------------------------------------------------
+-- 2) Direct evidence: customer's sales-order location is tied to a class.
+--    We bound per window by counting only orders inside that window.
+-- -------------------------------------------------------------------------
+sales_order_dates AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    location                                               AS order_location_id,
+    DATE(SAFE_CAST(date AS TIMESTAMP))                     AS order_date
+  FROM latest_sales_orders
+  WHERE date IS NOT NULL
+),
+
+direct_evidence_per_window AS (
+  SELECT
+    so.tenant_id,
+    so.customer_id,
+    loc.price_class_id,
+    win.valid_from,
+    win.valid_to,
+    COUNT(*)                                               AS evidence_count,
+    MIN(so.order_date)                                     AS first_order_date_in_window,
+    MAX(so.order_date)                                     AS last_order_date_in_window,
+    'sales_order_order_location_price_class'               AS source_method
+  FROM sales_order_dates AS so
+  JOIN latest_customer_locations AS loc
+    ON loc.tenant_id = so.tenant_id
+   AND loc.customer_id = so.customer_id
+   AND loc.location_id = so.order_location_id
+  JOIN price_class_windows AS win
+    ON win.tenant_id = so.tenant_id
+   AND win.price_class_id = loc.price_class_id
+   AND so.order_date BETWEEN win.valid_from AND win.valid_to
+  WHERE loc.price_class_id IS NOT NULL
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+-- -------------------------------------------------------------------------
+-- 3) Inferred evidence: clean order line with unit_price matching a class
+--    price for the same inventoryId, order date inside the class window.
+-- -------------------------------------------------------------------------
+sales_order_class_prices AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    priceCode                                              AS price_class_id,
+    inventoryId                                            AS inventory_id,
+    SAFE_CAST(price AS NUMERIC)                            AS price_amount,
+    SAFE_CAST(effectiveDate AS TIMESTAMP)                  AS effective_at,
+    SAFE_CAST(expirationDate AS TIMESTAMP)                 AS expires_at
+  FROM ${ref("dw_1_bronze_visma", "visma_customer_sales_prices")}
+  WHERE isDeleted IS DISTINCT FROM TRUE
+    AND priceType = 'CustomerPriceClass'
+    AND priceCode IS NOT NULL
+    AND inventoryId IS NOT NULL
+    AND SAFE_CAST(price AS NUMERIC) > 0
+    AND COALESCE(breakQty, 0) = 0
+    AND COALESCE(promotion, FALSE) = FALSE
+),
+
+clean_sales_order_lines AS (
+  SELECT
+    tenantId                                               AS tenant_id,
+    customerId                                             AS customer_id,
+    SAFE_CAST(date AS TIMESTAMP)                           AS order_ts,
+    DATE(SAFE_CAST(date AS TIMESTAMP))                     AS order_date,
+    JSON_VALUE(line, '$.inventory.id')                     AS inventory_id,
+    SAFE_CAST(JSON_VALUE(line, '$.unitPrice') AS NUMERIC)  AS unit_price
+  FROM latest_sales_orders,
+  UNNEST(JSON_QUERY_ARRAY(lines, '$')) AS line
+  WHERE JSON_VALUE(line, '$.inventory.id') IS NOT NULL
+    AND SAFE_CAST(JSON_VALUE(line, '$.unitPrice') AS NUMERIC) > 0
+    AND COALESCE(JSON_VALUE(line, '$.hasManualPrice'), 'false') = 'false'
+    AND COALESCE(JSON_VALUE(line, '$.hasManualDiscount'), 'false') = 'false'
+    AND COALESCE(SAFE_CAST(JSON_VALUE(line, '$.discountPercent') AS NUMERIC), 0) = 0
+),
+
+inferred_line_matches AS (
+  SELECT
+    l.tenant_id,
+    l.customer_id,
+    p.price_class_id,
+    l.order_date
+  FROM clean_sales_order_lines AS l
+  JOIN sales_order_class_prices AS p
+    ON p.tenant_id = l.tenant_id
+   AND p.inventory_id = l.inventory_id
+   AND p.price_amount = l.unit_price
+   AND (p.effective_at IS NULL OR p.effective_at <= l.order_ts)
+   AND (p.expires_at IS NULL OR l.order_ts <= p.expires_at)
+),
+
+inferred_evidence_per_window AS (
+  SELECT
+    m.tenant_id,
+    m.customer_id,
+    m.price_class_id,
+    win.valid_from,
+    win.valid_to,
+    COUNT(*)                                               AS evidence_count,
+    MIN(m.order_date)                                      AS first_order_date_in_window,
+    MAX(m.order_date)                                      AS last_order_date_in_window,
+    'sales_order_price_signature_inferred'                 AS source_method
+  FROM inferred_line_matches AS m
+  JOIN price_class_windows AS win
+    ON win.tenant_id = m.tenant_id
+   AND win.price_class_id = m.price_class_id
+   AND m.order_date BETWEEN win.valid_from AND win.valid_to
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+-- -------------------------------------------------------------------------
+-- 4) Combine; if both direct and inferred evidence exist for the same
+--    (customer, class, window), prefer direct (stronger signal).
+-- -------------------------------------------------------------------------
+all_evidence AS (
+  SELECT * FROM direct_evidence_per_window
+  UNION ALL
+  SELECT * FROM inferred_evidence_per_window
+),
+
+deduped_evidence AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    price_class_id,
+    valid_from,
+    valid_to,
+    evidence_count,
+    first_order_date_in_window,
+    last_order_date_in_window,
+    source_method
+  FROM all_evidence
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, customer_id, price_class_id, valid_from, valid_to
+    ORDER BY
+      CASE source_method
+        WHEN 'sales_order_order_location_price_class' THEN 1
+        WHEN 'sales_order_price_signature_inferred'   THEN 2
+        ELSE 9
+      END,
+      evidence_count DESC
+  ) = 1
+),
+
+customer_period_counts AS (
+  SELECT
+    tenant_id,
+    customer_id,
+    COUNT(*)                                               AS price_class_period_count,
+    COUNT(DISTINCT price_class_id)                         AS distinct_price_class_count
+  FROM deduped_evidence
+  GROUP BY 1, 2
+)
+
+SELECT
+  FARM_FINGERPRINT(CONCAT(
+    CAST(d.tenant_id AS STRING), '|',
+    CAST(d.customer_id AS STRING)
+  ))                                                       AS customer_key,
+  d.tenant_id,
+  d.customer_id,
+  d.price_class_id,
+  codebook.price_class_description                         AS price_class_description,
+  d.valid_from,
+  d.valid_to,
+  (CURRENT_DATE() BETWEEN d.valid_from AND d.valid_to)     AS is_current,
+  d.first_order_date_in_window,
+  d.last_order_date_in_window,
+  d.evidence_count,
+  d.source_method,
+  counts.price_class_period_count,
+  counts.distinct_price_class_count,
+  counts.distinct_price_class_count > 1                    AS customer_has_multiple_price_classes,
+  'visma'                                                  AS source_system
+FROM deduped_evidence AS d
+LEFT JOIN tenant_price_class_codebook AS codebook
+  ON codebook.tenant_id = d.tenant_id
+ AND codebook.price_class_id = d.price_class_id
+LEFT JOIN customer_period_counts AS counts
+  ON counts.tenant_id = d.tenant_id
+ AND counts.customer_id = d.customer_id

@@ -1,0 +1,84 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_expense_claim_receipt",
+  description: "Silver: Individual receipts within Xero expense claims. Grain: one row per tenant_id + expense_claim_id + receipt_id.",
+  tags: ["silver", "xero", "fact"]
+}
+
+-- =============================================================================
+-- fact_expense_claim_receipt.sqlx
+-- Silver fact: Expense claim receipts (Xero)
+-- Source:  dw_1_bronze_xero.xero_expense_claims (Receipts[] unnested)
+-- Grain:   one row per tenant_id + expense_claim_id + receipt_id
+-- Note:    Date uses Xero's /Date(ms±offset)/ format.
+-- Note:    Receipt line items → fact_expense_claim_receipt_line
+-- FK refs: expense_claim_id → dw_1_silver_xero.fact_expense_claim
+--          contact_id       → dw_1_silver_xero.dim_contact
+--          user_id          → dw_1_silver_xero.dim_user (future)
+-- =============================================================================
+
+WITH raw AS (
+  SELECT
+    tenant_id,
+    record_id,
+    payload,
+    last_seen_at AS synced_at
+  FROM ${ref("dw_1_bronze_xero", "xero_expense_claims")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+unnested AS (
+  SELECT
+    r.tenant_id,
+    r.synced_at,
+    r.record_id  AS expense_claim_id,
+    receipt
+  FROM raw AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.payload, '$.Receipts')) AS receipt
+)
+
+SELECT
+  tenant_id,
+  synced_at,
+  expense_claim_id,
+
+  -- Natural key
+  JSON_VALUE(receipt, '$.ReceiptID')                                  AS receipt_id,
+
+  -- Foreign keys
+  JSON_VALUE(receipt, '$.Contact.ContactID')                          AS contact_id,
+  JSON_VALUE(receipt, '$.Contact.Name')                               AS contact_name,
+  JSON_VALUE(receipt, '$.User.UserID')                                AS user_id,
+  JSON_VALUE(receipt, '$.User.EmailAddress')                          AS user_email,
+
+  -- Status & reference
+  JSON_VALUE(receipt, '$.Status')                                     AS status,
+  JSON_VALUE(receipt, '$.Reference')                                  AS reference,
+  JSON_VALUE(receipt, '$.LineAmountTypes')                            AS line_amount_types,
+  JSON_VALUE(receipt, '$.Url')                                        AS url,
+
+  -- Date — Xero /Date(ms±offset)/ format
+  TIMESTAMP_MILLIS(
+    SAFE_CAST(
+      REGEXP_EXTRACT(JSON_VALUE(receipt, '$.Date'),
+        r'/Date\((\d+)[+-]\d{4}\)/') AS INT64)
+  )                                                                   AS receipt_date,
+
+  -- Amounts
+  SAFE_CAST(JSON_VALUE(receipt, '$.SubTotal') AS FLOAT64)             AS sub_total,
+  SAFE_CAST(JSON_VALUE(receipt, '$.TotalTax') AS FLOAT64)             AS total_tax,
+  SAFE_CAST(JSON_VALUE(receipt, '$.Total')    AS FLOAT64)             AS total,
+
+  -- Flags
+  SAFE_CAST(JSON_VALUE(receipt, '$.HasAttachments') AS BOOL)          AS has_attachments,
+
+  -- Line item count (detail in fact_expense_claim_receipt_line)
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(receipt, '$.LineItems'))              AS line_item_count,
+
+  'xero'                                                              AS _source
+
+FROM unnested

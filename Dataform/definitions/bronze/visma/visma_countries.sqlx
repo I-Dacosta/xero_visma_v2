@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_visma",
+  name: "visma_countries",
+  description: "Bronze: Country reference data (code, name) from Visma Global API."
+}

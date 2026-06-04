@@ -1,0 +1,112 @@
+config {
+  type: "table",
+  schema: "dw_1_gold_common",
+  name: "dim_currency",
+  description: "Conformed currency dimension at global currency-code grain.",
+  tags: ["gold", "common", "dimension", "conformed"]
+}
+
+WITH ranked_currency AS (
+  SELECT
+    currency_id,
+    currency_code,
+    currency_description,
+    standard_currency_name,
+    source_symbol,
+    symbol,
+    standard_symbol,
+    decimal_precision,
+    is_base_currency,
+    is_used_for_accounting,
+    has_staging_market_rate,
+    staging_market_quote_currency_code,
+    staging_market_rate_source,
+    tenant_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY currency_id
+      ORDER BY
+        CASE WHEN standard_currency_name IS NOT NULL THEN 0 ELSE 1 END,
+        CASE WHEN symbol IS NOT NULL THEN 0 ELSE 1 END,
+        CASE WHEN is_base_currency THEN 0 ELSE 1 END,
+        CASE WHEN is_used_for_accounting THEN 0 ELSE 1 END,
+        tenant_id
+    ) AS currency_rank
+  FROM ${ref("dw_1_silver_visma", "dim_currency")}
+),
+tenant_usage AS (
+  SELECT
+    currency_id,
+    COUNT(DISTINCT tenant_id) AS tenant_count
+  FROM ${ref("dw_1_silver_visma", "dim_currency")}
+  GROUP BY 1
+),
+external_market_currencies AS (
+  SELECT DISTINCT from_currency_id AS currency_id
+  FROM ${ref("dw_1_silver_visma", "dim_currency_market_rate")}
+  UNION DISTINCT
+  SELECT DISTINCT to_currency_id AS currency_id
+  FROM ${ref("dw_1_silver_visma", "dim_currency_market_rate")}
+),
+external_currency_reference AS (
+  SELECT * FROM UNNEST([
+    STRUCT('BRL' AS currency_id, 'Brazilian real' AS currency_description, 'R$' AS standard_symbol),
+    STRUCT('IDR', 'Indonesian rupiah', 'IDR')
+  ])
+),
+visma_currency AS (
+  SELECT
+    FARM_FINGERPRINT(CAST(c.currency_id AS STRING))  AS currency_key,
+    FARM_FINGERPRINT(CAST(c.currency_id AS STRING))  AS global_currency_key,
+    c.currency_id,
+    c.currency_code,
+    COALESCE(c.standard_currency_name, c.currency_description)
+                                                     AS currency_description,
+    c.currency_description                            AS source_currency_description,
+    c.source_symbol,
+    COALESCE(c.standard_symbol, c.symbol, c.currency_id)
+                                                     AS symbol,
+    c.standard_symbol,
+    c.decimal_precision,
+    c.is_base_currency,
+    c.is_used_for_accounting,
+    c.has_staging_market_rate,
+    c.staging_market_quote_currency_code,
+    c.staging_market_rate_source,
+    u.tenant_count,
+    'visma' AS source_system
+  FROM ranked_currency AS c
+  LEFT JOIN tenant_usage AS u
+    ON u.currency_id = c.currency_id
+  WHERE c.currency_rank = 1
+)
+
+SELECT
+  *
+FROM visma_currency
+
+UNION ALL
+
+SELECT
+  FARM_FINGERPRINT(CAST(e.currency_id AS STRING))   AS currency_key,
+  FARM_FINGERPRINT(CAST(e.currency_id AS STRING))   AS global_currency_key,
+  e.currency_id,
+  e.currency_id                                     AS currency_code,
+  r.currency_description                            AS currency_description,
+  r.currency_description                            AS source_currency_description,
+  CAST(NULL AS STRING)                              AS source_symbol,
+  COALESCE(r.standard_symbol, e.currency_id)        AS symbol,
+  r.standard_symbol,
+  CAST(NULL AS INT64)                               AS decimal_precision,
+  CAST(NULL AS BOOL)                                AS is_base_currency,
+  CAST(NULL AS BOOL)                                AS is_used_for_accounting,
+  TRUE                                              AS has_staging_market_rate,
+  'NOK'                                             AS staging_market_quote_currency_code,
+  'dw_1_staging_currency_n2.HistoryratesPowerBI'    AS staging_market_rate_source,
+  0                                                 AS tenant_count,
+  'staging_currency_feed'                           AS source_system
+FROM external_market_currencies AS e
+JOIN external_currency_reference AS r
+  ON r.currency_id = e.currency_id
+LEFT JOIN visma_currency AS v
+  ON v.currency_id = e.currency_id
+WHERE v.currency_id IS NULL
