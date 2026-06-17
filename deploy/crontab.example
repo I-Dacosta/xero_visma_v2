@@ -1,0 +1,88 @@
+# ─── xero_service_v2 — layered sync cadence (crontab) ───────────────────────────
+#
+# The `xero` binary is a STATELESS one-shot job: each invocation fetches raw Xero
+# pages and writes them verbatim to GCS, then exits. State is append-only in the
+# bucket; downstream BigQuery/Dataform handles dedup/merge. There is no Postgres,
+# Redis, BigQuery client, or HTTP server.
+#
+# A single rolling pull does NOT keep the bucket complete on its own (hard deletes
+# never re-enter a modified window; rare linked changes don't bump a parent's
+# UpdatedDateUTC). So we run LAYERED jobs at different cadences — each lands the
+# same append-only GCS layout, tagged via the x-sync-type object metadata.
+#
+# ── Install ─────────────────────────────────────────────────────────────────────
+#   1. Copy this file and edit XERO_BIN / ENV_FILE / LOG_DIR below to taste.
+#   2. Load it for the deploy user:   crontab deploy/crontab.example
+#   3. Confirm:                       crontab -l
+#
+# Each line runs `xero` with all credentials sourced from the env file (Xero
+# custom-connection creds, GCS_BUCKET, GOOGLE_APPLICATION_CREDENTIALS, the
+# SYNC_* tuning knobs). Times are the server's local timezone unless CRON_TZ is
+# set. Stagger minutes so layers never collide on the Xero 60/min, 5000/day
+# per-tenant rate limits.
+#
+# If you run the container instead of the host binary, replace
+#   $XERO_BIN sync …
+# with
+#   docker run --rm --env-file $ENV_FILE -v /secrets:/secrets:ro \
+#       xero-service-v2:latest sync …
+
+# ── Knobs (edit these) ──────────────────────────────────────────────────────────
+SHELL=/bin/sh
+CRON_TZ=UTC
+XERO_BIN=/usr/local/bin/xero
+ENV_FILE=/etc/xero/xero.env
+LOG_DIR=/var/log/xero
+
+# Helper pattern used on every line below:
+#   set -a; . $ENV_FILE; set +a;   → export the env file
+#   $XERO_BIN sync …               → run the job
+#   >> $LOG_DIR/<layer>.log 2>&1   → capture stdout+stderr per layer
+
+# ── incremental — every 4h ──────────────────────────────────────────────────────
+# modified ≥ now − 3d across the full accounting set (reports excluded).
+# Catches churn, closes, voids. Cheapest, most frequent.
+0 */4 * * *   set -a; . $ENV_FILE; set +a; $XERO_BIN sync --window-days 3 >> $LOG_DIR/incremental.log 2>&1
+
+# ── open-sweep — daily ──────────────────────────────────────────────────────────
+# AUTHORISED (open) AR/AP items with NO modified window — catches open items that
+# haven't changed in > 3 days and so fell out of the incremental window.
+20 1 * * *    set -a; . $ENV_FILE; set +a; $XERO_BIN sync --where 'Status=="AUTHORISED"' --no-window >> $LOG_DIR/open-sweep.log 2>&1
+
+# ── master — daily ──────────────────────────────────────────────────────────────
+# Full (unfiltered) refresh of the small master tables (accounts, contacts,
+# items, tax_rates, tracking_categories, currencies, organisations, users,
+# branding_themes). Cheap because the tables are tiny.
+40 1 * * *    set -a; . $ENV_FILE; set +a; $XERO_BIN sync --full >> $LOG_DIR/master.log 2>&1
+
+# ── reports — daily ─────────────────────────────────────────────────────────────
+# Point-in-time report snapshots (P&L, balance sheet, trial balance, …) with
+# their own param model, as-of the run date. Not a modified window.
+0 2 * * *     set -a; . $ENV_FILE; set +a; $XERO_BIN sync --reports --as-of "$(date -u +\%Y-\%m-\%d)" >> $LOG_DIR/reports.log 2>&1
+
+# ── rolling-full (tight) — weekly (Mon 03:00) ───────────────────────────────────
+# business-date last 30d over transactional entities. Catches recent hard-deletes
+# and drift the modified window misses. --full-with-window uses
+# SYNC_ROLLING_FULL_TIGHT_DAYS (default 30).
+0 3 * * 1     set -a; . $ENV_FILE; set +a; $XERO_BIN sync --full-with-window >> $LOG_DIR/rolling-full-tight.log 2>&1
+
+# ── rolling-full (wide) — monthly (1st of month 04:00) ──────────────────────────
+# business-date last 90d over transactional entities. Catches drift in days
+# 31–90. Window size comes from SYNC_ROLLING_FULL_WIDE_DAYS (default 90); the
+# explicit business-from/to below makes the window auditable in the object
+# metadata regardless of the env default.
+0 4 1 * *     set -a; . $ENV_FILE; set +a; $XERO_BIN sync --business-from "$(date -u -d '90 days ago' +\%Y-\%m-\%d)" --business-to "$(date -u +\%Y-\%m-\%d)" >> $LOG_DIR/rolling-full-wide.log 2>&1
+
+# ── backfill — ONCE (commented; run by hand, not on a schedule) ─────────────────
+# Full history in business-date chunks (oldest→newest), one chunk per month.
+# Run this a single time when onboarding a bucket, then leave it disabled. It is
+# expensive (100+ pages/entity) and would burn the daily rate-limit budget if
+# scheduled. Replace <today> with the run date.
+#
+# Pin it to one tenant at a time to keep within per-tenant limits:
+#   $XERO_BIN sync --tenant <uuid> --backfill 2020-01-01:<today> --chunk-months 1
+#
+# Or run it inline (not via cron):
+#   set -a; . $ENV_FILE; set +a; \
+#     $XERO_BIN sync --backfill 2020-01-01:"$(date -u +%Y-%m-%d)" --chunk-months 1 \
+#     >> $LOG_DIR/backfill.log 2>&1

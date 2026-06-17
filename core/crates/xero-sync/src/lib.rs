@@ -1,489 +1,369 @@
-//! `xero-sync` — orchestrates fetch → bronze → checkpoint → BigQuery → run-history.
+//! `xero-sync` — stateless raw → GCS uploader orchestration.
+//!
+//! This crate fans out per-(tenant, entity) Xero fetches and writes the
+//! verbatim API response bytes to a [`RawSink`] (GCS in production, local disk
+//! for dry-runs). There is **no** Postgres, BigQuery, Redis, checkpoint, or
+//! watermark state: every run computes its own window from [`SyncMode`] and a
+//! `run_date`, and re-runs simply append new objects (downstream dedups).
+//!
+//! Auth is custom-connection (`client_credentials`) only, via
+//! [`MultiTenantCustomConnectionClient`]. Custom-connection tokens are
+//! tenant-scoped, so the API client is built with the `xero-tenant-id` header
+//! DISABLED (`new_with_tenant_header(tenant, false)`).
 //!
 //! Public surface:
+//!   - [`SyncJob`] — the orchestrator (`new` + `run`).
+//!   - [`SyncMode`] — the per-run window/filter selector.
 //!
-//!  - [`SyncExecutor`] — entry point used by `xero-http` handlers and the
-//!    backfill worker. Holds the [`StateStore`] handle and a `send_tenant_header`
-//!    flag (off in PKCE mode, on in custom-connection mode).
-//!  - [`RunOptions`] — per-call knobs: `modified_*` / `business_date_*` windows,
-//!    `trigger_id`, `job_type`, `triggered_by`, `advance_watermark`.
-//!  - [`compute_next_watermark`] — pure function that codifies the checkpoint
-//!    monotonicity + gap-safety rules. Unit-tested.
-//!
-//! Sync pipeline (in `run_with_options`):
-//!
-//!  1. `run_history::start_run` — audit log row
-//!  2. Load current checkpoint (modified-mode only)
-//!  3. `xero-client::fetch_*` — paginated GETs with retry + rate-limit
-//!  4. `local_bronze::upsert_records` — PK-deduped pg writes (best-effort BQ stream)
-//!  5. `checkpoint::upsert` with `compute_next_watermark` rules
-//!  6. `run_history::finish_run` — final status + counts
+//! Pipeline (`run` → `run_entity`):
+//!   1. mint a token for the tenant (custom-connection)
+//!   2. derive fetch params from the [`SyncMode`]
+//!   3. `xero-client::fetch_raw_pages` (or `fetch_report_raw` for reports)
+//!   4. for each page: build object key + metadata, `sink.put_raw`
+//!   5. record an [`EntityOutcome`]; per-entity failures are isolated.
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use serde_json::Value;
-use tracing::info;
+mod mode;
+mod report;
+
+pub use mode::{
+    business_date_where, compact_ts, fetch_params, incremental_modified_after, rolling_window,
+    FetchParams, SyncMode,
+};
+pub use report::{report_params, ReportSpec};
+
+use std::sync::Arc;
+
+use chrono::{NaiveDate, Utc};
+use futures::stream::{FuturesUnordered, StreamExt};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
-use xero_common::{EntityType, Result, TenantId};
-use xero_state::{
-    checkpoint::{self, Checkpoint, CheckpointKey},
-    local_bronze,
-    run_history::{self, RunStatus},
-    StateStore,
+
+use xero_auth::MultiTenantCustomConnectionClient;
+use xero_client::{ExtraQuery, XeroApiClient};
+use xero_common::{EntityType, GcsConfig, SyncConfig};
+use xero_gcs::{
+    metadata, object_key, report_metadata, report_object_key, EntityOutcome, MetaArgs, RawSink,
+    ReportMetaArgs, RunManifest,
 };
 
-#[derive(Debug, Clone)]
-pub struct RunOptions {
-    pub modified_after: Option<DateTime<Utc>>,
-    pub modified_before: Option<DateTime<Utc>>,
-    pub business_date_after: Option<NaiveDate>,
-    pub business_date_before: Option<NaiveDate>,
-    pub trigger_id: Option<Uuid>,
-    pub job_type: String,
-    pub triggered_by: String,
-    /// Opt-in: when `true` AND this is a business-date run, advance
-    /// `last_modified_watermark` to `business_date_before` (midnight UTC).
-    /// The caller asserts that records outside the business-date window with
-    /// `UpdatedDateUTC` in (`existing_wm`, `business_date_before`] are either
-    /// irrelevant or covered by their own backfill plan. Default `false`.
-    /// Gap-safety: ignored if `business_date_before` is `None`. Monotonic — the
-    /// watermark cannot move backwards.
-    pub advance_watermark: bool,
+/// The maximum number of concurrent in-flight (tenant, entity) tasks. Xero
+/// caps per-tenant concurrency at 6, so this is the safe hard ceiling.
+const MAX_CONCURRENCY: usize = 6;
+
+/// Stateless orchestrator: fetch raw Xero pages and upload them to a sink.
+pub struct SyncJob {
+    auth: Arc<MultiTenantCustomConnectionClient>,
+    sink: Arc<dyn RawSink>,
+    gcs: GcsConfig,
+    cfg: SyncConfig,
 }
 
-impl Default for RunOptions {
-    fn default() -> Self {
+impl SyncJob {
+    /// Build a job from its collaborators. No I/O — wiring only.
+    pub fn new(
+        auth: Arc<MultiTenantCustomConnectionClient>,
+        sink: Arc<dyn RawSink>,
+        gcs: GcsConfig,
+        cfg: SyncConfig,
+    ) -> Self {
         Self {
-            modified_after: None,
-            modified_before: None,
-            business_date_after: None,
-            business_date_before: None,
-            trigger_id: None,
-            job_type: "scheduled".to_owned(),
-            triggered_by: "system".to_owned(),
-            advance_watermark: false,
-        }
-    }
-}
-
-pub struct SyncExecutor {
-    state: StateStore,
-    send_tenant_header: bool,
-}
-
-impl SyncExecutor {
-    pub fn new(state: StateStore) -> Self {
-        Self {
-            state,
-            send_tenant_header: true,
+            auth,
+            sink,
+            gcs,
+            cfg,
         }
     }
 
-    pub fn new_with_tenant_header(state: StateStore, send_tenant_header: bool) -> Self {
-        Self {
-            state,
-            send_tenant_header,
-        }
-    }
-
-    /// Run a sync for one entity. Returns the number of records fetched.
+    /// Run a sync across the cartesian product of `tenants` × `entities` in the
+    /// given [`SyncMode`], bounded by `max_concurrent` (clamped to 1..=6).
     ///
-    /// Concrete fetch logic will call `xero-client` once tokens are wired.
-    /// For now this is the plumbing scaffold.
-    pub async fn sync_one(
-        &self,
-        tenant: TenantId,
-        entity: &EntityType,
-        records: Vec<Value>,
-        options: &RunOptions,
-    ) -> Result<Uuid> {
-        let run_id = run_history::start_run(
-            &self.state.pg,
-            tenant.as_str(),
-            entity.as_str(),
-            &options.job_type,
-            &options.triggered_by,
-            options.trigger_id,
-        )
-        .await?;
-
-        self.sync_one_with_run_id(run_id, tenant, entity, records, options)
-            .await
-    }
-
-    async fn sync_one_with_run_id(
-        &self,
-        run_id: Uuid,
-        tenant: TenantId,
-        entity: &EntityType,
-        records: Vec<Value>,
-        options: &RunOptions,
-    ) -> Result<Uuid> {
-        info!(
-            run_id = %run_id,
-            tenant = %tenant,
-            entity = %entity,
-            records = records.len(),
-            "sync_one started"
-        );
-
-        let count = records.len() as i64;
-
-        // Bronze upsert: idempotent by (tenant, entity, record_id) PK. Also
-        // streams accepted rows to the BigQuery sink (best-effort, never fails
-        // the run — replay endpoint catches stragglers).
-        let bronze_stats = match local_bronze::upsert_records(
-            &self.state.pg,
-            tenant.as_str(),
-            entity,
-            run_id,
-            &records,
-        )
-        .await
-        {
-            Ok(stats) => stats,
-            Err(e) => {
-                let _ = run_history::finish_run(
-                    &self.state.pg,
-                    run_id,
-                    RunStatus::Failed,
-                    count,
-                    0,
-                    count,
-                    Some(&e.to_string()),
-                )
-                .await;
-                return Err(e);
-            }
-        };
-        let loaded_count = count - bronze_stats.skipped_invalid;
-
-        // Always touch the checkpoint row so `last_sync_at` reflects any
-        // successful run (incremental or business-date backfill). The
-        // `last_modified_watermark` only advances when it is safe to do so —
-        // see `compute_next_watermark` for the rules.
-        let existing_cp =
-            match checkpoint::load(&self.state.pg, tenant.as_str(), entity.as_str()).await {
-                Ok(cp) => cp,
-                Err(e) => {
-                    let _ = run_history::finish_run(
-                        &self.state.pg,
-                        run_id,
-                        RunStatus::Failed,
-                        count,
-                        loaded_count,
-                        bronze_stats.skipped_invalid,
-                        Some(&e.to_string()),
-                    )
-                    .await;
-                    return Err(e);
-                }
-            };
-        let existing_wm = existing_cp.and_then(|c| c.last_modified_watermark);
-        let next_wm = compute_next_watermark(existing_wm, options);
-
-        let cp = Checkpoint {
-            key: CheckpointKey::new(tenant.clone(), entity),
-            last_modified_watermark: next_wm,
-            last_sync_at: Some(Utc::now()),
-            records_seen: count,
-        };
-        if let Err(e) = checkpoint::upsert(&self.state.pg, &cp).await {
-            let _ = run_history::finish_run(
-                &self.state.pg,
-                run_id,
-                RunStatus::Failed,
-                count,
-                loaded_count,
-                bronze_stats.skipped_invalid,
-                Some(&e.to_string()),
-            )
-            .await;
-            return Err(e);
-        }
-
-        run_history::finish_run(
-            &self.state.pg,
-            run_id,
-            RunStatus::Succeeded,
-            count,
-            loaded_count,
-            bronze_stats.skipped_invalid,
-            None,
-        )
-        .await?;
-
-        info!(run_id = %run_id, "sync_one finished — {count} records");
-        Ok(run_id)
-    }
-
+    /// Each (tenant, entity) pair is isolated: a failure becomes an
+    /// [`EntityOutcome`] with `error` set and `termination = "error"`, never
+    /// aborting the rest of the run. Returns the assembled [`RunManifest`];
+    /// the caller persists it via `xero_gcs::write_manifest`.
     pub async fn run(
         &self,
-        access_token: &str,
-        tenant: TenantId,
-        entity: EntityType,
-    ) -> Result<Uuid> {
-        self.run_with_options(access_token, tenant, entity, RunOptions::default())
-            .await
-    }
-
-    pub async fn run_with_options(
-        &self,
-        access_token: &str,
-        tenant: TenantId,
-        entity: EntityType,
-        options: RunOptions,
-    ) -> Result<Uuid> {
-        use xero_client::{DateWindow, XeroApiClient};
-        let run_id = run_history::start_run(
-            &self.state.pg,
-            tenant.as_str(),
-            entity.as_str(),
-            &options.job_type,
-            &options.triggered_by,
-            options.trigger_id,
-        )
-        .await?;
-
-        let cp = match checkpoint::load(&self.state.pg, tenant.as_str(), entity.as_str()).await {
-            Ok(cp) => cp,
-            Err(e) => {
-                let _ = run_history::finish_run(
-                    &self.state.pg,
-                    run_id,
-                    RunStatus::Failed,
-                    0,
-                    0,
-                    0,
-                    Some(&e.to_string()),
-                )
-                .await;
-                return Err(e);
-            }
-        };
-        let modified_after = options
-            .modified_after
-            .or_else(|| cp.and_then(|c| c.last_modified_watermark));
-
-        let api = XeroApiClient::new_with_tenant_header(
-            tenant.as_str().to_owned(),
-            self.send_tenant_header,
-        );
-        let records = match (options.business_date_after, options.business_date_before) {
-            (Some(start), Some(end)) => match DateWindow::new(start, end) {
-                Ok(window) => {
-                    api.fetch_by_business_date(access_token, &entity, window, 100)
-                        .await
-                }
-                Err(e) => Err(e),
-            },
-            (None, None) => {
-                api.fetch(
-                    access_token,
-                    &entity,
-                    modified_after,
-                    options.modified_before,
-                    100,
-                )
-                .await
-            }
-            _ => Err(xero_common::Error::Config(
-                "business_date_after and business_date_before must be provided together".to_owned(),
-            )),
-        };
-
-        let records = match records {
-            Ok(records) => records,
-            Err(e) => {
-                let _ = run_history::finish_run(
-                    &self.state.pg,
-                    run_id,
-                    RunStatus::Failed,
-                    0,
-                    0,
-                    0,
-                    Some(&e.to_string()),
-                )
-                .await;
-                return Err(e);
-            }
-        };
-
-        self.sync_one_with_run_id(run_id, tenant, &entity, records, &options)
-            .await
-    }
-
-    /// Run several entities for one tenant concurrently, bounded by
-    /// `max_concurrent`. Each entity gets its own `Result<Uuid>` so a
-    /// failure on one does not abort the others.
-    ///
-    /// The Xero rate limiter (see `xero-client::rate_limit`) already caps
-    /// in-flight requests at `MAX_CONCURRENT_PER_TENANT = 6`, so the safe
-    /// ceiling for `max_concurrent` is 6 for a single tenant. Callers that
-    /// orchestrate multiple tenants should multiply by their tenant fan-out.
-    ///
-    /// Returns one result per requested (tenant, entity) pair, in the same
-    /// order as `entities`. Use `.into_iter().enumerate()` to map results
-    /// back to entities.
-    pub async fn run_many(
-        &self,
-        access_token: &str,
-        tenant: TenantId,
-        entities: Vec<EntityType>,
-        options: RunOptions,
+        run_id: Uuid,
+        run_date: NaiveDate,
+        tenants: &[String],
+        entities: &[EntityType],
+        mode: SyncMode,
         max_concurrent: usize,
-    ) -> Vec<Result<Uuid>> {
-        use futures::stream::{FuturesOrdered, StreamExt};
+    ) -> RunManifest {
+        let started_at = Utc::now();
+        // One compact timestamp for the whole run → all objects share a ts.
+        let ts = compact_ts(started_at);
+        let concurrency = max_concurrent.clamp(1, MAX_CONCURRENCY);
 
-        let concurrency = max_concurrent.clamp(1, 6);
-        let mut in_flight: FuturesOrdered<_> = entities
-            .into_iter()
-            .map(|entity| {
-                let opts = options.clone();
-                let t = tenant.clone();
-                async move {
-                    self.run_with_options(access_token, t, entity, opts).await
-                }
-            })
+        info!(
+            run_id = %run_id,
+            run_date = %run_date,
+            mode = mode.label(),
+            tenants = tenants.len(),
+            entities = entities.len(),
+            concurrency,
+            "sync run started"
+        );
+
+        // Build every (tenant, entity) unit of work up front.
+        let units: Vec<(&str, &EntityType)> = tenants
+            .iter()
+            .flat_map(|t| entities.iter().map(move |e| (t.as_str(), e)))
             .collect();
 
-        // FuturesOrdered processes everything but yields in input order. To
-        // bound concurrency we drain in chunks of `concurrency` — a simple
-        // pattern that doesn't pull in tokio_util::StreamExt::buffered.
-        let mut results = Vec::with_capacity(in_flight.len());
-        let mut buffered = Vec::with_capacity(concurrency);
-        while let Some(fut) = in_flight.next().await {
-            buffered.push(fut);
-            if buffered.len() >= concurrency {
-                results.extend(buffered.drain(..));
+        let mut outcomes: Vec<EntityOutcome> = Vec::with_capacity(units.len());
+        let mut in_flight = FuturesUnordered::new();
+        let mut next = 0usize;
+
+        // Prime the pump up to `concurrency`, then refill on each completion.
+        while next < units.len() && in_flight.len() < concurrency {
+            let (tenant, entity) = units[next];
+            in_flight.push(self.run_unit(run_id, run_date, &ts, tenant, entity, &mode));
+            next += 1;
+        }
+        while let Some(outcome) = in_flight.next().await {
+            outcomes.push(outcome);
+            if next < units.len() {
+                let (tenant, entity) = units[next];
+                in_flight.push(self.run_unit(run_id, run_date, &ts, tenant, entity, &mode));
+                next += 1;
             }
         }
-        results.extend(buffered.drain(..));
-        results
+
+        let finished_at = Utc::now();
+        info!(
+            run_id = %run_id,
+            entities = outcomes.len(),
+            errors = outcomes.iter().filter(|o| o.error.is_some()).count(),
+            "sync run finished"
+        );
+
+        RunManifest {
+            run_id: run_id.to_string(),
+            started_at: started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            mode: mode.label().to_string(),
+            window_days: mode.window_days(),
+            entities: outcomes,
+        }
     }
-}
 
-/// Decide the new `last_modified_watermark` value for a run.
-///
-/// Rules, applied in order:
-///   1. Modified-only run (no business-date window): candidate is
-///      `options.modified_before.or(now())`. Monotonic — never moves backwards.
-///   2. Business-date run with `advance_watermark = true` and a non-empty
-///      `business_date_before`: candidate is `business_date_before` at 00:00 UTC.
-///      Caller is responsible for asserting that no relevant out-of-window
-///      records exist between `existing_wm` and `business_date_before`.
-///      Monotonic — never moves backwards.
-///   3. Business-date run with `advance_watermark = false` (default): the
-///      watermark stays at `existing_wm`. This is the gap-safe default.
-fn compute_next_watermark(
-    existing_wm: Option<DateTime<Utc>>,
-    options: &RunOptions,
-) -> Option<DateTime<Utc>> {
-    let is_business_date = options.business_date_after.is_some()
-        || options.business_date_before.is_some();
+    /// Run a single (tenant, entity) unit, converting any error into an
+    /// [`EntityOutcome`] so the surrounding fan-out never short-circuits.
+    async fn run_unit(
+        &self,
+        run_id: Uuid,
+        run_date: NaiveDate,
+        ts: &str,
+        tenant: &str,
+        entity: &EntityType,
+        mode: &SyncMode,
+    ) -> EntityOutcome {
+        match self
+            .run_entity(run_id, run_date, ts, tenant, entity, mode)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!(
+                    run_id = %run_id,
+                    tenant = %tenant,
+                    entity = %entity.as_str(),
+                    error = %e,
+                    "entity sync failed (isolated)"
+                );
+                EntityOutcome {
+                    tenant: tenant.to_string(),
+                    endpoint: entity.as_str().to_string(),
+                    pages: 0,
+                    records: 0,
+                    termination: "error".to_string(),
+                    error: Some(e),
+                }
+            }
+        }
+    }
 
-    let candidate = if !is_business_date {
-        options.modified_before.or_else(|| Some(Utc::now()))
-    } else if options.advance_watermark {
-        options
-            .business_date_before
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map(|ndt| Utc.from_utc_datetime(&ndt))
-    } else {
-        return existing_wm;
-    };
+    /// Fetch + upload one (tenant, entity). Reports take the single-shot report
+    /// path; everything else takes the paginated raw path.
+    async fn run_entity(
+        &self,
+        run_id: Uuid,
+        run_date: NaiveDate,
+        ts: &str,
+        tenant: &str,
+        entity: &EntityType,
+        mode: &SyncMode,
+    ) -> std::result::Result<EntityOutcome, String> {
+        // Custom-connection token → API client WITHOUT the tenant header.
+        let token = self
+            .auth
+            .fetch_token_for_tenant(tenant)
+            .await
+            .map_err(|e| e.to_string())?;
+        let api = XeroApiClient::new_with_tenant_header(tenant.to_string(), false);
+        let synced_at = Utc::now().to_rfc3339();
+        let run_id_str = run_id.to_string();
+        let run_id_short = &run_id_str[..run_id_str.len().min(6)];
 
-    match (existing_wm, candidate) {
-        (Some(prev), Some(c)) if prev > c => Some(prev),
-        (_, next) => next,
+        if entity.is_report() {
+            return self
+                .run_report(
+                    &api,
+                    &token.access_token,
+                    run_date,
+                    ts,
+                    run_id_short,
+                    &run_id_str,
+                    tenant,
+                    entity,
+                    mode,
+                    &synced_at,
+                )
+                .await;
+        }
+
+        let params = fetch_params(mode, Utc::now(), run_date, self.cfg.window_days);
+        let (pages, outcome) = api
+            .fetch_raw_pages(
+                &token.access_token,
+                entity,
+                params.modified_after,
+                &params.extras,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut total_records: i64 = 0;
+        for page in &pages {
+            total_records += page.record_count as i64;
+            let key = object_key(
+                &self.gcs.prefix,
+                tenant,
+                entity.as_str(),
+                run_date,
+                ts,
+                run_id_short,
+                page.page,
+            );
+            let meta = metadata(&MetaArgs {
+                tenant_id: tenant,
+                org_name: "",
+                endpoint: entity.as_str(),
+                sync_type: mode.sync_type(),
+                modified_after: params.modified_after_str.as_deref(),
+                business_from: params.business_from.as_deref(),
+                business_to: params.business_to.as_deref(),
+                where_filter: params.where_filter.as_deref(),
+                page: page.page,
+                record_count: page.record_count as i64,
+                http_status: page.http_status,
+                run_id: &run_id_str,
+                synced_at: &synced_at,
+            });
+            self.sink
+                .put_raw(&key, &page.body, &meta)
+                .await
+                .map_err(|e| e.to_string())?;
+            debug!(run_id = %run_id, tenant = %tenant, entity = %entity.as_str(), page = page.page, "page uploaded");
+        }
+
+        Ok(EntityOutcome {
+            tenant: tenant.to_string(),
+            endpoint: entity.as_str().to_string(),
+            pages: outcome.pages_fetched,
+            records: total_records,
+            termination: outcome.termination.as_str().to_string(),
+            error: None,
+        })
+    }
+
+    /// Single-shot report fetch + upload.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_report(
+        &self,
+        api: &XeroApiClient,
+        access_token: &str,
+        run_date: NaiveDate,
+        ts: &str,
+        run_id_short: &str,
+        run_id: &str,
+        tenant: &str,
+        entity: &EntityType,
+        mode: &SyncMode,
+        synced_at: &str,
+    ) -> std::result::Result<EntityOutcome, String> {
+        // Reports only make sense in Reports mode; default to today otherwise.
+        let as_of = match mode {
+            SyncMode::Reports { as_of } => *as_of,
+            _ => run_date,
+        };
+        let spec = report_params(entity, as_of);
+        let extras = ExtraQuery {
+            extra: spec.extra.clone(),
+            ..ExtraQuery::default()
+        };
+        let page = api
+            .fetch_report_raw(access_token, entity, &extras)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let key = report_object_key(
+            &self.gcs.prefix,
+            tenant,
+            entity.as_str(),
+            run_date,
+            ts,
+            run_id_short,
+            &spec.period_key,
+        );
+        let signature = spec.params_signature();
+        let meta = report_metadata(&ReportMetaArgs {
+            tenant_id: tenant,
+            org_name: "",
+            endpoint: entity.as_str(),
+            report: entity.as_str(),
+            report_date: spec.report_date.as_deref(),
+            report_from: spec.report_from.as_deref(),
+            report_to: spec.report_to.as_deref(),
+            report_params: &signature,
+            http_status: page.http_status,
+            record_count: page.record_count as i64,
+            run_id,
+            synced_at,
+        });
+        self.sink
+            .put_raw(&key, &page.body, &meta)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(EntityOutcome {
+            tenant: tenant.to_string(),
+            endpoint: entity.as_str().to_string(),
+            pages: 1,
+            records: page.record_count as i64,
+            termination: "report-snapshot".to_string(),
+            error: None,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn opt_business_date(after: NaiveDate, before: NaiveDate, advance: bool) -> RunOptions {
-        RunOptions {
-            business_date_after: Some(after),
-            business_date_before: Some(before),
-            advance_watermark: advance,
-            ..RunOptions::default()
-        }
-    }
-
-    fn opt_modified(before: Option<DateTime<Utc>>) -> RunOptions {
-        RunOptions {
-            modified_before: before,
-            ..RunOptions::default()
-        }
+    #[test]
+    fn run_id_short_is_first_six_chars() {
+        let run_id = Uuid::parse_str("5f3c9a2e-0000-0000-0000-000000000000").unwrap();
+        let s = run_id.to_string();
+        let short = &s[..s.len().min(6)];
+        assert_eq!(short, "5f3c9a");
     }
 
     #[test]
-    fn modified_only_advances_to_modified_before() {
-        let prev = Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap());
-        let target = Utc.with_ymd_and_hms(2026, 5, 11, 0, 0, 0).unwrap();
-        let next = compute_next_watermark(prev, &opt_modified(Some(target)));
-        assert_eq!(next, Some(target));
-    }
-
-    #[test]
-    fn modified_only_falls_back_to_now_when_modified_before_missing() {
-        let prev = Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap());
-        let next = compute_next_watermark(prev, &opt_modified(None));
-        assert!(next.unwrap() > prev.unwrap());
-    }
-
-    #[test]
-    fn watermark_is_monotonic_modified_path() {
-        let prev = Some(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap());
-        let target = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
-        let next = compute_next_watermark(prev, &opt_modified(Some(target)));
-        assert_eq!(next, prev, "later prev wm must not regress to earlier candidate");
-    }
-
-    #[test]
-    fn business_date_without_opt_in_keeps_existing_wm() {
-        let prev = Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap());
-        let opts = opt_business_date(
-            NaiveDate::from_ymd_opt(2026, 5, 4).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 5, 11).unwrap(),
-            false,
-        );
-        assert_eq!(compute_next_watermark(prev, &opts), prev);
-    }
-
-    #[test]
-    fn business_date_with_opt_in_advances_to_business_date_before() {
-        let prev = Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap());
-        let opts = opt_business_date(
-            NaiveDate::from_ymd_opt(2026, 5, 4).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 5, 11).unwrap(),
-            true,
-        );
-        let next = compute_next_watermark(prev, &opts);
-        assert_eq!(
-            next,
-            Some(Utc.with_ymd_and_hms(2026, 5, 11, 0, 0, 0).unwrap()),
-        );
-    }
-
-    #[test]
-    fn business_date_with_opt_in_is_monotonic() {
-        let prev = Some(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap());
-        let opts = opt_business_date(
-            NaiveDate::from_ymd_opt(2026, 5, 4).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 5, 11).unwrap(),
-            true,
-        );
-        assert_eq!(compute_next_watermark(prev, &opts), prev);
-    }
-
-    #[test]
-    fn first_ever_run_modified_path_seeds_watermark() {
-        let target = Utc.with_ymd_and_hms(2026, 5, 11, 0, 0, 0).unwrap();
-        let next = compute_next_watermark(None, &opt_modified(Some(target)));
-        assert_eq!(next, Some(target));
+    fn max_concurrency_clamp_bounds() {
+        assert_eq!(0usize.clamp(1, MAX_CONCURRENCY), 1);
+        assert_eq!(100usize.clamp(1, MAX_CONCURRENCY), 6);
+        assert_eq!(4usize.clamp(1, MAX_CONCURRENCY), 4);
     }
 }
-

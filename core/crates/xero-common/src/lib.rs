@@ -4,6 +4,6 @@ pub mod config;
 pub mod error;
 pub mod types;
 
-pub use config::{AppConfig, XeroCustomConnectionConfig};
+pub use config::{AppConfig, GcsConfig, SyncConfig, XeroCustomConnectionConfig};
 pub use error::{Error, Result};
 pub use types::{EntityType, TenantId};

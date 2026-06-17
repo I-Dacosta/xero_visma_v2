@@ -8,11 +8,9 @@ authors.workspace = true
 [dependencies]
 xero-common = { workspace = true }
 xero-auth   = { workspace = true }
-xero-state  = { workspace = true }
 xero-client = { workspace = true }
+xero-gcs    = { workspace = true }
 tokio       = { workspace = true }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
 chrono      = { workspace = true }
 tracing     = { workspace = true }
 uuid        = { workspace = true }

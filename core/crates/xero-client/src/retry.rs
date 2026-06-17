@@ -72,7 +72,10 @@ mod tests {
             Duration::from_secs(FALLBACK_RETRY_AFTER_SECS)
         );
         let mut h = HeaderMap::new();
-        h.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("nope"));
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("nope"),
+        );
         assert_eq!(
             retry_after_or_default(&h),
             Duration::from_secs(FALLBACK_RETRY_AFTER_SECS)

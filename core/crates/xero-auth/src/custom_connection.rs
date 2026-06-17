@@ -19,6 +19,7 @@ use crate::{TokenData, TOKEN_URL};
 struct TokenResponse {
     access_token: String,
     expires_in: i64,
+    scope: Option<String>,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -79,12 +80,20 @@ impl CustomConnectionClient {
 
     async fn fetch_token_uncached(&self) -> xero_common::Result<TokenData> {
         let creds = STANDARD.encode(format!("{}:{}", self.client_id, self.client_secret));
+        let configured_scope = std::env::var("XERO_SCOPES")
+            .ok()
+            .map(|scope| scope.trim().to_owned())
+            .filter(|scope| !scope.is_empty());
+        let mut form = vec![("grant_type", "client_credentials")];
+        if let Some(scope) = configured_scope.as_deref() {
+            form.push(("scope", scope));
+        }
 
         let resp = self
             .http
             .post(TOKEN_URL)
             .header("Authorization", format!("Basic {creds}"))
-            .form(&[("grant_type", "client_credentials")])
+            .form(&form)
             .send()
             .await
             .map_err(|e| xero_common::Error::Auth(e.to_string()))?;
@@ -107,7 +116,12 @@ impl CustomConnectionClient {
             access_token: tr.access_token,
             refresh_token: String::new(), // not issued for client_credentials
             expires_at: Utc::now() + chrono::Duration::seconds(tr.expires_in),
-            scopes: vec![],
+            scopes: tr
+                .scope
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect(),
             tenant_id: self.tenant_id.clone(),
         })
     }
@@ -139,6 +153,10 @@ impl MultiTenantCustomConnectionClient {
 
     pub fn tenant_ids(&self) -> Vec<&str> {
         self.clients.keys().map(String::as_str).collect()
+    }
+
+    pub fn has_tenant(&self, tenant_id: &str) -> bool {
+        self.clients.contains_key(tenant_id)
     }
 
     pub async fn fetch_token_for_tenant(&self, tenant_id: &str) -> xero_common::Result<TokenData> {

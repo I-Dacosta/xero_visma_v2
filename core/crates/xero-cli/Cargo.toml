@@ -12,17 +12,15 @@ path = "src/main.rs"
 [dependencies]
 xero-common = { workspace = true }
 xero-auth   = { workspace = true }
-xero-state  = { workspace = true }
 xero-sync   = { workspace = true }
-xero-http   = { workspace = true }
-xero-client = { workspace = true }
+xero-gcs    = { workspace = true }
 tokio       = { workspace = true }
 clap        = { workspace = true }
 anyhow      = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
-serde_json     = { workspace = true }
-sqlx           = { workspace = true }
-chrono         = { workspace = true }
-deadpool-redis = { workspace = true }
-dashmap        = "6"
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
