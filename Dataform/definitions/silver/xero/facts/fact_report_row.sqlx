@@ -1,0 +1,232 @@
+config {
+  type: "table",
+  schema: "dw_1_silver_xero",
+  name: "fact_report_row",
+  description: "Silver: Xero Accounting report snapshots (WS3) flattened to long form. One row per report cell: report × run-date × params × section × row × cell. Each bronze snapshot is immutable per run-day (record_id = <report>|<param-sig>|<run_date>), so this table is an append-only history of point-in-time reports.",
+  tags: ["silver", "xero", "fact", "report"]
+}
+
+-- =============================================================================
+-- fact_report_row.sqlx
+-- Silver fact: Xero report snapshots in long form (WS3)
+-- Sources (UNIONed — one bronze table per report kind):
+--   dw_1_bronze_xero.xero_report_profit_and_loss
+--   dw_1_bronze_xero.xero_report_balance_sheet
+--   dw_1_bronze_xero.xero_report_trial_balance
+--   dw_1_bronze_xero.xero_report_aged_receivables_by_contact
+--   dw_1_bronze_xero.xero_report_aged_payables_by_contact
+--   dw_1_bronze_xero.xero_report_bank_summary
+--   dw_1_bronze_xero.xero_report_budget_summary
+--   dw_1_bronze_xero.xero_report_executive_summary
+--
+-- Envelope payload (per bronze row):
+--   { "_params": {...}, "_run_date": "<rfc3339>", "Report": <raw ReportWithRows> }
+-- ReportWithRows.Reports[] each carries Rows[] (RowType Header/Section/Row/
+-- SummaryRow). Header rows define the column labels; Section rows nest the
+-- data Rows[]; each Row/SummaryRow carries Cells[] (a Value + optional
+-- Attributes[] that link the cell to an entity, e.g. {Id:"account", Value:<id>}).
+--
+-- Grain: one row per
+--   tenant_id + record_id(snapshot) + report_index + section_index
+--           + row_index + cell_index
+-- (record_id already encodes report|param-sig|run_date, so snapshots never
+--  overwrite one another — this is append-only point-in-time history.)
+-- =============================================================================
+
+-- --- 1. Union every report bronze table, tagging each with its report kind ----
+WITH unioned AS (
+  SELECT 'profit_and_loss'              AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_profit_and_loss")}
+  UNION ALL
+  SELECT 'balance_sheet'                AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_balance_sheet")}
+  UNION ALL
+  SELECT 'trial_balance'               AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_trial_balance")}
+  UNION ALL
+  SELECT 'aged_receivables_by_contact' AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_aged_receivables_by_contact")}
+  UNION ALL
+  SELECT 'aged_payables_by_contact'    AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_aged_payables_by_contact")}
+  UNION ALL
+  SELECT 'bank_summary'                AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_bank_summary")}
+  UNION ALL
+  SELECT 'budget_summary'              AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_budget_summary")}
+  UNION ALL
+  SELECT 'executive_summary'           AS report, * FROM ${ref("dw_1_bronze_xero", "xero_report_executive_summary")}
+),
+
+-- Keep the latest write per immutable snapshot (id includes report|params|run).
+raw AS (
+  SELECT
+    report,
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    last_seen_at AS synced_at
+  FROM unioned
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, record_id
+    ORDER BY last_seen_at DESC
+  ) = 1
+),
+
+-- --- 2. Snapshot-level keys: run-date + every report param we may emit --------
+snapshots AS (
+  SELECT
+    report,
+    tenant_id,
+    record_id,
+    payload,
+    first_seen_at,
+    synced_at,
+    JSON_VALUE(payload, '$._run_date')        AS run_date,
+    -- Params (union of all report shapes; unused keys are NULL per report)
+    JSON_VALUE(payload, '$._params.date')     AS param_date,
+    JSON_VALUE(payload, '$._params.fromDate') AS param_from_date,
+    JSON_VALUE(payload, '$._params.toDate')   AS param_to_date,
+    JSON_VALUE(payload, '$._params.periods')  AS param_periods,
+    JSON_VALUE(payload, '$._params.timeframe') AS param_timeframe,
+    JSON_VALUE(payload, '$._params.contactId') AS param_contact_id
+  FROM raw
+),
+
+-- --- 3. Reports[] inside the payload (usually one, occasionally several) ------
+reports AS (
+  SELECT
+    s.*,
+    rpt,
+    rpt_idx AS report_index
+  FROM snapshots AS s
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(s.payload, '$.Report.Reports')) AS rpt WITH OFFSET rpt_idx
+),
+
+-- --- 4. Top-level Rows[] of each report --------------------------------------
+outer_rows AS (
+  SELECT
+    r.*,
+    orow,
+    orow_idx                              AS section_index,
+    JSON_VALUE(orow, '$.RowType')         AS outer_row_type,
+    JSON_VALUE(orow, '$.Title')           AS section_title
+  FROM reports AS r
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(r.rpt, '$.Rows')) AS orow WITH OFFSET orow_idx
+),
+
+-- Column labels: cells of any Header row, keyed by position.
+header_cells AS (
+  SELECT
+    tenant_id,
+    record_id,
+    report_index,
+    hcell_idx                             AS cell_index,
+    JSON_VALUE(hcell, '$.Value')          AS column_header
+  FROM outer_rows
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(orow, '$.Cells')) AS hcell WITH OFFSET hcell_idx
+  WHERE outer_row_type = 'Header'
+),
+
+-- --- 5. Data rows: Section children, plus any top-level non-Header data row ---
+data_rows AS (
+  -- a) Rows nested inside a Section
+  SELECT
+    o.report, o.tenant_id, o.record_id, o.first_seen_at, o.synced_at, o.run_date,
+    o.param_date, o.param_from_date, o.param_to_date, o.param_periods,
+    o.param_timeframe, o.param_contact_id,
+    o.rpt, o.report_index, o.section_index, o.section_title,
+    irow                              AS data_row,
+    irow_idx                          AS row_index,
+    JSON_VALUE(irow, '$.RowType')     AS row_type
+  FROM outer_rows AS o
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(o.orow, '$.Rows')) AS irow WITH OFFSET irow_idx
+  WHERE o.outer_row_type = 'Section'
+
+  UNION ALL
+
+  -- b) Top-level rows that carry data directly (not Header, not Section wrapper)
+  SELECT
+    o.report, o.tenant_id, o.record_id, o.first_seen_at, o.synced_at, o.run_date,
+    o.param_date, o.param_from_date, o.param_to_date, o.param_periods,
+    o.param_timeframe, o.param_contact_id,
+    o.rpt, o.report_index, o.section_index, o.section_title,
+    o.orow                            AS data_row,
+    -1                                AS row_index,
+    o.outer_row_type                  AS row_type
+  FROM outer_rows AS o
+  WHERE o.outer_row_type NOT IN ('Header', 'Section')
+),
+
+-- --- 6. Explode each data row's Cells[] into long form -----------------------
+data_cells AS (
+  SELECT
+    d.*,
+    cell,
+    cell_idx                          AS cell_index,
+    JSON_VALUE(cell, '$.Value')       AS cell_value,
+    -- Row label = the first cell's value (Xero's leading description column)
+    JSON_VALUE(
+      JSON_QUERY_ARRAY(d.data_row, '$.Cells')[SAFE_OFFSET(0)], '$.Value'
+    )                                 AS row_label,
+    -- First linked attribute (e.g. {Id:"account"|"contact", Value:<uuid>})
+    JSON_VALUE(
+      JSON_QUERY_ARRAY(cell, '$.Attributes')[SAFE_OFFSET(0)], '$.Id'
+    )                                 AS attribute_id,
+    JSON_VALUE(
+      JSON_QUERY_ARRAY(cell, '$.Attributes')[SAFE_OFFSET(0)], '$.Value'
+    )                                 AS attribute_value,
+    TO_JSON_STRING(JSON_QUERY_ARRAY(cell, '$.Attributes')) AS attributes_json
+  FROM data_rows AS d
+  CROSS JOIN UNNEST(JSON_QUERY_ARRAY(d.data_row, '$.Cells')) AS cell WITH OFFSET cell_idx
+)
+
+SELECT
+  -- Snapshot identity ---------------------------------------------------------
+  dc.tenant_id,
+  dc.record_id                                              AS snapshot_id,
+  dc.report,
+  dc.synced_at,
+  dc.first_seen_at,
+  SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', dc.run_date) AS run_at,
+  DATE(SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', dc.run_date)) AS run_date,
+
+  -- Report parameters (point-in-time window the report was run for) -----------
+  dc.param_date,
+  SAFE.PARSE_DATE('%Y-%m-%d', dc.param_date)                AS param_date_d,
+  dc.param_from_date,
+  SAFE.PARSE_DATE('%Y-%m-%d', dc.param_from_date)           AS param_from_date_d,
+  dc.param_to_date,
+  SAFE.PARSE_DATE('%Y-%m-%d', dc.param_to_date)             AS param_to_date_d,
+  dc.param_periods,
+  dc.param_timeframe,
+  dc.param_contact_id,
+
+  -- Report header -------------------------------------------------------------
+  JSON_VALUE(dc.rpt, '$.ReportID')                          AS report_id,
+  JSON_VALUE(dc.rpt, '$.ReportName')                        AS report_name,
+  JSON_VALUE(dc.rpt, '$.ReportType')                        AS report_type,
+  JSON_VALUE(dc.rpt, '$.ReportDate')                        AS report_date,
+  JSON_VALUE(dc.rpt, '$.UpdatedDateUTC')                    AS report_updated_utc,
+  TO_JSON_STRING(JSON_QUERY_ARRAY(dc.rpt, '$.ReportTitles')) AS report_titles_json,
+
+  -- Position within the report (the long-form grain) --------------------------
+  dc.report_index,
+  dc.section_index,
+  dc.section_title,
+  dc.row_index,
+  dc.row_type,
+  dc.cell_index,
+
+  -- Cell content --------------------------------------------------------------
+  dc.row_label,
+  hc.column_header,
+  dc.cell_value,
+  SAFE_CAST(dc.cell_value AS FLOAT64)                       AS cell_value_numeric,
+  dc.attribute_id,
+  dc.attribute_value,
+  dc.attributes_json,
+
+  'xero'                                                    AS _source
+
+FROM data_cells AS dc
+LEFT JOIN header_cells AS hc
+  ON  hc.tenant_id    = dc.tenant_id
+  AND hc.record_id    = dc.record_id
+  AND hc.report_index = dc.report_index
+  AND hc.cell_index   = dc.cell_index

@@ -1,0 +1,17 @@
+config {
+  type: "declaration",
+  schema: "dw_1_bronze_xero",
+  name: "xero_report_profit_and_loss",
+  description: "Bronze: Profit & Loss report snapshots (Xero Reports/ProfitAndLoss). Immutable per (params, run-date). Envelope payload = { _params, _run_date, Report: <ReportWithRows> }; params: fromDate, toDate."
+}
+
+//schema
+[
+  { "name": "tenant_id",     "mode": "", "type": "STRING",    "description": "Xero tenant (organisation) id.", "fields": [] },
+  { "name": "record_id",     "mode": "", "type": "STRING",    "description": "Synthesized snapshot key: <report>|<param-sig>|<run_date>. Immutable per run-day.", "fields": [] },
+  { "name": "payload",       "mode": "", "type": "JSON",      "description": "{ _params: {fromDate,toDate}, _run_date: <rfc3339>, Report: <raw ReportWithRows> }.", "fields": [] },
+  { "name": "first_seen_at", "mode": "", "type": "TIMESTAMP", "description": "First time this snapshot row was written.", "fields": [] },
+  { "name": "last_seen_at",  "mode": "", "type": "TIMESTAMP", "description": "Most recent write for this snapshot row.", "fields": [] },
+  { "name": "last_run_id",   "mode": "", "type": "STRING",    "description": "Sync run id of the most recent write.", "fields": [] },
+  { "name": "synced_at",     "mode": "", "type": "TIMESTAMP", "description": "BigQuery load timestamp.", "fields": [] }
+]
