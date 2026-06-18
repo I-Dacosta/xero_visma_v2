@@ -73,16 +73,25 @@ LOG_DIR=/var/log/xero
 # metadata regardless of the env default.
 0 4 1 * *     set -a; . $ENV_FILE; set +a; $XERO_BIN sync --business-from "$(date -u -d '90 days ago' +\%Y-\%m-\%d)" --business-to "$(date -u +\%Y-\%m-\%d)" >> $LOG_DIR/rolling-full-wide.log 2>&1
 
-# ── backfill — ONCE (commented; run by hand, not on a schedule) ─────────────────
-# Full history in business-date chunks (oldest→newest), one chunk per month.
-# Run this a single time when onboarding a bucket, then leave it disabled. It is
-# expensive (100+ pages/entity) and would burn the daily rate-limit budget if
-# scheduled. Replace <today> with the run date.
+# ── backfill — ONCE, BY HAND (never scheduled) ──────────────────────────────────
+# Full history when onboarding a bucket. Expensive (100+ pages/entity) and bound
+# by Xero's 5000-calls/day/tenant cap, so run it DELIBERATELY — sliced by date
+# and/or tenant across days until complete — not on a timer.
 #
-# Pin it to one tenant at a time to keep within per-tenant limits:
-#   $XERO_BIN sync --tenant <uuid> --backfill 2020-01-01:<today> --chunk-months 1
+# Run it in TWO parts. `--backfill` applies a business-date `Date` window, which
+# only suits transactional entities; master/reference tables have no Date field,
+# so pull those with `--full` instead:
 #
-# Or run it inline (not via cron):
-#   set -a; . $ENV_FILE; set +a; \
-#     $XERO_BIN sync --backfill 2020-01-01:"$(date -u +%Y-%m-%d)" --chunk-months 1 \
+#   # 1) master / reference tables (no date filter), all tenants:
+#   set -a; . $ENV_FILE; set +a; $XERO_BIN sync --full >> $LOG_DIR/backfill.log 2>&1
+#
+#   # 2) transactional history in business-date chunks (date-filterable entities):
+#   set -a; . $ENV_FILE; set +a; $XERO_BIN sync \
+#     --entity invoices,bills,bank_transactions,credit_notes,payments,manual_journals,purchase_orders,quotes \
+#     --backfill 2018-01-01:"$(date -u +%Y-%m-%d)" --chunk-months 3 \
 #     >> $LOG_DIR/backfill.log 2>&1
+#
+# Stay under the per-tenant daily cap by slicing: add `--tenant <uuid>` and/or
+# run narrower `--backfill` ranges (e.g. one year at a time) on successive days.
+# Re-runs are safe — the landing zone is append-only and downstream BigQuery
+# dedups by (id, UpdatedDateUTC).
