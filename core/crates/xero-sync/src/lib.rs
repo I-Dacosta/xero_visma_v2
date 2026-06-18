@@ -56,6 +56,9 @@ pub struct SyncJob {
     sink: Arc<dyn RawSink>,
     gcs: GcsConfig,
     cfg: SyncConfig,
+    /// `tenant_id` → org display name, used for the `x-org-name` object metadata
+    /// tag. Tenants without a configured name fall back to an empty tag.
+    org_names: std::collections::HashMap<String, String>,
 }
 
 impl SyncJob {
@@ -65,12 +68,14 @@ impl SyncJob {
         sink: Arc<dyn RawSink>,
         gcs: GcsConfig,
         cfg: SyncConfig,
+        org_names: std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
             auth,
             sink,
             gcs,
             cfg,
+            org_names,
         }
     }
 
@@ -205,6 +210,11 @@ impl SyncJob {
         let synced_at = Utc::now().to_rfc3339();
         let run_id_str = run_id.to_string();
         let run_id_short = &run_id_str[..run_id_str.len().min(6)];
+        let org_name = self
+            .org_names
+            .get(tenant)
+            .map(String::as_str)
+            .unwrap_or_default();
 
         if entity.is_report() {
             return self
@@ -216,6 +226,7 @@ impl SyncJob {
                     run_id_short,
                     &run_id_str,
                     tenant,
+                    org_name,
                     entity,
                     mode,
                     &synced_at,
@@ -248,7 +259,7 @@ impl SyncJob {
             );
             let meta = metadata(&MetaArgs {
                 tenant_id: tenant,
-                org_name: "",
+                org_name,
                 endpoint: entity.as_str(),
                 sync_type: mode.sync_type(),
                 modified_after: params.modified_after_str.as_deref(),
@@ -289,6 +300,7 @@ impl SyncJob {
         run_id_short: &str,
         run_id: &str,
         tenant: &str,
+        org_name: &str,
         entity: &EntityType,
         mode: &SyncMode,
         synced_at: &str,
@@ -320,7 +332,7 @@ impl SyncJob {
         let signature = spec.params_signature();
         let meta = report_metadata(&ReportMetaArgs {
             tenant_id: tenant,
-            org_name: "",
+            org_name,
             endpoint: entity.as_str(),
             report: entity.as_str(),
             report_date: spec.report_date.as_deref(),

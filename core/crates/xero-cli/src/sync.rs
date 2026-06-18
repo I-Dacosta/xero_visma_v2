@@ -121,7 +121,24 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
     let gcs_cfg = resolve_gcs_config(&args)?;
     let sink = build_sink(&args, &gcs_cfg).await?;
 
-    let job = SyncJob::new(auth, Arc::clone(&sink), gcs_cfg, sync_cfg.clone());
+    // tenant_id → org display name (from XERO_ORG_N_NAME) for the x-org-name
+    // object metadata tag; tenants without a configured name get an empty tag.
+    let org_names: std::collections::HashMap<String, String> = cfg
+        .xero_cc_connections
+        .iter()
+        .filter_map(|c| {
+            c.tenant_name
+                .clone()
+                .map(|name| (c.tenant_id.clone(), name))
+        })
+        .collect();
+    let job = SyncJob::new(
+        auth,
+        Arc::clone(&sink),
+        gcs_cfg,
+        sync_cfg.clone(),
+        org_names,
+    );
 
     // Backfill runs N chunked sub-runs; everything else is a single run.
     let manifest = if let Some(spec) = args.backfill.as_deref() {
