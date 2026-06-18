@@ -78,16 +78,11 @@ LOG_DIR=/var/log/xero
 # by Xero's 5000-calls/day/tenant cap, so run it DELIBERATELY — sliced by date
 # and/or tenant across days until complete — not on a timer.
 #
-# Run it in TWO parts. `--backfill` applies a business-date `Date` window, which
-# only suits transactional entities; master/reference tables have no Date field,
-# so pull those with `--full` instead:
+# `--backfill` is entity-aware: master/reference tables (no `Date` field) get a
+# single full pull, while date-filterable transactional entities are pulled in
+# business-date chunks (oldest→newest). One command covers everything:
 #
-#   # 1) master / reference tables (no date filter), all tenants:
-#   set -a; . $ENV_FILE; set +a; $XERO_BIN sync --full >> $LOG_DIR/backfill.log 2>&1
-#
-#   # 2) transactional history in business-date chunks (date-filterable entities):
 #   set -a; . $ENV_FILE; set +a; $XERO_BIN sync \
-#     --entity invoices,bills,bank_transactions,credit_notes,payments,manual_journals,purchase_orders,quotes \
 #     --backfill 2018-01-01:"$(date -u +%Y-%m-%d)" --chunk-months 3 \
 #     >> $LOG_DIR/backfill.log 2>&1
 #

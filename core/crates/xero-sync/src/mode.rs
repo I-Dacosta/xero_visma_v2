@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use xero_client::ExtraQuery;
+use xero_common::EntityType;
 use xero_gcs::SyncType;
 
 /// The sync layer this run executes. Stateless — each variant fully describes
@@ -112,6 +113,7 @@ pub fn business_date_where(from: NaiveDate, to: NaiveDate) -> String {
 /// passing a report mode here yields the empty (master-like) params.
 pub fn fetch_params(
     mode: &SyncMode,
+    entity: &EntityType,
     now: DateTime<Utc>,
     run_date: NaiveDate,
     window_days: i64,
@@ -133,13 +135,23 @@ pub fn fetch_params(
             where_filter: Some(where_clause.clone()),
             ..FetchParams::default()
         },
-        SyncMode::RollingFull { days } => {
+        // Business-date window modes only apply to date-windowable entities;
+        // master/reference + offset endpoints (e.g. Journals) have no `Date`
+        // field, so they fall through to a full (no-filter) pull instead of
+        // erroring on an invalid `where`.
+        SyncMode::RollingFull { days } if entity.is_date_windowable() => {
             let (from, to) = rolling_window(run_date, *days);
             params_for_business_window(from, to)
         }
-        SyncMode::Backfill { from, to } => params_for_business_window(*from, *to),
-        // Master + (defensively) Reports: no filter, no window.
-        SyncMode::Master | SyncMode::Reports { .. } => FetchParams::default(),
+        SyncMode::Backfill { from, to } if entity.is_date_windowable() => {
+            params_for_business_window(*from, *to)
+        }
+        // Master, Reports, and any non-date-windowable entity in a window mode:
+        // no filter, no window.
+        SyncMode::RollingFull { .. }
+        | SyncMode::Backfill { .. }
+        | SyncMode::Master
+        | SyncMode::Reports { .. } => FetchParams::default(),
     }
 }
 
@@ -215,7 +227,13 @@ mod tests {
 
     #[test]
     fn incremental_sets_modified_after_only() {
-        let p = fetch_params(&SyncMode::Incremental, now(), run_date(), 3);
+        let p = fetch_params(
+            &SyncMode::Incremental,
+            &EntityType::Invoices,
+            now(),
+            run_date(),
+            3,
+        );
         assert_eq!(
             p.modified_after,
             Some(Utc.with_ymd_and_hms(2026, 6, 14, 3, 0, 1).unwrap())
@@ -232,6 +250,7 @@ mod tests {
             &SyncMode::OpenSweep {
                 where_clause: "Status==\"AUTHORISED\"".to_owned(),
             },
+            &EntityType::Invoices,
             now(),
             run_date(),
             3,
@@ -246,7 +265,13 @@ mod tests {
 
     #[test]
     fn rolling_full_sets_business_window_via_where() {
-        let p = fetch_params(&SyncMode::RollingFull { days: 30 }, now(), run_date(), 3);
+        let p = fetch_params(
+            &SyncMode::RollingFull { days: 30 },
+            &EntityType::Invoices,
+            now(),
+            run_date(),
+            3,
+        );
         assert!(p.modified_after.is_none());
         assert_eq!(p.business_from.as_deref(), Some("2026-05-19"));
         assert_eq!(p.business_to.as_deref(), Some("2026-06-17"));
@@ -262,7 +287,13 @@ mod tests {
     fn backfill_sets_explicit_business_window() {
         let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
-        let p = fetch_params(&SyncMode::Backfill { from, to }, now(), run_date(), 3);
+        let p = fetch_params(
+            &SyncMode::Backfill { from, to },
+            &EntityType::Invoices,
+            now(),
+            run_date(),
+            3,
+        );
         assert_eq!(p.business_from.as_deref(), Some("2020-01-01"));
         assert_eq!(p.business_to.as_deref(), Some("2026-06-17"));
         assert!(p.extras.where_clause.is_some());
@@ -270,7 +301,13 @@ mod tests {
 
     #[test]
     fn master_sets_no_filter() {
-        let p = fetch_params(&SyncMode::Master, now(), run_date(), 3);
+        let p = fetch_params(
+            &SyncMode::Master,
+            &EntityType::Invoices,
+            now(),
+            run_date(),
+            3,
+        );
         assert!(p.modified_after.is_none());
         assert!(p.extras.where_clause.is_none());
         assert!(p.modified_after_str.is_none());
@@ -278,6 +315,38 @@ mod tests {
         assert!(p.business_to.is_none());
         assert!(p.where_filter.is_none());
         assert!(p.extras.extra.is_empty());
+    }
+
+    #[test]
+    fn backfill_master_entity_gets_no_date_filter() {
+        // A master/reference entity has no `Date` field, so even in Backfill
+        // mode it must fall through to a full (no-filter) pull, never a `where`.
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let p = fetch_params(
+            &SyncMode::Backfill { from, to },
+            &EntityType::Accounts,
+            now(),
+            run_date(),
+            3,
+        );
+        assert!(p.extras.where_clause.is_none());
+        assert!(p.business_from.is_none());
+        assert!(p.business_to.is_none());
+    }
+
+    #[test]
+    fn rolling_full_non_windowable_entity_gets_no_date_filter() {
+        // Journals is offset-based (no `Date` `where`) → no window applied.
+        let p = fetch_params(
+            &SyncMode::RollingFull { days: 30 },
+            &EntityType::Journals,
+            now(),
+            run_date(),
+            3,
+        );
+        assert!(p.extras.where_clause.is_none());
+        assert!(p.business_from.is_none());
     }
 
     // ── sync_type / label / window_days ──────────────────────────────────────

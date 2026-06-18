@@ -230,32 +230,66 @@ async fn run_backfill(
     max_concurrent: usize,
 ) -> anyhow::Result<RunManifest> {
     let (from, to) = parse_range(spec)?;
-    let chunks = backfill_chunks(from, to, chunk_months);
-    tracing::info!(
-        from = %from, to = %to, chunks = chunks.len(), chunk_months,
-        "backfill expanded into business-date chunks"
-    );
 
-    let mut merged: Option<RunManifest> = None;
-    for (chunk_from, chunk_to) in chunks {
-        let mode = SyncMode::Backfill {
-            from: chunk_from,
-            to: chunk_to,
-        };
-        let manifest = job
-            .run(run_id, chunk_to, tenants, entities, mode, max_concurrent)
-            .await;
-        merged = Some(match merged {
-            None => manifest,
-            Some(mut acc) => {
-                acc.finished_at = manifest.finished_at;
-                acc.entities.extend(manifest.entities);
-                acc
-            }
-        });
+    // Entity-aware split: date-windowable entities are pulled in business-date
+    // chunks; master/reference + offset endpoints (e.g. Journals) have no `Date`
+    // field, so they get a SINGLE full (no-filter) pull — not a per-chunk
+    // re-fetch that would error on an invalid `where` and burn the daily cap.
+    let (windowable, full_once): (Vec<EntityType>, Vec<EntityType>) = entities
+        .iter()
+        .cloned()
+        .partition(EntityType::is_date_windowable);
+
+    let mut parts: Vec<RunManifest> = Vec::new();
+
+    if !full_once.is_empty() {
+        tracing::info!(
+            entities = full_once.len(),
+            "backfill: single full (no-date) pull for non-windowable entities"
+        );
+        parts.push(
+            job.run(
+                run_id,
+                to,
+                tenants,
+                &full_once,
+                SyncMode::Master,
+                max_concurrent,
+            )
+            .await,
+        );
     }
 
-    merged.context("backfill produced no chunks (empty date range)")
+    if !windowable.is_empty() {
+        let chunks = backfill_chunks(from, to, chunk_months);
+        tracing::info!(
+            from = %from, to = %to, chunks = chunks.len(), chunk_months,
+            entities = windowable.len(),
+            "backfill: date-chunked pull for windowable entities (oldest→newest)"
+        );
+        for (chunk_from, chunk_to) in chunks {
+            let mode = SyncMode::Backfill {
+                from: chunk_from,
+                to: chunk_to,
+            };
+            parts.push(
+                job.run(run_id, chunk_to, tenants, &windowable, mode, max_concurrent)
+                    .await,
+            );
+        }
+    }
+
+    // Merge every sub-run's manifest into one (entities concatenated; the latest
+    // finished_at wins).
+    let mut iter = parts.into_iter();
+    let mut merged = iter
+        .next()
+        .context("backfill produced no work (no entities or empty date range)")?;
+    for m in iter {
+        merged.finished_at = m.finished_at;
+        merged.entities.extend(m.entities);
+    }
+    Ok(merged)
 }
 
 /// Print a one-line-per-entity summary plus run-level totals to stdout.

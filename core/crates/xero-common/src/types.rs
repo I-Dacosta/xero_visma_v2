@@ -365,6 +365,31 @@ impl EntityType {
     pub fn open_status() -> &'static [EntityType] {
         &[Self::Invoices, Self::Bills]
     }
+
+    /// `true` if this entity supports a Xero `where=Date>=…` business-date
+    /// window, so it can be backfilled / rolling-full'd in date chunks.
+    ///
+    /// Everything else — master/reference data (no `Date` field) and the
+    /// offset/no-`where` endpoints (e.g. Journals) — must be pulled in full
+    /// (no date filter); applying a `Date` filter to them errors or is ignored.
+    pub fn is_date_windowable(&self) -> bool {
+        matches!(
+            self,
+            Self::Invoices
+                | Self::Bills
+                | Self::CreditNotes
+                | Self::Quotes
+                | Self::Payments
+                | Self::Overpayments
+                | Self::Prepayments
+                | Self::BankTransactions
+                | Self::BankTransfers
+                | Self::ManualJournals
+                | Self::PurchaseOrders
+                | Self::Receipts
+                | Self::BatchPayments
+        )
+    }
 }
 
 impl fmt::Display for EntityType {

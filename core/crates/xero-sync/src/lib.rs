@@ -234,7 +234,7 @@ impl SyncJob {
                 .await;
         }
 
-        let params = fetch_params(mode, Utc::now(), run_date, self.cfg.window_days);
+        let params = fetch_params(mode, entity, Utc::now(), run_date, self.cfg.window_days);
         let (pages, outcome) = api
             .fetch_raw_pages(
                 &token.access_token,
