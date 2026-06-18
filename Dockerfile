@@ -7,6 +7,13 @@ FROM rust:1.80-bookworm AS builder
 
 WORKDIR /workspace
 
+# `aws-lc-sys` (pulled in transitively by gcloud-storage's default
+# `jwt-aws-lc-rs` feature) compiles its C library from source and needs
+# cmake + perl + a C compiler. gcc is already in the rust image; add the rest.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cmake perl && \
+    rm -rf /var/lib/apt/lists/*
+
 # Cap parallel codegen units to keep peak RAM low on memory-constrained build
 # hosts (the prod VPS is shared with ~30 containers). Slower but OOM-safe.
 ENV CARGO_BUILD_JOBS=2

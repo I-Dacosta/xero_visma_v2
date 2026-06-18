@@ -51,3 +51,6 @@ tmp/
 
 # Local overrides — keep template visible, ignore personal copy
 docker-compose.local.yml
+
+# Local dry-run output (LocalDirSink --dry-run --local-dir ./out)
+out/

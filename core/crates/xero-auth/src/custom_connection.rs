@@ -80,14 +80,12 @@ impl CustomConnectionClient {
 
     async fn fetch_token_uncached(&self) -> xero_common::Result<TokenData> {
         let creds = STANDARD.encode(format!("{}:{}", self.client_id, self.client_secret));
-        let configured_scope = std::env::var("XERO_SCOPES")
-            .ok()
-            .map(|scope| scope.trim().to_owned())
-            .filter(|scope| !scope.is_empty());
-        let mut form = vec![("grant_type", "client_credentials")];
-        if let Some(scope) = configured_scope.as_deref() {
-            form.push(("scope", scope));
-        }
+        // Custom-connection `client_credentials` takes NO scope param: Xero
+        // issues a token covering every scope configured on the custom
+        // connection app. Requesting a scope the app lacks — or any OIDC/PKCE
+        // scope (openid/profile/email/offline_access) — fails with
+        // `invalid_scope`, so we omit it and accept the app's full granted set.
+        let form = [("grant_type", "client_credentials")];
 
         let resp = self
             .http
