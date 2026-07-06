@@ -1,13 +1,17 @@
 """
 Xero contact groups parser.
 
-Reads from:   dw_1_bronze_xero.xero_contact_groups
-Writes to:    dw_2_staging_xero.contact_groups          (header)
-              dw_2_staging_xero.contact_group_members   (Contacts[] + xero_contacts ContactGroups[])
+Reads from:   GCS raw contact_groups files (or dw_1_bronze_xero.xero_contact_groups in dev)
+Writes to:    staging_xero.contact_groups          (header)
+              staging_xero.contact_group_members   (Contacts[] within this endpoint only)
 
-Note: contact_group_members UNIONs both endpoints — the group endpoint gives
-      Contacts[] per group; contacts.py does NOT write group membership to avoid
-      duplication. All membership rows flow through this module.
+Pure staging: this parser unpacks ONLY the contact_groups endpoint. The
+Contacts[] array inside each group becomes contact_group_members rows.
+
+It does NOT read the contacts endpoint or UNION across sources — that cross-
+endpoint reconciliation is an ODS-layer join (see docs/DWH_ARCHITECTURE.md,
+"Staging Layer Purity"). The contacts endpoint's own ContactGroups[] array is
+unpacked separately by contacts.py into contact_group_memberships.
 """
 
 import logging
@@ -34,69 +38,28 @@ def parse_header(record):
     }
 
 
-def parse_members_from_groups(reader: BQReader) -> list[dict]:
-    """Source A: Contacts[] within each ContactGroup record."""
+def parse_members(record) -> list[dict]:
+    """Unpack the Contacts[] array inside a single ContactGroup record."""
+    p = record["payload"]
     result = []
-    for record in reader.iter_records(BRONZE_TABLE):
-        p = record["payload"]
-        for contact in p.get("Contacts") or []:
-            result.append({
-                "tenant_id":        record["tenant_id"],
-                "contact_group_id": p.get("ContactGroupID"),
-                "contact_id":       contact.get("ContactID"),
-                "contact_name":     contact.get("Name"),
-                "contact_group_name": None,
-                "_endpoint":        "xero_contact_groups",
-            })
-    return result
-
-
-def parse_members_from_contacts(reader: BQReader) -> list[dict]:
-    """Source B: ContactGroups[] within each Contact record."""
-    result = []
-    contacts_reader = BQReader(project=reader.project, dataset=reader.dataset)
-    for record in contacts_reader.iter_records("xero_contacts"):
-        p = record["payload"]
-        for grp in p.get("ContactGroups") or []:
-            result.append({
-                "tenant_id":        record["tenant_id"],
-                "contact_group_id": grp.get("ContactGroupID"),
-                "contact_id":       p.get("ContactID"),
-                "contact_name":     p.get("Name"),
-                "contact_group_name": grp.get("Name"),
-                "_endpoint":        "xero_contacts",
-            })
+    for contact in p.get("Contacts") or []:
+        result.append({
+            "tenant_id":        record["tenant_id"],
+            "contact_group_id": p.get("ContactGroupID"),
+            "contact_id":       contact.get("ContactID"),
+            "contact_name":     contact.get("Name"),
+        })
     return result
 
 
 def run(reader: BQReader, writer: BQWriter,
         tenant_id: str | None = None, limit: int | None = None) -> dict:
-    headers = [parse_header(r)
-               for r in reader.iter_records(BRONZE_TABLE, tenant_id=tenant_id, limit=limit)]
+    headers, members = [], []
+    for record in reader.iter_records(BRONZE_TABLE, tenant_id=tenant_id, limit=limit):
+        headers.append(parse_header(record))
+        members.extend(parse_members(record))
+
     writer.merge(HEADER_TABLE, headers)
-
-    # UNION both membership sources, deduplicate on (tenant_id, contact_group_id, contact_id)
-    from_groups   = parse_members_from_groups(reader)
-    from_contacts = parse_members_from_contacts(reader)
-    all_members   = from_groups + from_contacts
-
-    # Deduplicate in Python — last writer wins (contacts endpoint has group name)
-    seen: dict[tuple, dict] = {}
-    for m in all_members:
-        key = (m["tenant_id"], m["contact_group_id"], m["contact_id"])
-        existing = seen.get(key)
-        if existing is None:
-            seen[key] = m
-        else:
-            # Prefer whichever has the group name
-            if m.get("contact_group_name") and not existing.get("contact_group_name"):
-                seen[key]["contact_group_name"] = m["contact_group_name"]
-
-    members = list(seen.values())
-    # Remove _endpoint before writing (internal routing only)
-    for m in members:
-        m.pop("_endpoint", None)
-
     if members:
         writer.merge(MEMBER_TABLE, members,
                      key_columns=("tenant_id", "contact_group_id", "contact_id"))

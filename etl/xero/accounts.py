@@ -1,11 +1,13 @@
 """
 Xero accounts (chart of accounts) parser.
 
-Reads from:   dw_1_bronze_xero.xero_accounts
-Writes to:    dw_2_staging_xero.accounts   (flat — no nested arrays)
+Reads from:   GCS raw accounts files (or dw_1_bronze_xero.xero_accounts in dev)
+Writes to:    staging_xero.accounts   (flat — no nested arrays)
 
-Note: bs_pl and fsli_1 are pre-derived here using the same labels as Visma
-      so the ODS cross-provider layer can UNION both without extra logic.
+Pure staging: only unpacks the raw payload. The `account_class` value is kept
+raw (ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE). Derived classifications such as
+bs_pl / fsli_1 are NOT computed here — that business logic belongs in the ODS
+layer (see docs/DWH_ARCHITECTURE.md, "Staging Layer Purity").
 """
 
 import logging
@@ -17,18 +19,6 @@ logger = logging.getLogger(__name__)
 
 BRONZE_TABLE = "xero_accounts"
 HEADER_TABLE = "accounts"
-
-_BS_PL = {
-    "ASSET": "BS", "LIABILITY": "BS", "EQUITY": "BS",
-    "REVENUE": "P&L", "EXPENSE": "P&L",
-}
-_FSLI_1 = {
-    "ASSET": "Assets",
-    "LIABILITY": "Equity and liabilities",
-    "EQUITY": "Equity and liabilities",
-    "REVENUE": "Revenue",
-    "EXPENSE": "Operating expenses",
-}
 
 
 def parse_header(record: dict) -> dict:
@@ -60,11 +50,8 @@ def parse_header(record: dict) -> dict:
         "add_to_watchlist":             p.get("AddToWatchlist"),
         "has_attachments":              p.get("HasAttachments"),
 
-        "updated_at":           parse_xero_datetime(p.get("UpdatedDateUTC")),
-
-        # Pre-derived for cross-provider harmonisation
-        "bs_pl":    _BS_PL.get(cls),
-        "fsli_1":   _FSLI_1.get(cls),
+        "updated_at":                   parse_xero_datetime(p.get("UpdatedDateUTC")),
+        "reporting_code_updated_at":    parse_xero_datetime(p.get("ReportingCodeUpdatedUTC")),
     }
 
 

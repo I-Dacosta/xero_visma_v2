@@ -79,6 +79,11 @@ class BQWriter:
         try:
             self._write_temp(tmp, rows, schema=existing_schema)
             self._ensure_target_exists(target, tmp)
+            # If the target exists but is missing new columns, add them now
+            # (schema evolution: new API fields). Types are taken from the
+            # temp table schema which was created with autodetect.
+            if existing_schema is not None:
+                self._evolve_target_schema(target, tmp, existing_schema)
             self._run_merge(target, tmp, columns, key_columns)
             logger.info("Merged %d row(s) into %s", len(rows), table)
             return len(rows)
@@ -113,10 +118,26 @@ class BQWriter:
             # Use the existing staging table schema — prevents type mismatches
             # when BQ would otherwise autodetect a different type (e.g. numeric
             # account codes inferred as INT64 instead of STRING).
-            job_config = bigquery.LoadJobConfig(
-                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-                schema=schema,
-            )
+            # However, if the data contains fields not yet in the schema (schema
+            # evolution — new API fields), fall back to autodetect so new columns
+            # are added rather than rejected.
+            existing_field_names = {f.name for f in schema}
+            data_field_names = set(rows[0].keys())
+            new_fields = data_field_names - existing_field_names
+            if new_fields:
+                logger.info(
+                    "New fields detected (schema evolution) — using autodetect: %s",
+                    sorted(new_fields),
+                )
+                job_config = bigquery.LoadJobConfig(
+                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                    autodetect=True,
+                )
+            else:
+                job_config = bigquery.LoadJobConfig(
+                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                    schema=schema,
+                )
         else:
             job_config = bigquery.LoadJobConfig(
                 write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
@@ -128,6 +149,36 @@ class BQWriter:
         )
         job.result()
         logger.debug("Wrote %d row(s) to temp table %s", len(rows), tmp)
+
+    def _evolve_target_schema(
+        self, target: str, tmp: str, existing_schema: list
+    ) -> None:
+        """
+        Add columns to the target that exist in the temp table but not in the
+        target. Called only when schema evolution is detected (new API fields).
+        Uses ALTER TABLE ADD COLUMN IF NOT EXISTS so it is idempotent.
+        """
+        try:
+            tmp_table    = self.client.get_table(tmp.replace("`", ""))
+            existing_names = {f.name for f in existing_schema}
+            new_fields   = [f for f in tmp_table.schema if f.name not in existing_names]
+            if not new_fields:
+                return
+            target_ref = target.replace("`", "")
+            adds = ", ".join(
+                f"ADD COLUMN IF NOT EXISTS {f.name} {f.field_type}"
+                for f in new_fields
+            )
+            sql = f"ALTER TABLE `{target_ref}` {adds}"
+            self.client.query(sql).result()
+            logger.info(
+                "Schema evolution: added %d column(s) to %s: %s",
+                len(new_fields),
+                target_ref,
+                [f.name for f in new_fields],
+            )
+        except Exception as e:
+            logger.warning("Schema evolution ALTER TABLE failed (non-fatal): %s", e)
 
     def _ensure_target_exists(self, target: str, tmp: str) -> None:
         """

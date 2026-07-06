@@ -1,13 +1,17 @@
 """
 Xero contacts parser.
 
-Reads from:   dw_1_bronze_xero.xero_contacts
-Writes to:    dw_2_staging_xero.contacts              (header)
-              dw_2_staging_xero.contact_addresses     (Addresses[])
-              dw_2_staging_xero.contact_phones        (Phones[] — non-empty only)
+Reads from:   GCS raw contacts files (or dw_1_bronze_xero.xero_contacts in dev)
+Writes to:    staging_xero.contacts                    (header)
+              staging_xero.contact_addresses           (Addresses[])
+              staging_xero.contact_phones              (Phones[] — non-empty only)
+              staging_xero.contact_group_memberships   (ContactGroups[])
 
-Note: Contact group membership (ContactGroups[]) is handled by contact_groups.py
-      which UNIONs both endpoints. Do not duplicate it here.
+Pure staging: this parser unpacks ONLY the contacts endpoint. The ContactGroups[]
+array within each contact is unpacked into contact_group_memberships (the
+contact-centric view of group membership). The group-centric view lives in
+contact_groups.contact_group_members. Reconciling the two views is an ODS-layer
+join — staging does not UNION them (see docs/DWH_ARCHITECTURE.md).
 """
 
 import logging
@@ -17,10 +21,11 @@ from etl.common.date_parser import parse_xero_datetime
 
 logger = logging.getLogger(__name__)
 
-BRONZE_TABLE   = "xero_contacts"
-HEADER_TABLE   = "contacts"
-ADDRESS_TABLE  = "contact_addresses"
-PHONE_TABLE    = "contact_phones"
+BRONZE_TABLE      = "xero_contacts"
+HEADER_TABLE      = "contacts"
+ADDRESS_TABLE     = "contact_addresses"
+PHONE_TABLE       = "contact_phones"
+MEMBERSHIP_TABLE  = "contact_group_memberships"
 
 
 def parse_header(record: dict) -> dict:
@@ -114,13 +119,32 @@ def parse_phones(record: dict) -> list[dict]:
     return result
 
 
+def parse_group_memberships(record: dict) -> list[dict]:
+    """Unpack the ContactGroups[] array within a single contact record."""
+    p         = record["payload"]
+    tenant_id = record["tenant_id"]
+    record_id = record["record_id"]
+    result    = []
+    for grp in p.get("ContactGroups") or []:
+        result.append({
+            "tenant_id":        tenant_id,
+            "record_id":        record_id,
+            "contact_id":       p.get("ContactID"),
+            "contact_group_id": grp.get("ContactGroupID"),
+            "group_name":       grp.get("Name"),
+            "group_status":     grp.get("Status"),
+        })
+    return result
+
+
 def run(reader: BQReader, writer: BQWriter,
         tenant_id: str | None = None, limit: int | None = None) -> dict:
-    headers, addresses, phones = [], [], []
+    headers, addresses, phones, memberships = [], [], [], []
     for record in reader.iter_records(BRONZE_TABLE, tenant_id=tenant_id, limit=limit):
         headers.append(parse_header(record))
         addresses.extend(parse_addresses(record))
         phones.extend(parse_phones(record))
+        memberships.extend(parse_group_memberships(record))
     writer.merge(HEADER_TABLE, headers)
     if addresses:
         writer.merge(ADDRESS_TABLE, addresses,
@@ -128,6 +152,10 @@ def run(reader: BQReader, writer: BQWriter,
     if phones:
         writer.merge(PHONE_TABLE, phones,
                      key_columns=("tenant_id", "record_id", "phone_type"))
-    logger.info("contacts: %d headers, %d addresses, %d phones",
-                len(headers), len(addresses), len(phones))
-    return {"headers": len(headers), "addresses": len(addresses), "phones": len(phones)}
+    if memberships:
+        writer.merge(MEMBERSHIP_TABLE, memberships,
+                     key_columns=("tenant_id", "record_id", "contact_group_id"))
+    logger.info("contacts: %d headers, %d addresses, %d phones, %d memberships",
+                len(headers), len(addresses), len(phones), len(memberships))
+    return {"headers": len(headers), "addresses": len(addresses),
+            "phones": len(phones), "memberships": len(memberships)}

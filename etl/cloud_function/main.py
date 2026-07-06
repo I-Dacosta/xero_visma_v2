@@ -1,37 +1,30 @@
 """
-Cloud Function — GCS write trigger.
+Cloud Function — GCS meta file trigger.
 
-Triggered when a new JSON file lands in gs://prj-dw-dev-raw.
-Expected path format:
-    raw/{vendor}/{tenant_id}/v1/{entity_type}/{date}/{record_id}.json
+Triggered when a .meta.json file is written to gs://aquatiq-dw-dev-storage.
+Data file writes are ignored (filtered by the .meta.json suffix check).
+
+Path format:
+    raw/{vendor}/{tenant_id}/2.0/{endpoint}/{date}/{ts}_{run}_{page}.json.meta.json
 
 Flow:
-    GCS write event
-    → parse path (vendor, tenant_id, entity_type, record_id)
-    → download JSON file
-    → build record dict (same shape as BQReader output)
-    → route to correct parser module via _SingleRecordReader
-    → parser.run() writes to dw_2_staging_{vendor}
+    .meta.json written to GCS
+    → Cloud Function fires
+    → read meta file (tenant_id, endpoint, synced_at)
+    → derive data file path (strip .meta.json)
+    → GCSReader yields one record per item in the records array
+    → route to correct entity parser
+    → parser.run() MERGEs all rows into dw_2_staging_{vendor}
 
-_SingleRecordReader wraps a single GCS-sourced record so every parser's
-run() function works without modification — parsers do not know whether
-they are reading from BQ bronze or GCS.
-
-Note: contact_groups.parse_members_from_contacts() creates its own BQReader
-internally. In Cloud Function context this is a no-op because that path
-is only triggered by xero_contact_groups files; the cross-reference from
-xero_contacts is populated separately when contacts files are processed.
-Full membership union requires a batch run via bq_reader.
+_BatchReader wraps a pre-fetched list of records so every parser's run()
+function works without modification — parsers do not know whether they
+are reading from BQ bronze, GCS, or a test fixture.
 """
 
-import json
 import logging
-import re
-from datetime import datetime, timezone
-
 import functions_framework
-from google.cloud import storage
 
+from etl.common.gcs_reader import GCSReader
 from etl.common.bq_writer import BQWriter
 
 # Xero parsers
@@ -65,17 +58,8 @@ import etl.xero.users               as _users
 
 logger = logging.getLogger(__name__)
 
-PROJECT = "prj-dw-dev"
-
-# raw/{vendor}/{tenant_id}/v{n}/{entity_type}/{date}/{record_id}.json
-_PATH_RE = re.compile(
-    r"raw/(?P<vendor>[^/]+)"
-    r"/(?P<tenant_id>[^/]+)"
-    r"/v\d+"
-    r"/(?P<entity_type>[^/]+)"
-    r"/[^/]+"                   # date
-    r"/(?P<record_id>[^/]+)\.json$"
-)
+GCS_BUCKET = "aquatiq-dw-dev-storage"
+PROJECT     = "prj-dw-dev"
 
 XERO_PARSERS: dict = {
     "accounts":             _accounts,
@@ -109,75 +93,71 @@ XERO_PARSERS: dict = {
 
 VENDOR_PARSERS: dict = {
     "xero": XERO_PARSERS,
-    # "visma": VISMA_PARSERS,  # added when Visma ETL is built
+    # "visma": VISMA_PARSERS,  # added when Visma parsers are built
 }
 
 
-class _SingleRecordReader:
+class _BatchReader:
     """
-    Thin adapter so a single GCS-sourced record can be passed to any
-    parser's run() function without modification.
-
-    Mimics BQReader.iter_records() — yields one record regardless of
-    the table name or filters passed. The table argument is ignored
-    because the Cloud Function already knows which entity it is processing.
+    Wraps a pre-fetched list of records so parser run() functions work
+    without modification. The table argument to iter_records() is ignored —
+    records are already filtered by entity type by the Cloud Function.
     """
-
-    def __init__(self, record: dict, project: str):
+    def __init__(self, records: list[dict], project: str):
         self.project = project
-        self._record = record
+        self._records = records
 
     def iter_records(self, table: str, **kwargs):  # noqa: ARG002
-        yield self._record
+        yield from self._records
 
 
 @functions_framework.cloud_event
 def process_gcs_upload(cloud_event):
-    """Entry point: triggered on every GCS object finalise event."""
+    """Entry point — fires on every GCS object finalise event."""
     data        = cloud_event.data
     bucket_name = data["bucket"]
     object_name = data["name"]
 
-    m = _PATH_RE.search(object_name)
-    if not m:
-        logger.warning("Skipping unrecognised GCS path: %s", object_name)
+    # Only process meta files; silently ignore data file triggers
+    if not object_name.endswith(".meta.json"):
         return
 
-    vendor      = m.group("vendor")
-    tenant_id   = m.group("tenant_id")
-    entity_type = m.group("entity_type")
-    record_id   = m.group("record_id")
+    logger.info("Processing meta file: gs://%s/%s", bucket_name, object_name)
 
-    # Download JSON
-    gcs  = storage.Client()
-    blob = gcs.bucket(bucket_name).blob(object_name)
-    blob.reload()
-    payload = json.loads(blob.download_as_text())
+    # Read both files and yield records
+    gcs_reader = GCSReader(bucket=bucket_name, project=PROJECT)
+    records = list(gcs_reader.iter_records_from_meta(object_name))
 
-    now = datetime.now(tz=timezone.utc)
-    record = {
-        "tenant_id":    tenant_id,
-        "record_id":    record_id,
-        "payload":      payload,
-        "first_seen_at": blob.time_created or now,
-        "last_seen_at":  blob.updated or now,
-        "synced_at":     now,
-    }
+    if not records:
+        logger.info("No records extracted from %s — skipping", object_name)
+        return
 
-    # Route
+    # Extract routing info from the first record (all records share vendor/endpoint)
+    # Path: raw/{vendor}/{tenant_id}/2.0/{endpoint}/...
+    parts = object_name.split("/")
+    vendor   = parts[1] if len(parts) > 1 else None
+    endpoint = parts[4] if len(parts) > 4 else None
+
+    if not vendor or not endpoint:
+        logger.warning("Could not parse vendor/endpoint from path: %s", object_name)
+        return
+
     vendor_map = VENDOR_PARSERS.get(vendor)
-    if vendor_map is None:
+    if not vendor_map:
         logger.warning("No parsers registered for vendor: %s", vendor)
         return
 
-    parser = vendor_map.get(entity_type)
-    if parser is None:
-        logger.warning("No parser for %s/%s", vendor, entity_type)
+    parser = vendor_map.get(endpoint)
+    if not parser:
+        logger.warning("No parser for %s/%s", vendor, endpoint)
         return
 
     staging_dataset = f"dw_2_staging_{vendor}"
-    writer = BQWriter(project=PROJECT, dataset=staging_dataset)
-    reader = _SingleRecordReader(record, project=PROJECT)
+    writer      = BQWriter(project=PROJECT, dataset=staging_dataset)
+    batch_reader = _BatchReader(records, project=PROJECT)
 
-    result = parser.run(reader, writer)
-    logger.info("Processed gs://%s/%s → %s", bucket_name, object_name, result)
+    result = parser.run(batch_reader, writer)
+    logger.info(
+        "Processed gs://%s/%s — %d records → %s",
+        bucket_name, object_name, len(records), result
+    )

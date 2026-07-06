@@ -1,6 +1,6 @@
 # Data Warehouse Architecture
 
-_Created: 2026-06-04. Updated: 2026-06-04 — Phase 1 complete. Full backfill done. dw_2_staging_xero populated. Next: deploy Cloud Function once Rust GCS writer is ready, then ODS._
+_Created: 2026-06-04. Updated: 2026-07-03 — staging_xero backfilled from GCS (16 endpoints, 345k rows). Staging layer purity enforced: derivations and cross-endpoint joins removed._
 
 ---
 
@@ -103,16 +103,43 @@ Xero / Visma API
 - Writes to BQ staging tables via the BQ Python client (insert/upsert)
 - **All field-level knowledge from the Dataform silver work is preserved here** — same fields, same nesting patterns, same date quirks — just implemented in Python
 
-### Staging Layer (`dw_2_staging_*`)
+### Staging Layer (`staging_*`)
 
-- One BQ dataset per provider: `dw_2_staging_xero`, `dw_2_staging_visma`
-- 1-2 BQ tables per API endpoint
+- One BQ dataset per provider: `staging_xero`, `staging_visma`
+- 1-N BQ tables per API endpoint
   - Header table (one row per record): e.g. `bank_transactions`
-  - Line table where arrays exist (one row per record + line): e.g. `bank_transaction_lines`
+  - Line/child table per nested array (one row per record + item): e.g. `bank_transaction_lines`
 - Columns are fully typed (TIMESTAMP, FLOAT64, BOOL, STRING, DATE) — no JSON
-- Facts and dimensions are defined at this layer
-- Deduplication handled by the Python writer (upsert on `tenant_id` + `record_id`)
+- Deduplication handled by the Python writer (MERGE on `tenant_id` + `record_id`)
 - This layer is append-friendly and incrementally updated by the Cloud Function
+
+#### Staging Layer Purity (rule established 2026-07-03)
+
+**The staging layer stores raw data as fully unpacked as possible — and nothing more. All joins and all derivations belong in ODS.**
+
+What staging IS allowed to do:
+- **Unpack nested arrays** into separate child tables (e.g. `LineItems[]` → `invoice_lines`). One row per array item.
+- **Flatten single nested objects** to extract their fields, including foreign-key IDs (e.g. `Contact.ContactID` → `contact_id`). The nested object is part of the same record's payload, so this is unpacking, not a join.
+- **Denormalise convenience names** from those same in-payload nested objects (e.g. `Contact.Name` → `contact_name`). Kept as a pragmatic exception — harmless because the value already lives inside the record; it does not require reading another table.
+
+What staging is NOT allowed to do (these are ODS concerns):
+- **Derive/compute classifications** — no business-logic mappings. (Removed `bs_pl`, `fsli_1` from `accounts`.)
+- **Join or UNION across endpoints/sources** — each parser reads exactly one endpoint. (Removed the `contact_groups` ↔ `contacts` UNION.)
+
+**Changes made to enforce this (2026-07-03):**
+
+| File | Change |
+|---|---|
+| `etl/xero/accounts.py` | Removed derived `bs_pl` and `fsli_1` columns + their lookup dicts. `account_class` kept raw (ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE). Dropped & re-backfilled `staging_xero.accounts` so the columns are gone. |
+| `etl/xero/contact_groups.py` | Rewritten to pure single-endpoint unpacking. `contact_group_members` now sourced ONLY from the groups endpoint's `Contacts[]`. Removed the cross-endpoint UNION with `xero_contacts` and the Python dedup logic. |
+| `etl/xero/contacts.py` | Added `contact_group_memberships` child table from the contacts endpoint's own `ContactGroups[]`. This is the contact-centric view; the group-centric view is `contact_groups.contact_group_members`. |
+
+**The two group-membership views are reconciled in ODS, not staging:**
+- `staging_xero.contact_group_members` — group-centric (from contact_groups endpoint)
+- `staging_xero.contact_group_memberships` — contact-centric (from contacts endpoint)
+- Neither endpoint alone is authoritative; the ODS layer UNIONs and dedups them.
+
+Denormalised names that were deliberately KEPT (harmless, per the rule above): `bank_transactions.contact_name` / `.bank_account_name`, `invoices.contact_name`, `payments.contact_name`, etc.
 
 ### ODS — Operational Data Store (`dw_3_ods_*`)
 
@@ -194,24 +221,68 @@ The Dataform silver layer work (46 `.sqlx` files in `Dataform/definitions/silver
 
 ---
 
-## GCS File Format & Metadata
+## GCS File Format & Metadata (UPDATED 2026-06-29)
 
-Each raw file is a single JSON object (one API record per file):
+### Bucket
+`gs://aquatiq-dw-dev-storage` (not `prj-dw-dev-raw` as originally planned)
 
+### Path format
 ```
-gs://bucket/raw/xero/{tenant_id}/v1/{entity_type}/{date}/{record_id}.json
+raw/{vendor}/{tenant_id}/2.0/{entity_type}/{date}/{timestamp}_{run_id_short}_{page}.json
 ```
 
 Example:
 ```
-gs://bucket/raw/xero/9dc5d3f0-68b1-4811-a38d-9efbb5990604/v1/bank_transactions/2026-06-04/a1c669bb-fa0d-4d5b-bf2f-97da2d82d879.json
+raw/xero/19b25bd5-431a-4af4-8ecf-7a5a75cbcc5c/2.0/accounts/2026-06-18/20260618T134051Z_9c0e3d_p001.json
 ```
 
-GCS object metadata attributes (set by the sync service on upload):
-- `tenant_id`: `9dc5d3f0-68b1-4811-a38d-9efbb5990604`
-- `record_id`: `a1c669bb-fa0d-4d5b-bf2f-97da2d82d879`
+### Two files per API call
+Each sync produces a **data file** and a **metadata file**:
+- `20260618T134051Z_9c0e3d_p001.json` — the API response (array of records)
+- `20260618T134051Z_9c0e3d_p001.json.meta.json` — sync context
 
-The JSON body itself does not need to carry these fields — the Cloud Function extracts them from the file path or metadata. During the BQ-bronze development phase, these are taken from the `tenant_id` and `record_id` columns in the bronze table.
+### Metadata file structure
+```json
+{
+  "x-api-version": "2.0",
+  "x-endpoint": "accounts",
+  "x-http-status": "200",
+  "x-org-name": "Aqua Pharma Australia Pty Ltd",
+  "x-page": "1",
+  "x-record-count": "126",
+  "x-run-id": "9c0e3d86-4c84-4d69-8587-ef085eeb20de",
+  "x-sync-type": "master",
+  "x-synced-at": "2026-06-18T13:40:56.194109096+00:00",
+  "x-tenant-id": "19b25bd5-431a-4af4-8ecf-7a5a75cbcc5c",
+  "x-vendor": "xero"
+}
+```
+
+### Data file structure
+The data file is an API response wrapper containing a **batch of records** in an endpoint-specific array:
+```json
+{
+  "Id": "5a53fde9-...",
+  "Status": "OK",
+  "ProviderName": "Aqua Pharma Pty Ltd Data Warehouse Server",
+  "DateTimeUTC": "/Date(1781790056419)/",
+  "pagination": { "page": 1, "pageSize": 100, "pageCount": 1, "itemCount": 56 },
+  "Accounts": [ { ... }, { ... } ]
+}
+```
+
+The records array key is always the **PascalCase endpoint name**: `Accounts`, `Invoices`, `BankTransactions` etc.
+Some endpoints include a `pagination` object; others don't. Both forms are handled the same way.
+
+### Trigger strategy
+The Cloud Function triggers on `.meta.json` file writes **only** (data file triggers are ignored). When a meta file lands:
+1. Read the meta file → extract `x-tenant-id`, `x-endpoint`, `x-synced-at`, `x-run-id`
+2. Derive the data file path by stripping `.meta.json` from the trigger path
+3. Read the data file → extract the records array using the PascalCase endpoint key
+4. Loop over all records in the array and send each through the entity parser
+5. MERGE all parsed rows into the staging table in one batch
+
+This means one Cloud Function invocation processes a full page of records, not one record at a time.
 
 ---
 
@@ -296,10 +367,13 @@ All 20 Xero entity parsers tested against real bronze data — 20/20 passing.
 | Build `common/bq_reader.py` | ✅ Done — 7 tests passing; QUALIFY deduplication added |
 | Build `xero/bank_transactions.py` (proof of concept) | ✅ Done — 9 tests passing end-to-end |
 | Build remaining 19 Xero entity parsers | ✅ Done — 20/20 passing against real data |
-| Build `cloud_function/main.py` | ✅ Done — path routing tested; `_SingleRecordReader` adapter works |
+| Build `cloud_function/main.py` | ✅ Done — updated for new GCS structure; `_BatchReader` for per-file batch processing |
+| Build `common/gcs_reader.py` | ✅ Done — reads meta + data files, yields records; 7 tests passing |
+| Build `common/endpoint_config.py` | ✅ Done — 28 endpoints mapped |
+| Schema evolution in `bq_writer.py` | ✅ Done — auto-detect + ALTER TABLE for new API fields |
 | Run full historical backfill | ✅ Done — 27/27 entities, 278s, all staging tables populated |
-| Deploy Cloud Function | ⏳ Blocked — waiting on Rust GCS writer |
-| Swap `bq_reader.py` → `gcs_reader.py` | ⏳ After Rust GCS writer is ready |
+| End-to-end GCS → staging test | ✅ Done — 126 accounts from `aquatiq-dw-dev-storage` → staging confirmed |
+| Deploy Cloud Function | ⏳ Pending — packaging of `etl/` with function source to be resolved |
 
 **Bugs found and fixed during backfill:**
 
@@ -316,68 +390,147 @@ All 20 Xero entity parsers tested against real bronze data — 20/20 passing.
 
 ---
 
-## Staging Layer — Current State (backfill run 2026-06-04)
+## BigQuery Dataset Structure (as of 2026-06-29)
 
-All historical bronze data loaded into `dw_2_staging_xero`. 27/27 entities processed in 278 seconds.
+### Active datasets
+
+| Dataset | Purpose |
+|---|---|
+| `staging_xero` | Parsed, typed Xero API records — one table per endpoint |
+| `staging_visma` | Parsed, typed Visma API records — one table per endpoint |
+| `ods_xero` | Xero-specific intermediate and final joins (self-contained) |
+| `ods_visma` | Visma-specific intermediate and final joins (self-contained) |
+| `ods` | Cross-provider unified tables (consumes final output from ods_xero, ods_visma) |
+| `datamart` | BI-ready, no joins — column selections and aggregations from ODS |
+
+### Deprecated datasets (safe to delete after verification)
+All data copied to `deprecated_*` versions. Original datasets still exist in BQ but should be deleted by a GCP admin (requires `bigquery.datasets.delete` permission — do from the BQ console):
+
+| Original dataset | Deprecated copy | Tables |
+|---|---|---|
+| `dw_1_bronze_xero` | `deprecated_dw_1_bronze_xero` | 29 |
+| `dw_2_staging_xero` | `deprecated_dw_2_staging_xero` | 36 |
+| `dw_1_silver_xero` | `deprecated_dw_1_silver_xero` | 46 |
+
+Visma datasets (`dw_1_silver_visma`, `dw_1_silver_visma_global`) are **untouched**.
+
+---
+
+## Staging Layer — Current State (GCS backfill 2026-07-03)
+
+`staging_xero` populated **from the GCS bucket** (`aquatiq-dw-dev-storage`) via `etl/backfill_gcs.py`. 16 endpoints, 0 failures, ~21 min, **345,515 rows across 27 tables**. This is real multi-tenant data (6 organisations) — much larger than the earlier single-tenant bronze sample.
+
+Run with: `python -m etl.backfill_gcs [endpoint ...]` (no args = all endpoints).
 
 | Staging table(s) | Rows |
 |---|---|
-| `journals` | 24,130 |
-| `journal_lines` | 72,485 |
-| `invoices` | 12,894 |
-| `invoice_lines` | 22,779 |
-| `invoice_payments` | 11,616 |
-| `payments` | 12,871 |
-| `bank_transactions` | 4,659 |
-| `bank_transaction_lines` | 4,818 |
-| `manual_journals` | 1,556 |
-| `manual_journal_lines` | 5,653 |
-| `quotes` | 1,119 |
-| `quote_lines` | 3,075 |
-| `purchase_orders` | 897 |
-| `purchase_order_lines` | 1,976 |
-| `linked_transactions` | 468 |
-| `items` | 327 |
-| `credit_notes` | 361 |
-| `credit_note_lines` | 520 |
-| `credit_note_allocations` | 349 |
-| `contacts` | 265 |
-| `contact_addresses` | 530 |
-| `contact_phones` | 96 |
-| `accounts` | 271 |
-| `batch_payments` | 82 |
-| `batch_payment_lines` | 528 |
-| `bank_transfers` | 82 |
-| `users` | 42 |
-| `tax_rates` | 18 |
-| `tracking_categories` | 2 |
-| `tracking_options` | 12 |
-| `branding_themes` | 2 |
-| `budgets` | 2 |
-| `contact_groups` | 1 |
-| `contact_group_members` | 1 |
-| `repeating_invoices` | 1 |
-| `repeating_invoice_lines` | 3 |
-| Empty (bronze not yet populated) | `currencies`, `expense_claims`, `organisations`, `overpayments`, `prepayments`, `receipts` |
+| `quotes` / `quote_lines` | 38,862 / 107,202 |
+| `purchase_orders` / `purchase_order_lines` | 31,416 / 68,918 |
+| `invoices` / `invoice_lines` / `invoice_payments` | 15,294 / 26,845 / 13,603 |
+| `payments` | 14,989 |
+| `bank_transactions` / `bank_transaction_lines` | 4,985 / 5,150 |
+| `manual_journals` / `manual_journal_lines` | 1,731 / 6,541 |
+| `items` | 1,999 |
+| `contacts` / `contact_addresses` / `contact_phones` / `contact_group_memberships` | 1,675 / 3,350 / 333 / 1 |
+| `accounts` | 786 |
+| `credit_notes` / `credit_note_lines` / `credit_note_allocations` | 457 / 646 / 412 |
+| `users` | 140 |
+| `tax_rates` | 82 |
+| `tracking_categories` / `tracking_options` | 6 / 46 |
+| `currencies` | 27 |
+| `branding_themes` | 14 |
+| `organisations` | 6 |
 
-### Immediate next steps (before Phase 2)
+**Endpoints present in GCS but intentionally NOT parsed:**
+- `bills` — **SKIPPED (decided 2026-07-06).** Verified by inspecting both folders: the `bills` folder is a complete subset of `invoices`. The `invoices` folder returns both types (11,214 ACCPAY + 4,080 ACCREC = 15,293 distinct IDs); the `bills` folder returns only the same 11,214 ACCPAY records (11,213 distinct, all also in invoices; zero unique to bills). `staging_xero.invoices` therefore already holds every bill. Parsing `bills` would re-MERGE identical records for no gain. Any "bills" view downstream is simply `WHERE invoice_type = 'ACCPAY'` on `staging_xero.invoices`.
 
-**A. Rust GCS writer (colleague's work — blocks Cloud Function)**
-- Update the Rust sync service to write each API response as a JSON file to `gs://prj-dw-dev-raw/raw/xero/{tenant_id}/v1/{entity_type}/{date}/{record_id}.json`
-- Once this is live, deploy the Cloud Function (see deployment section below) and new records will flow automatically into staging
+**Endpoints with parsers but NOT in the GCS bucket yet** (will populate when synced): `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
 
-**B. Cloud Function packaging**
-- The `cloud_function/main.py` imports from `etl.xero.*` — the `etl/` parent package must be bundled with the function source. Two options:
-  1. Copy `etl/` into `etl/cloud_function/etl/` before deploying (simple but manual)
-  2. Move Cloud Function to repo root with a proper `pyproject.toml` (cleaner long-term)
-- Resolve this before deploying
+**Note on Journals:** the old bronze data had a `journals` endpoint (system GL journals). It is not currently in the GCS bucket endpoint list — confirm with colleague whether journals will be synced (it is the GL source of truth and important for ODS finance tables).
 
-**C. `gcs_reader.py`** — write this module to read JSON directly from GCS objects (mirrors `bq_reader.py` interface). Swap in once Rust GCS writer is live. Zero changes needed to any parser.
+### Immediate next steps (updated 2026-06-29)
+
+**A. New Dataform branch** ✅
+All Dataform work goes on branch `Datawarehouse/Dev-Etl-JSON`.
+
+**B. `etl/common/gcs_reader.py`** ✅ Done
+Reads both the `.meta.json` and data files from GCS. Yields one record dict per item in the records array, in the same shape as `bq_reader.py` so all parsers work unchanged. Tested against real bucket — 126 accounts records extracted and parsed correctly.
+
+**C. `etl/common/endpoint_config.py`** ✅ Done
+Explicit mappings for all 28 endpoints:
+- Endpoint name → PascalCase array key (`"accounts"` → `"Accounts"`)
+- Endpoint name → record ID field (`"accounts"` → `"AccountID"`)
+
+**D. Updated `etl/cloud_function/main.py`** ✅ Done
+- Triggers on `.meta.json` files only (data file triggers silently ignored)
+- `_BatchReader` wraps the full list of records from a file so all parsers work unchanged
+- Routes by vendor/endpoint parsed from the GCS path
+- New bucket `aquatiq-dw-dev-storage` and `2.0` version path
+
+**E. `bq_writer.py` — schema evolution support** ✅ Done (3 improvements)
+See Schema Evolution section below.
+
+**F. `etl/xero/accounts.py`** ✅ Done
+Added `reporting_code_updated_at` field (new in live API responses).
+
+**G. Cloud Function packaging** ⏳ Pending
+`cloud_function/main.py` imports from `etl.xero.*` — the `etl/` parent package must be bundled with the function before deploying.
+
+**H. End-to-end test** ✅ Confirmed
+GCS (`aquatiq-dw-dev-storage`) → `gcs_reader.py` → `accounts.py` → `dw_2_staging_xero.accounts` — 126 records, schema evolution handled automatically.
+
+---
+
+## Schema Evolution — How New API Fields Are Handled
+
+When the Xero API adds a new field to a response (e.g. `ReportingCodeUpdatedUTC`), the staging table will not have that column yet. `bq_writer.py` handles this automatically in three steps:
+
+1. **Detect new fields** — compare the data's field names against the existing staging table schema. If any are new, log them and switch the temp table write from schema-bound to autodetect.
+
+2. **Autodetect temp table** — BQ infers types for all fields including the new ones. Existing fields retain their correct types from the data values.
+
+3. **`ALTER TABLE` target** — before running the MERGE, add the new column(s) to the staging table using `ALTER TABLE ADD COLUMN IF NOT EXISTS` (idempotent). The column type is taken from the autodetected temp table schema.
+
+After these three steps the MERGE runs normally — both temp and target have the new columns. **No manual DDL or intervention is required when the API adds fields.**
+
+Log output when schema evolution fires:
+```
+INFO: New fields detected (schema evolution) — using autodetect: ['reporting_code_updated_at']
+INFO: Schema evolution: added 1 column(s) to dw_2_staging_xero.accounts: ['reporting_code_updated_at']
+INFO: Merged 126 row(s) into accounts
+```
+
+## Open Items — To Check Later
+
+Things known to be incomplete or pending external input, as of 2026-07-06:
+
+### Journals not yet in GCS (GL source of truth)
+- The Xero `/Journals` endpoint (the general ledger — where every transaction posts) is **not yet in the bucket** for any tenant, including the three expected ones (`19b25bd5…`, `83adbd31…`, `9dc5d3f0…`). Confirmed by listing every endpoint folder per tenant.
+- Colleague confirmed journals **will** arrive eventually but the sync isn't writing them yet (access issues on their side).
+- **Do not confuse `journals` (GL) with `manual_journals` (hand-entered only)** — both are separate Xero endpoints; only `manual_journals` is currently synced.
+- **Pipeline side is fully ready** — parser (`etl/xero/journals.py`), `endpoint_config.py` (`Journals` / `JournalID`), Cloud Function routing, and `backfill_gcs.py` all wired. Payload format verified against `dw_1_bronze_xero.xero_journals`.
+- **When journals land:** run `python -m etl.backfill_gcs journals` → creates `staging_xero.journals` + `staging_xero.journal_lines`. Nothing else needed.
+- **Multi-tenant caveat:** colleague noted journals access is failing for tenants beyond the three named. Verify all expected tenants produce journals once the sync is fixed.
+
+### Endpoints with parsers but no GCS data yet
+Will populate automatically when synced (parsers already exist): `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
+
+### Cloud Function not yet deployed
+- `cloud_function/main.py` imports from `etl.xero.*` — the `etl/` package must be bundled with the function source before deploy. Resolve packaging (copy `etl/` into the function dir, or restructure with `pyproject.toml`).
+- Until deployed, staging is populated via manual `backfill_gcs.py` runs. That's fine for now; deploy when ready for event-driven ingestion.
+
+### Deprecated datasets await deletion
+- `dw_1_bronze_xero`, `dw_2_staging_xero`, `dw_1_silver_xero` were copied to `deprecated_*` but the originals still exist (delete requires `bigquery.datasets.delete`, which the local creds lack). A GCP admin should delete the three originals from the BQ console. (Note: `dw_1_bronze_xero` is still useful right now as the reference for the journals payload format — keep until journals are live.)
+
+### Denormalised-name exception is deliberate
+- Staging keeps convenience name columns (`contact_name`, `bank_account_name`, etc.) even though pure theory would push them to ODS. This was an explicit decision (2026-07-03). If a future reviewer flags them as "joins in staging," they are not — the values come from the same record's own payload. See "Staging Layer Purity".
+
+---
 
 ### Phase 2 — ODS in Dataform
 
-10. **Create ODS L0 Dataform tables** — within-provider joins within Xero staging (e.g. invoices + contacts + accounts enriched into a master invoice view)
-11. **Create ODS L1 Dataform tables** — cross-provider harmonisation (Xero + Visma invoices, payments, contacts unified with common schema)
+10. **Create ODS L0 Dataform tables** — within-provider joins within Xero staging (e.g. invoices + contacts + accounts enriched into a master invoice view). Note: ODS L0 complexity will differ per provider — Xero and Visma get their own `ods_xero` / `ods_visma` datasets with independent intermediate joins.
+11. **Create ODS L1 Dataform tables** — cross-provider harmonisation (Xero + Visma invoices, payments, contacts unified with common schema). **This is where `bs_pl`/`fsli_1` classification and the contact-group-membership reconciliation now live** (moved out of staging).
 12. **Wire Dataform trigger** — Cloud Function calls Dataform API after staging write completes (or run Dataform on a schedule)
 
 ### Phase 3 — Data Mart
