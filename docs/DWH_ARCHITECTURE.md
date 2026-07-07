@@ -513,7 +513,10 @@ Things known to be incomplete or pending external input, as of 2026-07-06:
 - **Multi-tenant caveat:** colleague noted journals access is failing for tenants beyond the three named. Verify all expected tenants produce journals once the sync is fixed.
 
 ### Endpoints with parsers but no GCS data yet
-Will populate automatically when synced (parsers already exist): `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
+Will populate automatically when synced (parsers already exist). **12 endpoints** (verified against filesystem 2026-07-07):
+`journals`, `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
+
+Parser inventory: **28 parsers total** — 16 populated from GCS, 12 awaiting data. (`payment_services.py` added 2026-07-07 so every configured endpoint has a matching parser — no more config-only stubs.) The only bucket endpoint with no parser is `bills`, deliberately skipped (proven subset of `invoices`).
 
 ### Cloud Function not yet deployed
 - `cloud_function/main.py` imports from `etl.xero.*` — the `etl/` package must be bundled with the function source before deploy. Resolve packaging (copy `etl/` into the function dir, or restructure with `pyproject.toml`).

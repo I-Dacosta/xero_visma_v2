@@ -46,6 +46,7 @@ import etl.xero.linked_transactions as _linked_transactions
 import etl.xero.manual_journals     as _manual_journals
 import etl.xero.organisations       as _organisations
 import etl.xero.overpayments        as _overpayments
+import etl.xero.payment_services     as _payment_services
 import etl.xero.payments            as _payments
 import etl.xero.prepayments         as _prepayments
 import etl.xero.purchase_orders     as _purchase_orders
@@ -80,6 +81,7 @@ XERO_PARSERS: dict = {
     "manual_journals":      _manual_journals,
     "organisations":        _organisations,
     "overpayments":         _overpayments,
+    "payment_services":     _payment_services,
     "payments":             _payments,
     "prepayments":          _prepayments,
     "purchase_orders":      _purchase_orders,

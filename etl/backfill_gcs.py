@@ -35,6 +35,7 @@ import etl.xero.items               as items
 import etl.xero.journals            as journals
 import etl.xero.manual_journals     as manual_journals
 import etl.xero.organisations       as organisations
+import etl.xero.payment_services     as payment_services
 import etl.xero.payments            as payments
 import etl.xero.purchase_orders     as purchase_orders
 import etl.xero.quotes              as quotes
@@ -66,6 +67,7 @@ PARSERS = {
     "journals":             journals,
     "manual_journals":      manual_journals,
     "organisations":        organisations,
+    "payment_services":     payment_services,
     "payments":             payments,
     "purchase_orders":      purchase_orders,
     "quotes":               quotes,
