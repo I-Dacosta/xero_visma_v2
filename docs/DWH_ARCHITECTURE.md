@@ -508,15 +508,33 @@ Things known to be incomplete or pending external input, as of 2026-07-06:
 - The Xero `/Journals` endpoint (the general ledger — where every transaction posts) is **not yet in the bucket** for any tenant, including the three expected ones (`19b25bd5…`, `83adbd31…`, `9dc5d3f0…`). Confirmed by listing every endpoint folder per tenant.
 - Colleague confirmed journals **will** arrive eventually but the sync isn't writing them yet (access issues on their side).
 - **Do not confuse `journals` (GL) with `manual_journals` (hand-entered only)** — both are separate Xero endpoints; only `manual_journals` is currently synced.
-- **Pipeline side is fully ready** — parser (`etl/xero/journals.py`), `endpoint_config.py` (`Journals` / `JournalID`), Cloud Function routing, and `backfill_gcs.py` all wired. Payload format verified against `dw_1_bronze_xero.xero_journals`.
-- **When journals land:** run `python -m etl.backfill_gcs journals` → creates `staging_xero.journals` + `staging_xero.journal_lines`. Nothing else needed.
-- **Multi-tenant caveat:** colleague noted journals access is failing for tenants beyond the three named. Verify all expected tenants produce journals once the sync is fixed.
+- **Parser was removed 2026-07-07** under the bucket-driven policy (see below). Payload format is verified against `dw_1_bronze_xero.xero_journals` and documented in `docs/SILVER_XERO.md`. `endpoint_config.py` still carries the `Journals` / `JournalID` mapping.
+- **When journals land:** the drift detector will flag it. Restore the parser with `git show <pre-2026-07-07-commit>:etl/xero/journals.py > etl/xero/journals.py`, add it back to the PARSERS maps in `backfill_gcs.py` and `cloud_function/main.py`, then run `python -m etl.backfill_gcs journals`.
+- **Multi-tenant caveat:** colleague noted journals access is failing for tenants beyond the three named (`19b25bd5…`, `83adbd31…`, `9dc5d3f0…`). Verify all expected tenants produce journals once the sync is fixed.
+- **Keep `dw_1_bronze_xero` (or its deprecated copy) until journals are live** — it's the reference payload for rebuilding the parser.
 
-### Endpoints with parsers but no GCS data yet
-Will populate automatically when synced (parsers already exist). **12 endpoints** (verified against filesystem 2026-07-07):
-`journals`, `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
+### Parser policy — bucket-driven, not project-driven (changed 2026-07-07)
 
-Parser inventory: **28 parsers total** — 16 populated from GCS, 12 awaiting data. (`payment_services.py` added 2026-07-07 so every configured endpoint has a matching parser — no more config-only stubs.) The only bucket endpoint with no parser is `bills`, deliberately skipped (proven subset of `invoices`).
+**A parser exists only for an endpoint that is actually present in the GCS bucket.** The GCS bucket — not the old BigQuery bronze project — is the source of truth for which endpoints exist.
+
+Previously we carried 28 parsers, all ported from the frozen `dw_1_bronze_xero` project (its 29 tables). Only 16 of those endpoints are actually in the GCS bucket. The other 12 were speculative — built against a project that no longer drives the pipeline. They have been **removed** to keep the parser set honest.
+
+**Removed 2026-07-07** (were old-project-only, absent from GCS): `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `journals`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
+
+These are **preserved in git history** (commit before this change) and their payloads are documented in `docs/SILVER_XERO.md`. Rebuilding any one is a quick `git show <commit>:etl/xero/<name>.py` + re-add to the two PARSERS maps.
+
+> Note: `journals` was removed too, even though it is confirmed coming. When it lands, the drift detector (below) flags it and we restore the parser from git — no need to carry it speculatively in the meantime. Its payload is verified and documented.
+
+### Drift detection — get warned when a new endpoint appears
+
+Both entry points now compare bucket endpoints against the parser set and warn on anything unrecognised:
+
+- **`backfill_gcs.py`** — on every run, lists all bucket endpoints and logs `NEW ENDPOINT DETECTED IN BUCKET: '<x>' has no parser…` for any endpoint that has neither a parser nor a `KNOWN_UNPARSED` entry. Prints a summary banner if any are found.
+- **`cloud_function/main.py`** — per meta-file event, if the endpoint has no parser it logs `NEW ENDPOINT DETECTED: <vendor>/<endpoint> has no parser…` (unless it's in `KNOWN_UNPARSED`).
+
+`KNOWN_UNPARSED` (endpoints intentionally skipped, kept out of warnings): `bills` — proven subset of `invoices` (ACCPAY).
+
+**Current parser inventory: 16 parsers, all backed by live GCS data.** When your colleague adds or renames a sync endpoint, the next backfill run or Cloud Function event surfaces it automatically — that is the signal to build the parser from the real payload.
 
 ### Cloud Function not yet deployed
 - `cloud_function/main.py` imports from `etl.xero.*` — the `etl/` package must be bundled with the function source before deploy. Resolve packaging (copy `etl/` into the function dir, or restructure with `pyproject.toml`).

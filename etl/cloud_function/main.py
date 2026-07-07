@@ -27,32 +27,22 @@ import functions_framework
 from etl.common.gcs_reader import GCSReader
 from etl.common.bq_writer import BQWriter
 
-# Xero parsers
+# Xero parsers — one per endpoint currently present in the GCS bucket.
+# Parsers are added only when their endpoint actually appears in the bucket;
+# a new unparsed endpoint triggers a drift warning (see process_gcs_upload).
 import etl.xero.accounts            as _accounts
 import etl.xero.bank_transactions   as _bank_transactions
-import etl.xero.bank_transfers      as _bank_transfers
-import etl.xero.batch_payments      as _batch_payments
 import etl.xero.branding_themes     as _branding_themes
-import etl.xero.budgets             as _budgets
-import etl.xero.contact_groups      as _contact_groups
 import etl.xero.contacts            as _contacts
 import etl.xero.credit_notes        as _credit_notes
 import etl.xero.currencies          as _currencies
-import etl.xero.expense_claims      as _expense_claims
 import etl.xero.invoices            as _invoices
 import etl.xero.items               as _items
-import etl.xero.journals            as _journals
-import etl.xero.linked_transactions as _linked_transactions
 import etl.xero.manual_journals     as _manual_journals
 import etl.xero.organisations       as _organisations
-import etl.xero.overpayments        as _overpayments
-import etl.xero.payment_services     as _payment_services
 import etl.xero.payments            as _payments
-import etl.xero.prepayments         as _prepayments
 import etl.xero.purchase_orders     as _purchase_orders
 import etl.xero.quotes              as _quotes
-import etl.xero.receipts            as _receipts
-import etl.xero.repeating_invoices  as _repeating_invoices
 import etl.xero.tax_rates           as _tax_rates
 import etl.xero.tracking_categories as _tracking_categories
 import etl.xero.users               as _users
@@ -65,29 +55,17 @@ PROJECT     = "prj-dw-dev"
 XERO_PARSERS: dict = {
     "accounts":             _accounts,
     "bank_transactions":    _bank_transactions,
-    "bank_transfers":       _bank_transfers,
-    "batch_payments":       _batch_payments,
     "branding_themes":      _branding_themes,
-    "budgets":              _budgets,
-    "contact_groups":       _contact_groups,
     "contacts":             _contacts,
     "credit_notes":         _credit_notes,
     "currencies":           _currencies,
-    "expense_claims":       _expense_claims,
     "invoices":             _invoices,
     "items":                _items,
-    "journals":             _journals,
-    "linked_transactions":  _linked_transactions,
     "manual_journals":      _manual_journals,
     "organisations":        _organisations,
-    "overpayments":         _overpayments,
-    "payment_services":     _payment_services,
     "payments":             _payments,
-    "prepayments":          _prepayments,
     "purchase_orders":      _purchase_orders,
     "quotes":               _quotes,
-    "receipts":             _receipts,
-    "repeating_invoices":   _repeating_invoices,
     "tax_rates":            _tax_rates,
     "tracking_categories":  _tracking_categories,
     "users":                _users,
@@ -96,6 +74,11 @@ XERO_PARSERS: dict = {
 VENDOR_PARSERS: dict = {
     "xero": XERO_PARSERS,
     # "visma": VISMA_PARSERS,  # added when Visma parsers are built
+}
+
+# Bucket endpoints we knowingly do not parse (kept out of drift warnings).
+KNOWN_UNPARSED = {
+    "bills": "subset of invoices (ACCPAY) — covered by staging_xero.invoices",
 }
 
 
@@ -151,10 +134,22 @@ def process_gcs_upload(cloud_event):
 
     parser = vendor_map.get(endpoint)
     if not parser:
-        logger.warning("No parser for %s/%s", vendor, endpoint)
+        if endpoint in KNOWN_UNPARSED:
+            logger.info(
+                "Skipping known-unparsed endpoint %s/%s (%s)",
+                vendor, endpoint, KNOWN_UNPARSED[endpoint],
+            )
+        else:
+            # Drift detection: a new endpoint is landing in the bucket that we
+            # do not yet parse. Warn loudly so a parser gets built.
+            logger.warning(
+                "NEW ENDPOINT DETECTED: %s/%s has no parser (file: %s). "
+                "Build etl/xero/%s.py and add it to XERO_PARSERS.",
+                vendor, endpoint, object_name, endpoint,
+            )
         return
 
-    staging_dataset = f"dw_2_staging_{vendor}"
+    staging_dataset = f"staging_{vendor}"
     writer      = BQWriter(project=PROJECT, dataset=staging_dataset)
     batch_reader = _BatchReader(records, project=PROJECT)
 
