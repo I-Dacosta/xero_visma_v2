@@ -189,7 +189,7 @@ The Dataform silver layer work (46 `.sqlx` files in `Dataform/definitions/silver
 2. **Historical record** — shows the progression of thinking and the full API field inventory
 3. **Fallback** — if the GCS/Python approach is ever paused, the BQ streaming + Dataform path still exists
 
-`docs/SILVER_XERO.md` remains the canonical reference for Xero API payload structures, date format quirks, and entity-level notes.
+`docs/STAGING_XERO.md` remains the canonical reference for Xero API payload structures, date format quirks, and entity-level notes.
 
 ---
 
@@ -508,7 +508,7 @@ Things known to be incomplete or pending external input, as of 2026-07-06:
 - The Xero `/Journals` endpoint (the general ledger — where every transaction posts) is **not yet in the bucket** for any tenant, including the three expected ones (`19b25bd5…`, `83adbd31…`, `9dc5d3f0…`). Confirmed by listing every endpoint folder per tenant.
 - Colleague confirmed journals **will** arrive eventually but the sync isn't writing them yet (access issues on their side).
 - **Do not confuse `journals` (GL) with `manual_journals` (hand-entered only)** — both are separate Xero endpoints; only `manual_journals` is currently synced.
-- **Parser was removed 2026-07-07** under the bucket-driven policy (see below). Payload format is verified against `dw_1_bronze_xero.xero_journals` and documented in `docs/SILVER_XERO.md`. `endpoint_config.py` still carries the `Journals` / `JournalID` mapping.
+- **Parser was removed 2026-07-07** under the bucket-driven policy (see below). Payload format is verified against `dw_1_bronze_xero.xero_journals` and documented in `docs/STAGING_XERO.md`. `endpoint_config.py` still carries the `Journals` / `JournalID` mapping.
 - **When journals land:** the drift detector will flag it. Restore the parser with `git show <pre-2026-07-07-commit>:etl/xero/journals.py > etl/xero/journals.py`, add it back to the PARSERS maps in `backfill_gcs.py` and `cloud_function/main.py`, then run `python -m etl.backfill_gcs journals`.
 - **Multi-tenant caveat:** colleague noted journals access is failing for tenants beyond the three named (`19b25bd5…`, `83adbd31…`, `9dc5d3f0…`). Verify all expected tenants produce journals once the sync is fixed.
 - **Keep `dw_1_bronze_xero` (or its deprecated copy) until journals are live** — it's the reference payload for rebuilding the parser.
@@ -521,7 +521,7 @@ Previously we carried 28 parsers, all ported from the frozen `dw_1_bronze_xero` 
 
 **Removed 2026-07-07** (were old-project-only, absent from GCS): `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `journals`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
 
-These are **preserved in git history** (commit before this change) and their payloads are documented in `docs/SILVER_XERO.md`. Rebuilding any one is a quick `git show <commit>:etl/xero/<name>.py` + re-add to the two PARSERS maps.
+These are **preserved in git history** (commit before this change) and their payloads are documented in `docs/STAGING_XERO.md`. Rebuilding any one is a quick `git show <commit>:etl/xero/<name>.py` + re-add to the two PARSERS maps.
 
 > Note: `journals` was removed too, even though it is confirmed coming. When it lands, the drift detector (below) flags it and we restore the parser from git — no need to carry it speculatively in the meantime. Its payload is verified and documented.
 
@@ -565,7 +565,7 @@ Both entry points now compare bucket endpoints against the parser set and warn o
 ## What Is Preserved From Previous Work
 
 - `Dataform/definitions/silver/xero/` — all 46 `.sqlx` files kept as field-level reference. The Python parsers translate these directly: `JSON_VALUE(payload, '$.Field')` → `record.get('Field')`
-- `docs/SILVER_XERO.md` — canonical reference for all Xero payload structures, date quirks, nesting patterns, and entity-level notes. **Read this before writing any parser.**
+- `docs/STAGING_XERO.md` — canonical reference for all Xero payload structures, date quirks, nesting patterns, and entity-level notes. **Read this before writing any parser.**
 - `Dataform/definitions/gold/` — kept as reference for ODS/Data Mart design (these become Phase 2 and 3)
 
 ## Infrastructure — Provisioned (2026-06-04)

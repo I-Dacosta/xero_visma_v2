@@ -1,14 +1,20 @@
-# Xero Silver Layer — Build Notes
+# Xero Staging Layer — Payload & Field Reference
 
-_Last updated: 2026-06-03. Silver layer complete — all 46 tables built and materialised._
+_Renamed from SILVER_XERO.md on 2026-07-07 to match current naming (silver → staging)._
+
+> **Current role of this document.** The architecture moved from a Dataform "silver" layer (SQL parsing a JSON `payload` column) to a Python ETL that unpacks raw GCS JSON into the `staging_xero` BigQuery dataset. See `docs/DWH_ARCHITECTURE.md` for the current pipeline.
+>
+> This file is retained as the **canonical Xero API payload & field reference** — every endpoint's fields, nesting, date-format quirks, and array keys. The Python parsers in `etl/xero/` were written from this reference; it is also the source for rebuilding any parser removed under the bucket-driven policy. **Read this before writing or restoring a parser.**
+>
+> The sections below still describe the original Dataform silver tables (`dw_1_silver_xero`, now deprecated). Treat the SQL/table details as historical, but the **field-level payload documentation remains accurate** — the underlying Xero API shapes are unchanged.
 
 ---
 
-## Overview
+## Overview (historical — original Dataform silver layer)
 
-This document covers the design, implementation, issues encountered, and forward considerations for the `dw_1_silver_xero` Dataform layer. It is the counterpart to the existing Visma silver layer (`dw_1_silver_visma`) and mirrors its folder structure and conventions.
+This document originally covered the `dw_1_silver_xero` Dataform layer (now deprecated). It was the counterpart to the Visma silver layer (`dw_1_silver_visma`) and mirrored its folder structure.
 
-All files live under:
+Original files lived under:
 ```
 Dataform/definitions/silver/xero/
   dimentinals/   ← dimension tables

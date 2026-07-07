@@ -21,7 +21,7 @@ bronze project were removed. When a NEW endpoint appears in the bucket without a
 parser, this script warns loudly (drift detection) — that is the signal to build
 the parser then, guided by the real payload rather than the frozen old project.
 Removed parsers remain in git history and their payloads are documented in
-docs/SILVER_XERO.md, so rebuilding is a quick `git show` + backfill.
+docs/STAGING_XERO.md, so rebuilding is a quick `git show` + backfill.
 """
 
 import sys
