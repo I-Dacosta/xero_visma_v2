@@ -1,6 +1,6 @@
 # Data Warehouse Architecture
 
-_Created: 2026-06-04. Updated: 2026-07-03 — staging_xero backfilled from GCS (16 endpoints, 345k rows). Staging layer purity enforced: derivations and cross-endpoint joins removed._
+_Created: 2026-06-04. Updated: 2026-07-07 — full ODS layer design resolved (numbered scopes, Visma-vocabulary harmonization, 6 design decisions). See "ODS Layer Design". staging_xero populated from GCS; parser set is bucket-driven with drift detection._
 
 ---
 
@@ -390,18 +390,21 @@ All 20 Xero entity parsers tested against real bronze data — 20/20 passing.
 
 ---
 
-## BigQuery Dataset Structure (as of 2026-06-29)
+## BigQuery Dataset Structure
 
-### Active datasets
+_Superseded by the numbered-scope scheme below (resolved 2026-07-07). See "ODS Layer Design"._
+
+### Active datasets — staging
 
 | Dataset | Purpose |
 |---|---|
 | `staging_xero` | Parsed, typed Xero API records — one table per endpoint |
 | `staging_visma` | Parsed, typed Visma API records — one table per endpoint |
-| `ods_xero` | Xero-specific intermediate and final joins (self-contained) |
-| `ods_visma` | Visma-specific intermediate and final joins (self-contained) |
-| `ods` | Cross-provider unified tables (consumes final output from ods_xero, ods_visma) |
 | `datamart` | BI-ready, no joins — column selections and aggregations from ODS |
+
+### ODS datasets — numbered-scope scheme (see ODS Layer Design)
+
+Scopes: `ods_xero_N`, `ods_visma_N`, `ods_omnibus_N`. Number = depth within scope (`0` = bottom / native). To be created when ODS build begins. The earlier unnumbered stubs (`ods_xero`, `ods_visma`, `ods`) are superseded and can be dropped by an admin.
 
 ### Deprecated datasets (safe to delete after verification)
 All data copied to `deprecated_*` versions. Original datasets still exist in BQ but should be deleted by a GCP admin (requires `bigquery.datasets.delete` permission — do from the BQ console):
@@ -413,6 +416,71 @@ All data copied to `deprecated_*` versions. Original datasets still exist in BQ 
 | `dw_1_silver_xero` | `deprecated_dw_1_silver_xero` | 46 |
 
 Visma datasets (`dw_1_silver_visma`, `dw_1_silver_visma_global`) are **untouched**.
+
+---
+
+## ODS Layer Design (resolved 2026-07-07)
+
+Design agreed across a full decision review. This governs how staging tables are merged into the ODS. **No ODS code written yet** — this is the blueprint to build against.
+
+### Guiding principle
+
+Mirror Visma's **output** (conformed shape + vocabulary), not its intermediate join steps. Xero is document-centric; Visma is a normalized ERP — their internal merges differ, which is exactly why each provider has its own ODS scope. Providers converge only at the *edges* (what the omnibus layer consumes).
+
+### Numbered-scope layering
+
+Layers are numbered, and **the number resets within each scope**. The scope prefix carries vertical position; the number carries depth within that scope. `0` = bottom = closest to source.
+
+```
+staging_xero ─→ ods_xero_0 (native) ─→ ods_xero_1 (harmonized) ─┐
+                                                                 ├─→ ods_omnibus_0 (UNION) ─→ ods_omnibus_1 (wide) ─→ datamart
+staging_visma ─→ ods_visma_0 (native) ─→ ods_visma_1 (harmonized)┘
+```
+
+- **`ods_<provider>_0`** — native conformance in the **provider's own vocabulary**. Audit anchor: ties 1:1 to the provider's own reports/UI. Merges multiple staging tables via **joins** (header + child tables → conformed dim/fact).
+- **`ods_<provider>_1`** — harmonized to the shared vocabulary (see below). Same grain as `_0`; only the vocabulary/classification changes.
+- **`ods_omnibus_0`** — cross-provider **UNION** of each provider's `_1` output. Reads from `_1`, never `_0` (UNION only works once columns align).
+- **`ods_omnibus_1`** — wide denormalization (facts pick up dim labels + classifications) so the datamart is join-free.
+
+Rules:
+- **Every layer carries all entities.** Entities needing no transformation pass through unchanged from the layer below, so anything downstream reads one known layer and finds everything.
+- **Layer count flexes per entity and per scope.** ~2 within each provider, ~1–2 at omnibus is the current expectation; insert a `_2` anywhere later without renumbering (that's why numbering resets per scope).
+- **Cross-provider prefix is `omnibus`** — distinctive and collision-free ("group" is overloaded in this domain: Xero ContactGroups, Aquatiq Group; "all" is vague). Scales to any number of providers.
+
+### Shared vocabulary = **Visma vocabulary** (decided 2026-07-07)
+
+When harmonizing at `_1`, everything shifts to **Visma's naming conventions and vocabulary**, not a neutral invented one. Reason: the finance users who consume the warehouse are most familiar with Visma — using Visma's column names, FSLI structure, and dimension naming lets them work with the data without re-learning it.
+
+Concretely:
+- Xero `ods_xero_1` dims/facts adopt Visma's column names, `fsli_1/2/3`, `bs_pl`, and classification vocabulary.
+- Visma's `_1` is largely a re-point of its existing conformed gold (it already speaks its own vocabulary).
+- Before building `ods_xero_1`, read Visma's `dim_account` + mapping seeds to extract the exact target column names and FSLI values Xero must emit.
+
+### The six resolved design decisions
+
+| # | Decision |
+|---|---|
+| **1 — Account classification** | Native-first at `_0` (Xero `account_class`, `reporting_code` as-is). Harmonize to Visma FSLI vocabulary at `_1` via a **Xero-account → FSLI mapping seed** (Xero codes like `440-001` differ from Visma's numeric chart, so Visma's code-keyed mapping can't be reused — Xero needs its own seed mapping into the same FSLI targets). |
+| **2 — Fact grain** | Line-level for transactional facts (invoices, credit notes, bank transactions, POs, quotes, manual journals). Header-grain only where there are no lines (payments). No aggregation in ODS. |
+| **3 — Star vs wide** | Hybrid. Conformed dimension tables always exist (star backbone, for drill/ad-hoc). Facts stay lean through provider layers, then **widen at `ods_omnibus_1`** (denormalize dim labels + FSLI onto fact rows) so the datamart is a pure column-select with no joins. |
+| **4 — Journals gap** | GL (`journals`) not synced yet. Two fact families (mirroring Visma): **GL facts** and **document facts**. Build all **document facts + dims now** (Xero has the data → AR/AP/sales reporting works immediately). **Defer the GL fact as an additive family** — build `fact_general_ledger` only when real journals land; **no reconstruction** from documents (fragile, throwaway). Financial statements (P&L/BS) wait for the real GL. |
+| **5 — Cross-source reconciliation** | **Staging is faithful per-source; ODS owns reconciliation.** General pattern for any record/relationship arriving from >1 endpoint. Specific case: contact-group bridge (`contact_group_members` group-centric + `contact_group_memberships` contact-centric) reconciled in `ods_xero_0` — **parked until `contact_groups` data exists** (endpoint not synced; other source near-empty). |
+| **6 — Multi-tenant & entity** | Canonical entity = **legal entity**, resolved via an **extended `seed_entity_mapping`** (add Xero `tenant_id` → canonical entity rows to Visma's existing mapping). Resolve at `_1`; preserve native `tenant_id` at `_0` for audit. **Xero and Visma cover disjoint legal entities** — no record appears in both providers — so `ods_omnibus` UNION can never double-count. Legal-entity → company/business-unit rollup deferred (Visma has `dim_company`/`dim_business_unit`; business need unconfirmed). |
+
+### Merge mechanics summary
+
+- **Within a provider (→ `_0`):** joins. Header staging table + its child tables → one conformed dim or line-grain fact. (e.g. `contacts` + `contact_addresses` + `contact_phones` → `dim_contact`; `invoices` + `invoice_lines` → `fact_invoice_line`.)
+- **Across providers (→ `omnibus_0`):** UNIONs. Same conformed entity from each provider's `_1`, stacked. New providers just add another input to the same UNION.
+
+### Build sequence (when ODS work starts)
+
+1. Read Visma `dim_account` + mapping seeds → extract the target FSLI vocabulary and column names.
+2. `ods_xero_0.dim_account` (native) → `ods_xero_1.dim_account` (Visma vocabulary + FSLI mapping seed).
+3. `ods_xero_0/1.dim_contact` (the other universally-referenced dim).
+4. One enriched fact end-to-end: `fact_invoice_line` (exercises contact + account + tracking + tax joins).
+5. Fan out remaining dims + document facts on the established pattern.
+6. `ods_omnibus_0` UNION (Xero + Visma), then `ods_omnibus_1` wide.
+7. GL fact family — deferred until journals sync.
 
 ---
 
