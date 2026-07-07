@@ -4,6 +4,23 @@ _Created: 2026-06-04. Updated: 2026-07-07 — full ODS layer design resolved (nu
 
 ---
 
+## ▶ RESUME HERE (current status, 2026-07-07)
+
+**Done:**
+- Staging layer complete. Python ETL in `etl/` parses raw GCS JSON (`gs://aquatiq-dw-dev-storage`) into `staging_xero` (16 endpoints, ~345k rows). Bucket-driven parser set + drift detection. Reference: `docs/STAGING_XERO.md` for payload shapes.
+- Full ODS design resolved and documented below (see "ODS Layer Design"). **No ODS code written yet.**
+
+**Next step — start the ODS build (`ods_xero`):**
+1. Read Visma's `dim_account` (`Dataform/definitions/.../dim_account.sqlx` and its mapping seeds) to extract the target FSLI vocabulary + column names Xero must emit at `_1`.
+2. Build `ods_xero_0.dim_account` (native Xero vocabulary) → `ods_xero_1.dim_account` (Visma vocabulary + Xero→FSLI mapping seed).
+3. Then `dim_contact`, then `fact_invoice_line` as the first enriched fact. Full sequence in "ODS Layer Design → Build sequence".
+
+**Key locked decisions** (details in "ODS Layer Design"): numbered scopes `ods_xero_N` / `ods_visma_N` / `ods_omnibus_N` (number resets per scope, `0` = native); harmonize to **Visma vocabulary** at `_1`; line-grain facts; GL deferred until `journals` syncs (no reconstruction); providers are entity-disjoint (clean omnibus UNION).
+
+**Environment notes:** local Python is `/opt/homebrew/bin/python3.13`; GCP auth via ADC often needs `gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform`; BQ project `prj-dw-dev`, region `europe-north2`.
+
+---
+
 ## Background & Why We Changed Direction
 
 The original approach streamed Xero API responses directly into BigQuery tables using a generic envelope schema (`tenant_id`, `record_id`, `payload` STRING, timestamps). Dataform SQL then parsed the JSON payload column using `JSON_VALUE()` calls to produce a "silver" layer.
