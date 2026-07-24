@@ -1,7 +1,7 @@
 """
 Cloud Function — GCS meta file trigger.
 
-Triggered when a .meta.json file is written to gs://aquatiq-dw-dev-storage.
+Triggered when a .meta.json file is written to gs://prj-dw-dev-raw.
 Data file writes are ignored (filtered by the .meta.json suffix check).
 
 Path format:
@@ -32,40 +32,53 @@ from etl.common.bq_writer import BQWriter
 # a new unparsed endpoint triggers a drift warning (see process_gcs_upload).
 import etl.xero.accounts            as _accounts
 import etl.xero.bank_transactions   as _bank_transactions
+import etl.xero.bank_transfers      as _bank_transfers
 import etl.xero.branding_themes     as _branding_themes
 import etl.xero.contacts            as _contacts
 import etl.xero.credit_notes        as _credit_notes
 import etl.xero.currencies          as _currencies
 import etl.xero.invoices            as _invoices
 import etl.xero.items               as _items
+import etl.xero.journals            as _journals
 import etl.xero.manual_journals     as _manual_journals
 import etl.xero.organisations       as _organisations
+import etl.xero.overpayments        as _overpayments
 import etl.xero.payments            as _payments
 import etl.xero.purchase_orders     as _purchase_orders
 import etl.xero.quotes              as _quotes
+import etl.xero.reports             as _reports
 import etl.xero.tax_rates           as _tax_rates
 import etl.xero.tracking_categories as _tracking_categories
 import etl.xero.users               as _users
 
 logger = logging.getLogger(__name__)
 
-GCS_BUCKET = "aquatiq-dw-dev-storage"
+GCS_BUCKET = "prj-dw-dev-raw"
 PROJECT     = "prj-dw-dev"
 
 XERO_PARSERS: dict = {
     "accounts":             _accounts,
     "bank_transactions":    _bank_transactions,
+    "bank_transfers":       _bank_transfers,
     "branding_themes":      _branding_themes,
     "contacts":             _contacts,
     "credit_notes":         _credit_notes,
     "currencies":           _currencies,
     "invoices":             _invoices,
     "items":                _items,
+    "journals":             _journals,
     "manual_journals":      _manual_journals,
     "organisations":        _organisations,
+    "overpayments":         _overpayments,
     "payments":             _payments,
     "purchase_orders":      _purchase_orders,
     "quotes":               _quotes,
+    "report_balance_sheet":      _reports,
+    "report_bank_summary":       _reports,
+    "report_budget_summary":     _reports,
+    "report_executive_summary": _reports,
+    "report_profit_and_loss":    _reports,
+    "report_trial_balance":      _reports,
     "tax_rates":            _tax_rates,
     "tracking_categories":  _tracking_categories,
     "users":                _users,

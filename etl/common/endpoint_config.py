@@ -38,6 +38,13 @@ ARRAY_KEYS: dict[str, str] = {
     "quotes":               "Quotes",
     "receipts":             "Receipts",
     "repeating_invoices":   "RepeatingInvoices",
+    # Reports API — all report kinds share the same "Reports" wrapper key.
+    "report_balance_sheet":      "Reports",
+    "report_bank_summary":       "Reports",
+    "report_budget_summary":     "Reports",
+    "report_executive_summary": "Reports",
+    "report_profit_and_loss":    "Reports",
+    "report_trial_balance":      "Reports",
     "tax_rates":            "TaxRates",
     "tracking_categories":  "TrackingCategories",
     "users":                "Users",
@@ -69,6 +76,16 @@ RECORD_ID_FIELDS: dict[str, str] = {
     "quotes":               "QuoteID",
     "receipts":             "ReceiptID",
     "repeating_invoices":   "RepeatingInvoiceID",
+    # ReportID is a per-report-KIND constant (e.g. "ProfitAndLoss"), NOT unique
+    # per snapshot/run — only used here to satisfy _extract_records' non-empty
+    # check. The parser (etl/xero/reports.py) derives real snapshot identity
+    # from the meta sidecar (x-run-id, x-report-from/to), not this field.
+    "report_balance_sheet":      "ReportID",
+    "report_bank_summary":       "ReportID",
+    "report_budget_summary":     "ReportID",
+    "report_executive_summary": "ReportID",
+    "report_profit_and_loss":    "ReportID",
+    "report_trial_balance":      "ReportID",
     "tax_rates":            "TaxType",        # tax_rates use TaxType as the natural key
     "tracking_categories":  "TrackingCategoryID",
     "users":                "UserID",

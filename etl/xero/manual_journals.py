@@ -6,7 +6,15 @@ Writes to:    dw_2_staging_xero.manual_journals        (header)
               dw_2_staging_xero.manual_journal_lines   (JournalLines[])
 
 Note: Manual journal lines use Tracking[] (not TrackingCategories[]).
-      Lines have no LineItemID — grain is (tenant_id, record_id, account_id).
+      Lines have no LineItemID. A single journal CAN have multiple lines
+      against the same account (confirmed 2026-07-24 against live data — a
+      real journal splits a stock adjustment into two separate postings to
+      the same account, different amounts) — (tenant_id, record_id,
+      account_id) is NOT a valid key; it silently collapsed/duplicated such
+      journals. Grain is (tenant_id, record_id, line_position), where
+      line_position is this line's 0-based index in Xero's own JournalLines[]
+      array (the only stable-enough identifier available, since there's no
+      native LineItemID).
       IsBlank=True lines are filtered out.
 """
 
@@ -56,6 +64,7 @@ def parse_lines(record: dict) -> list[dict]:
     tenant_id = record["tenant_id"]
     record_id = record["record_id"]
     result    = []
+    line_position = 0
     for line in p.get("JournalLines") or []:
         if line.get("IsBlank"):
             continue
@@ -64,6 +73,7 @@ def parse_lines(record: dict) -> list[dict]:
             "tenant_id":                tenant_id,
             "record_id":                record_id,
             "manual_journal_id":        p.get("ManualJournalID"),
+            "line_position":            line_position,
             "account_id":               line.get("AccountID"),
             "account_code":             line.get("AccountCode"),
             "description":              line.get("Description"),
@@ -80,6 +90,7 @@ def parse_lines(record: dict) -> list[dict]:
             "tracking_option_2_id":     _t(tracking, 1, "TrackingOptionID"),
             "tracking_option_2_name":   _t(tracking, 1, "Option"),
         })
+        line_position += 1
     return result
 
 
@@ -92,6 +103,6 @@ def run(reader: BQReader, writer: BQWriter,
     writer.merge(HEADER_TABLE, headers)
     if lines:
         writer.merge(LINE_TABLE, lines,
-                     key_columns=("tenant_id", "record_id", "account_id"))
+                     key_columns=("tenant_id", "record_id", "line_position"))
     logger.info("manual_journals: %d headers, %d lines", len(headers), len(lines))
     return {"headers": len(headers), "lines": len(lines)}

@@ -24,6 +24,13 @@ def parse_header(record):
         "registration_number": p.get("RegistrationNumber"),
         "is_demo_company": p.get("IsDemoCompany"),
         "created_at": parse_xero_datetime(p.get("CreatedDateUTC")),
+        # Needed to bound Trial Balance's "YTD Debit/Credit" columns, which
+        # reset at fiscal year start, not calendar/all-time (verified
+        # 2026-07-24 against real GL reconciliation — some accounts matched
+        # our all-time balance exactly, others diverged by exactly their
+        # pre-current-fiscal-year accumulation).
+        "financial_year_end_day":   p.get("FinancialYearEndDay"),
+        "financial_year_end_month": p.get("FinancialYearEndMonth"),
     }
 
 def run(reader, writer, tenant_id=None, limit=None):

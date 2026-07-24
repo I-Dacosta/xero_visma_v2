@@ -1,7 +1,7 @@
 """
 Tests for etl/common/gcs_reader.py
 
-Reads real files from gs://aquatiq-dw-dev-storage.
+Reads real files from gs://prj-dw-dev-raw.
 Run with:
     python etl/tests/test_gcs_reader.py
 """
@@ -16,7 +16,7 @@ from google.cloud import storage
 from etl.common.gcs_reader import GCSReader, _parse_synced_at
 from etl.common.endpoint_config import ARRAY_KEYS, RECORD_ID_FIELDS
 
-BUCKET  = "aquatiq-dw-dev-storage"
+BUCKET  = "prj-dw-dev-raw"
 PROJECT = "prj-dw-dev"
 
 reader = GCSReader(bucket=BUCKET, project=PROJECT)

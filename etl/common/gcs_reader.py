@@ -14,7 +14,7 @@ PascalCase-keyed array of records (e.g. "Accounts": [...], "Invoices": [...]).
 Usage (Cloud Function — single meta file event):
     from etl.common.gcs_reader import GCSReader
 
-    reader = GCSReader(bucket="aquatiq-dw-dev-storage")
+    reader = GCSReader(bucket="prj-dw-dev-raw")
     for record in reader.iter_records_from_meta("raw/xero/.../accounts/2026-06-18/file.json.meta.json"):
         # record["tenant_id"], record["record_id"], record["payload"], record["synced_at"]
         ...
@@ -37,6 +37,7 @@ Interface contract:
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Iterator
 
@@ -85,7 +86,7 @@ class GCSReader:
         tenant_id = meta["x-tenant-id"]
         synced_at = _parse_synced_at(meta["x-synced-at"])
 
-        yield from self._extract_records(data, endpoint, tenant_id, synced_at)
+        yield from self._extract_records(data, endpoint, tenant_id, synced_at, meta)
 
     # ------------------------------------------------------------------
     # Batch / replay interface: iterate all files for an endpoint + date
@@ -97,6 +98,7 @@ class GCSReader:
         endpoint: str,
         tenant_id: str | None = None,
         date: str | None = None,
+        max_workers: int = 16,
     ) -> Iterator[dict]:
         """
         Iterate all records for a vendor/endpoint, optionally filtered by
@@ -108,6 +110,15 @@ class GCSReader:
         clean list prefix is only possible when tenant_id is known. When it is
         not, we list the whole vendor tree and match endpoint (and optionally
         date) via the parsed path.
+
+        Concurrency (2026-07-24): matched files are fetched (meta + data, two
+        GETs each) on a thread pool. A single tenant/endpoint history can be
+        thousands of files with years of accumulated incremental syncs — fetching
+        them one at a time serially was the actual bottleneck behind an overnight
+        backfill stalling for hours on just a handful of large tenants, even
+        after parallelizing across (tenant, endpoint) jobs one level up in
+        backfill_gcs.py. Listing itself stays a single sequential pass first
+        (cheap — no downloads); only the per-file fetch+parse is parallelized.
         """
         if tenant_id:
             # Tightest possible prefix: raw/{vendor}/{tenant_id}/2.0/{endpoint}/[{date}/]
@@ -119,6 +130,7 @@ class GCSReader:
             # vendor tree and filter each blob by parsed path.
             prefix = f"raw/{vendor}/"
 
+        meta_paths = []
         for blob in self._client.list_blobs(self.bucket_name, prefix=prefix):
             if not blob.name.endswith(".meta.json"):
                 continue
@@ -129,10 +141,27 @@ class GCSReader:
                 continue
             if date and m.group("date") != date:
                 continue
-            try:
-                yield from self.iter_records_from_meta(blob.name)
-            except Exception as e:
-                logger.error("Failed processing %s: %s", blob.name, e)
+            meta_paths.append(blob.name)
+
+        if not meta_paths:
+            return
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(self._fetch_records, p) for p in meta_paths]
+            for future in as_completed(futures):
+                yield from future.result()
+
+    def _fetch_records(self, meta_path: str) -> list[dict]:
+        """
+        Fetch + parse one meta/data file pair. Returns a materialised list
+        (not a generator) so results cross thread boundaries cleanly via
+        Future.result().
+        """
+        try:
+            return list(self.iter_records_from_meta(meta_path))
+        except Exception as e:
+            logger.error("Failed processing %s: %s", meta_path, e)
+            return []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -152,6 +181,7 @@ class GCSReader:
         endpoint: str,
         tenant_id: str,
         synced_at: datetime,
+        meta: dict | None = None,
     ) -> Iterator[dict]:
         array_key = ARRAY_KEYS.get(endpoint)
         if not array_key:
@@ -181,6 +211,11 @@ class GCSReader:
                 "first_seen_at": synced_at,  # best approximation; not tracked per-record in GCS
                 "last_seen_at":  synced_at,
                 "synced_at":     synced_at,
+                # Full sync-context sidecar (x-run-id, x-report-from/to, etc.).
+                # Additive/optional — existing parsers ignore it. Needed by
+                # parsers whose identity/params live only in the meta file,
+                # not the payload (e.g. report snapshots — see etl/xero/reports.py).
+                "meta":          meta or {},
             }
 
 
