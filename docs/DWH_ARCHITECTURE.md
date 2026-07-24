@@ -1,21 +1,231 @@
 # Data Warehouse Architecture
 
-_Created: 2026-06-04. Updated: 2026-07-07 — full ODS layer design resolved (numbered scopes, Visma-vocabulary harmonization, 6 design decisions). See "ODS Layer Design". staging_xero populated from GCS; parser set is bucket-driven with drift detection._
+_Created: 2026-06-04. Updated: 2026-07-24 (yet later still, again, once more, still) — **Investigated how `journals` is actually synced (colleague raised: no date-range filter on `/Journals`) — confirmed a hybrid strategy, not a full pull every time.** Checked the GCS sync metadata (`x-sync-type`) across all 7 tenants' full history: frequent (~every 4 hours) `incremental` runs fetch only newly-created journals via an offset/cursor (small counts, often single digits or 0) — consistent with Xero's actual `/Journals` API design, which paginates by an ever-increasing `offset`/JournalNumber rather than `If-Modified-Since`, because journals are an append-only immutable ledger (never edited once posted), unlike mutable objects like invoices. Interspersed with these, at a roughly-every-several-days cadence (observed gaps of 4-8 days per tenant), are `master`/`rolling-full` runs that **do** re-download the tenant's *entire* journal history from scratch every time (e.g. one tenant: 2,718 records on 07-08, 2,769 on both 07-16 and 07-20 — a full re-fetch, not incremental). **This matters for confidence in this session's reconciliation findings, not just as a sync-mechanics detail**: because the periodic full re-pull genuinely re-downloads everything Xero's `/Journals` currently returns, it rules out "we just haven't synced back far enough" as an explanation for any of the gaps found so far — strengthening (not just "not contradicting") the conclusion that (a) the Balance Sheet conversion-balance gap is a genuine, permanent Xero-side exclusion (conversion balances are structurally never assigned a JournalNumber, most likely entered via a distinct one-time setup mechanism outside the normal ledger flow — a full re-pull would have surfaced them by now if they existed in `/Journals` at all), and (b) the `d08f38af`/`dcb20a20` document-vs-GL outliers from check 4 are genuine content differences (e.g. an invoice's account re-coded after its journal already posted — journals are immutable, so a later edit on the document side simply can't retroactively appear there) rather than a sync-completeness artifact. Updated 2026-07-24 (yet later still, again, once more) — **Check 4 built: document-fact bottom-up reconciliation (`ods_xero_1.recon_document_facts`).** Compares every Xero document fact against `fact_general_ledger`, all-time, at tenant+account+document_type grain — 14 document_types covered (the ones mapped in the earlier source_type exercise). Two things had to be discovered empirically before it worked: (1) **a sign convention per document_type** (not universal — e.g. `ACCPAY` needs no flip, `ACCREC` needs one, and each "credit" type flips the OPPOSITE way from its regular counterpart, since a credit note reverses the original entry's debit/credit direction — all verified against real data, not assumed); (2) **DELETED/VOIDED documents must be excluded from the document-fact side** — a voided invoice still carries its original amount in the `/Invoices` response, but Xero's GL never posted it (or reversed it), so counting it overstates the document side only; this alone dropped one tenant's `ACCREC` residual from 25% to 0%. Also confirmed empirically that transfer/overpayment-linked `bank_transactions` rows (`transaction_type` `SPEND-TRANSFER`/`RECEIVE-TRANSFER`/`SPEND-OVERPAYMENT`/`RECEIVE-OVERPAYMENT`) never independently post to GL under any source_type (0 matches tested) — so `fact_bank_transaction_line`'s CASHPAID/CASHREC bucket is filtered to `document_type IN ('SPEND','RECEIVE')` only, or it would double-count. **Result, on rows where both sides have data:** `MANJOURNAL`/`CASHREC`/`CASHPAID`/`APCREDITPAYMENT` all match to within ~0.5%; `ACCPAYCREDIT`/`TRANSFER`/`ACCRECCREDIT`/`APOVERPAYMENT`/`ACCRECPAYMENT`/`ACCREC` all within ~2-10% excluding one known-outlier tenant; `ACCPAY`/`ACCPAYPAYMENT` have a genuine, larger, tenant-concentrated residual (one tenant, `d08f38af`, at ~82-84%; investigated but not fully root-caused — looks like a document-vs-journal account-allocation mismatch, not a pipeline bug). **A second, expected finding, same shape as the Trial Balance BS gap**: every document type has a large "GL-only" bucket — the AR/AP control-account side of each double entry, which document-fact LINE ITEMS never carry (they represent the revenue/expense/bank side only) — tens of millions of dollars per type, structural, not a defect. Updated 2026-07-24 (yet later still, again) — **Restored `bank_transfers`/`overpayments` parsers to close the last 2 check-4 mapping gaps, and fixed a real concurrency bug in `bq_writer.py` along the way.** Both endpoints were removed 2026-07-07 under the bucket-driven policy (bronze was empty then) and are now confirmed present in `prj-dw-dev-raw` with real data. Restored `etl/xero/bank_transfers.py` and `etl/xero/overpayments.py` from git history, verified against live payloads (added a few missing fields; added `LineItems[]` unpacking to overpayments — the account grain a GL reconciliation needs), registered both in `backfill_gcs.py`/`cloud_function/main.py`, backfilled all 7 tenants (113 bank transfers, 91 overpayments/234 lines — clean grain), and built `ods_xero_0/1.fact_bank_transfer` + `fact_overpayment_line` (with the same tax-basis normalization + reconciliation-assertion pattern as every other document fact; assertion passes). Verified: `journals.source_type='TRANSFER'` now matches `fact_bank_transfer` 113/116; `APOVERPAYMENT`/`AROVERPAYMENT` match `fact_overpayment_line`'s parent 72/72 and 19/19. **Found a genuine concurrency bug in `bq_writer.py` while restoring**: for a brand-new table, `existing_schema = self._get_schema(target)` was read *before* acquiring the per-table lock, so two tenants' first-ever writes could both see "table doesn't exist," each autodetect their own schema, and the second one's MERGE then fails against whichever table the first one just created — moved the schema read inside the lock. Separately hit (again) the schema-autodetect trap on a `reference` field that's sometimes a numeric-looking string per-tenant — BigQuery's `autodetect` infers INTEGER even from an explicitly-`str()`-cast Python value if the string content is all-digits, so the fix had to be pre-creating the table with an explicit schema, not a Python-level cast (cast added anyway, for defense in depth). Updated 2026-07-24 (yet later still) — **GL checks continued: P&L reconciliation built, near-perfect match (94% exact, remainder immaterial).** Built `ods_xero_1.recon_profit_and_loss` vs. `report_profit_and_loss`. Discovered this report is period-bounded (`report_from`/`report_to` — empirically always "1st of current month → sync day", i.e. Xero's default month-to-date window), not fiscal-year YTD like Trial Balance. Hit a genuine sign-convention gotcha: Xero's P&L displays both revenue and expense as unsigned/positive "management report" style amounts, while our GL `amount` is signed double-entry — verified empirically that EXPENSE accounts match with no sign flip (64/64) and REVENUE accounts match only when negated (16/16), both 100%. Final result (scoped to `bs_pl='P&L'` accounts): **80/85 (94%) exact match, 0 mismatches**; the other 5 are small/near-zero EXPENSE amounts present in our GL for the period but simply not shown as rows in Xero's report (plausibly suppressed as immaterial) — not a reconciliation failure. This strongly confirms the Trial Balance finding: our GL is fully reliable within its synced window: the only real gap is BS accounts' pre-window conversion balances. Updated 2026-07-24 (yet later) — **GL checks: `fact_general_ledger` built + Trial Balance reconciliation run, first real finding.** Built `ods_xero_0/1.fact_general_ledger` (native GL fact, one row per `tenant_id+journal_id+journal_line_id`; `net_amount` balances 100% on 70,590/70,590 journals) plus `assert_fact_general_ledger_balances`. Added `financial_year_end_day/month` to `organisations.py`/`dim_organisation` (needed to bound Xero's Trial Balance YTD columns, which reset per-tenant fiscal year — tenants have MIXED fiscal years, 2 use June 30, rest Dec 31). Built `ods_xero_1.recon_trial_balance` (diagnostic): **253/429 (59%) accounts match Xero's own report exactly.** Splitting by account type shows a clean, explainable pattern — P&L accounts match 222/227 (98%), Balance Sheet accounts match only 31/202 (15%). Root cause: BS accounts carry a cumulative balance from company inception, including each org's one-time Xero conversion/opening-balance entry, which is not exposed via the regular `/Journals` feed under any observed `source_type`. P&L accounts reset every fiscal year so `/Journals` alone is complete for them — hence the near-perfect match. Also surfaced 4 previously-undocumented `journals.source_type` values (`TRANSFER`, `AROVERPAYMENT`, `APCREDITPAYMENT`, `ARCREDITPAYMENT`) relevant to the planned document-fact reconciliation check. Conclusion: `recon_trial_balance` stays a diagnostic for BS accounts (structural source-data gap, not fixable in our code); the P&L portion is solid enough to become a real assertion. Updated 2026-07-24 (later still) — **Full ODS rebuild + a real correctness bug found and fixed**: rebuilding `ods_xero_0/1` against the fully-backfilled staging (7 tenants) surfaced 342/1,882 manual journals unbalanced — a genuine bug in `etl/xero/manual_journals.py`'s merge key (`account_id` alone isn't unique within a journal; a real journal can post two separate lines to the same account). Fixed the key (`line_position`, the line's index in Xero's own array), rebuilt staging, now 1/1,882 unbalanced (the same single pre-existing anomaly known since this fact was first built). Also found 2/1,193 quotes with genuine tiny source inconsistencies (stale totals on already-invoiced quotes) — converted that assertion to a tolerant count-threshold, mirroring the manual-journal pattern. All 36 ODS tables rebuilt, 78 assertions pass, 0 failures. Updated 2026-07-24 (earlier) — **Xero Reports API parser built**: one shared Python module (`etl/xero/reports.py`) across all 6 report kinds (balance sheet, bank/budget/executive summary, P&L, trial balance), landing `staging_xero.report_snapshots` + `report_rows` (long-form, one row per cell). Snapshot/append-only pattern, not upsert — a genuinely new staging convention. Verified: 360 snapshots, 32,200 rows, all grain-clean, real `account_id` UUIDs present in cell attributes (the reconciliation join hook). Updated 2026-07-24 — **`backfill_gcs.py` two-stage performance fix**: cross-job concurrency (tenant-scoped `ThreadPoolExecutor`) plus within-job concurrency (parallel file fetch inside `GCSReader`) plus a per-table BigQuery merge lock. Proven on the endpoint that stalled the overnight run (`purchase_orders`, one tenant alone = 55,099 records): 41s vs. never finishing after hours. **Full 17-endpoint × 7-tenant backfill complete: 119/119 jobs, 0 failures, 327s total — all 17 staging tables populated, grain and GL balance (100% on `net_amount`) verified.** Updated 2026-07-23 — **GCS source bucket switched**: the live sync moved (back) to `gs://prj-dw-dev-raw`; the old `gs://aquatiq-dw-dev-storage` is frozen (dead since 2026-07-08). All 7 Xero tenants now have journals (GL) — a new 7th tenant also appeared. Updated 2026-07-09 — journals first restored for 3/6 tenants (see superseded section below). Updated 2026-07-07 — ODS build started: `ods_xero_0/1.dim_account` written (native → Visma vocabulary), no hand-authored FSLI seed (ship Xero metadata, let accountants define the crosswalk). Full ODS design resolved earlier same day (numbered scopes, Visma-vocabulary harmonization, 6 design decisions). staging_xero populated from GCS; parser set is bucket-driven with drift detection._
 
 ---
 
-## ▶ RESUME HERE (current status, 2026-07-07)
+## ▶ RESUME HERE (current status, 2026-07-24)
+
+**Latest — GCS bucket switch discovered & handled; journals now complete for all 7 tenants:**
+
+- **Bucket switch found by direct investigation, not announced.** Colleague said "3 more tenants have journals" (matching the 2026-07-09 update below), but checking the bucket we'd been reading from (`aquatiq-dw-dev-storage`) showed **zero change since 2026-07-08** — nothing written since, for any tenant or endpoint. Broadened the search: a second bucket, **`gs://prj-dw-dev-raw`** (the *original* pre-2026-06-29 bucket name, previously abandoned in favor of `aquatiq-dw-dev-storage`), is where the sync is now actually landing — actively growing, ~54k blobs vs. ~7.3k in the old one, most recent files from today.
+- **New tenant discovered:** `dcb20a20-7e7b-4017-a737-ceab3896d790` ("Aqua Pharma Inc") — did not exist in any prior sync. **7 tenants total now**, not 6.
+- **34 endpoint types per tenant now** (up from 17-28), including **6 brand-new Xero Reports API endpoints** not seen before: `report_balance_sheet`, `report_profit_and_loss`, `report_trial_balance`, `report_executive_summary`, `report_bank_summary`, `report_budget_summary`. These are Xero's own pre-built financial statements — worth investigating for the dashboard goal since they may shortcut some of the FSLI/GL enrichment work. No parsers built yet.
+- File format is identical (`raw/{vendor}/{tenant}/2.0/{endpoint}/{date}/...`, same meta.json schema) — confirmed byte-for-byte compatible with the existing `GCSReader`, so this was a **repoint, not a rebuild**.
+- **Pipeline repointed to `prj-dw-dev-raw`**: updated the bucket constant in `etl/backfill_gcs.py`, `etl/cloud_function/main.py`, `etl/common/gcs_reader.py` (docstring), `etl/tests/test_gcs_reader.py`. No other code changes.
+- **Journals re-backfilled from the new bucket (targeted run, ~12 min):** `staging_xero.journals` now **73,401 rows** (deduped from 190,427 raw — a strong real-world proof of the writer dedup fix, at a much heavier overlap ratio than the quotes/PO case), `staging_xero.journal_lines` **226,687 rows**. Grain clean (0 dupes, 0 orphans, 0 null line IDs). **All 7 tenants covered**, with real multi-year history — as far back as **2017** for one tenant, not just the last few weeks.
+- **GL balance finding reconfirmed at ~80x the earlier scale**: `net_amount` balances to zero per journal for **70,559 / 70,559 (100%)**; `gross_amount` only for 65%. Same rule as before (documented in "Xero tax basis" / `STAGING_XERO.md`), now proven far more robustly.
+- **Data-quality footnote (not investigated further):** tenant `dcb20a20…` has journals dated as far forward as **2027-09-30** — plausibly forward-dated fiscal-year-end entries, not necessarily an error, but worth a look before relying on max-date logic for that tenant.
+
+**⚠ `backfill_gcs.py` performance — two-stage fix (2026-07-23 night → 2026-07-24 morning). First fix was necessary but not sufficient; a second, deeper bottleneck stalled the overnight run again. Both are now fixed and proven.**
+
+*Stage 1 — cross-job concurrency + tenant scoping (night of 2026-07-23):*
+- Root cause of the first 2h18m stall: `GCSReader.iter_records()` with no `tenant_id` scans the *entire* bucket per endpoint call, and the old script ran fully serially — one endpoint at a time, one file download at a time.
+- Rewrote the orchestration (`etl/backfill_gcs.py`): work split into independent `(tenant, endpoint)` jobs — 7 tenants × 17 endpoints = 119 jobs — run on a `ThreadPoolExecutor` (default 8 workers, `--workers=N`). Each job uses `GCSReader`'s tight per-tenant prefix. Each worker thread gets its own `GCSReader`/`BQWriter` via thread-local storage (BQ/GCS clients aren't guaranteed thread-safe).
+- Smoke-tested (`currencies`, all 7 tenants: 56s vs. never finishing before) and launched the full 17-endpoint backfill overnight.
+
+*Stage 2 — it stalled again, for a different reason, ~7 hours in:*
+- **Symptom:** the log file showed `0 ok, 0 fail` for hours — looked like a fresh hang. First had to rule out a red herring: Python fully-buffers stdout when redirected to a file (unlike a terminal), so the log can sit empty for a long time even while real work happens. Confirmed via direct BigQuery checks (`MAX(synced_at)` on staging tables, bypassing the log entirely) that the process **had** made real progress, then genuinely stopped — ground truth showed zero new writes for ~3 hours despite the process still being alive at ~0% CPU.
+- **Real root cause:** Stage 1 only parallelized *across* `(tenant, endpoint)` jobs — each individual job still downloaded its own files **one at a time**. Job submission is endpoint-major (all 7 tenants of `accounts`, then all 7 of `bank_transactions`, etc.), so once a few of the 8 worker threads landed on a tenant with a huge file history (`purchase_orders` for one tenant alone turned out to have **55,099 records**), those threads were tied up for hours each — starving the rest of the queue (`quotes`, `tax_rates`, `tracking_categories`, `users` never even started).
+- **Also surfaced:** a genuine BigQuery race — two tenants merging into the *same* target table at once can get `"Could not serialize access to table ... due to concurrent update"` instead of queuing (hit once, on `accounts/d08f38af`). Not a data-integrity issue (MERGE is atomic; the rejected job just didn't commit), but needed a real fix.
+- **Fix 1 — within-job concurrency** (`etl/common/gcs_reader.py`): `iter_records()` now lists matching files (cheap, one pass) and fetches them on an internal thread pool (`max_workers=16`) instead of sequentially. `iter_records_from_meta()` (the Cloud Function's single-event path) is unchanged.
+- **Fix 2 — per-table merge lock** (`etl/common/bq_writer.py`): `BQWriter` now holds a class-level `dict[table_name, threading.Lock]` shared across every instance/thread in the process, so concurrent merges into the *same* table serialize (eliminating the race) while merges into *different* tables stay fully parallel.
+- **Proof:** killed the stalled process (no data lost — 83/119 jobs had already committed via atomic MERGE) and re-ran `purchase_orders` alone, all 7 tenants, **including the 55,099-record tenant** — completed in **41 seconds**, versus never finishing after hours before. Verified grain: 964 purchase orders = 964 distinct, 2,138 lines = 2,138 distinct — correctly deduplicated, not just fast.
+- **Final result: complete.** Full 17-endpoint × 7-tenant backfill (119 jobs) finished in **327 seconds (~5.5 min)** — **119 ok, 0 failed**. `journals/9dc5d3f0` (the one that threw `BrokenPipeError` before) and `accounts/d08f38af` (the one that hit the concurrent-update race) both succeeded cleanly this time. All 17 staging tables now populated; grain verified clean (n = distinct count) on `journals`, `journal_lines`, `quotes`, `quote_lines`, `purchase_orders`, `purchase_order_lines`, `invoices`, `accounts`. GL balance re-confirmed at the fuller dataset: **70,590 / 70,590 (100%)** on `net_amount`, 46,023 (65%) on `gross_amount` — same rule, now proven end-to-end on the complete backfill. Tenant coverage below 7 on a few tables (`quotes`=3, `purchase_orders`=5, `bank_transactions`=6, `items`=6, `tracking_categories`=6) is genuine sparsity — those tenants have zero source records for that endpoint (confirmed via `{'records': 0}` in the run log), not missed jobs.
+
+**Follow-up (2026-07-24): orphaned `_tmp_*` tables found in `staging_xero` — cleaned up + hardened.**
+- Found 4 leftover `_tmp_{table}_{run_id}` tables sitting directly in `staging_xero` (`_tmp_journal_lines_f8ebb4d0307b`, `_tmp_payments_298cb794861f`, `_tmp_purchase_orders_5a414e837849`, `_tmp_purchase_orders_6e8145930d98`) — these are `BQWriter.merge()`'s own temp-table-then-MERGE working files, which should always self-delete in a `finally` block.
+- **Root cause:** cross-referencing BigQuery's job history, all 4 had a successful `LOAD` followed by a successful `MERGE` into the real target — the data landed correctly. The `_drop_temp()` cleanup call itself failed afterward (plausibly transient, under the heavy concurrent load of the stalled Stage 1 run) and was silently swallowed — `_drop_temp` catches all exceptions and only logs a warning, with no retry. All 4 dated from the stalled run, before the concurrency fixes; the successful 327s re-run left zero orphans.
+- **Also found:** the code's own comment claiming orphaned temp tables "will expire anyway" was false — checked, all 4 had `expires=None`. No TTL was ever actually set.
+- **Fix:** `BQWriter._write_temp()` now sets a 1-hour `expires` TTL on every temp table immediately after creation (`etl/common/bq_writer.py._set_temp_expiration`). Verified directly (wrote a real temp table, confirmed `expires` populated ~1hr out). Belt-and-suspenders with the normal `_drop_temp()` path — if cleanup is ever skipped again (killed process, transient failure), the table now self-expires within an hour instead of lingering indefinitely. All 6 `test_bq_writer.py` tests still pass.
+- **Cleanup done:** all 4 orphaned tables deleted; `staging_xero` now contains only real staging tables.
+
+**Xero Reports API — parser built (2026-07-24).** Design discussion: should `report_*` endpoints live in `ods_xero_0` at all, given they're pre-aggregated (not transactional)? Resolved yes — `_0` is explicitly the "audit anchor, ties 1:1 to the provider's own reports/UI," and these literally *are* Xero's own reports. Better still, this exact problem was already solved once: the deprecated silver layer's `fact_report_row.sqlx` (see `docs/deprecated/`) modeled Xero's report tree as a generic long-form fact. Verified the live payload shape still matches it exactly (`Reports[] → Rows[]` with RowType Header/Section/Row, each cell carrying `{Value, Attributes:[{Id, Value}]}` — e.g. `{"Id":"account","Value":"<account-guid>"}`, which is the reconciliation join key back to `dim_account`).
+- **First, checked for the old design's other 2 report kinds** (`aged_receivables_by_contact`, `aged_payables_by_contact`) — confirmed via full endpoint listing across all 7 tenants that neither exists in the bucket under any name. Scope is the 6 that actually exist, not the old file's 8.
+- **Confirmed all 6 report kinds share identical structure** (spot-checked each): `ReportID`/`ReportType` are fixed per-kind constants (e.g. `"ProfitAndLoss"`), **not unique per run** — cannot serve as a snapshot key. Report params live only in the `.meta.json` sidecar (`x-report-params`, e.g. `"fromDate=2026-07-01&toDate=2026-07-09"` or `"date=2026-07-09"`), never in the payload (`Fields` is empty on every kind observed).
+- **Built one shared parser** (`etl/xero/reports.py`), registered under all 6 endpoint names in `backfill_gcs.py` / `cloud_function/main.py` — same module, report kind read from `meta["x-report"]`, not hardcoded per file.
+- **Enabling change**: `GCSReader._extract_records()` now passes through the full parsed `.meta.json` dict as `record["meta"]` (additive — every existing parser ignores the new key). Needed because report snapshot identity/params live only in the sidecar.
+- **⚠ New staging convention: snapshots, not entities.** Every other Xero parser upserts on `(tenant_id, record_id)` — one current row per entity. Reports have no such identity; re-running the same report for the same window is a new independent observation, not an update. `record_id` is synthesized as `f"{report}|{run_id}"` (from the meta sidecar's `x-run-id`, a fresh UUID per sync), and both staging tables (`report_snapshots` header, `report_rows` long-form cells) are MERGE-keyed on that — so history accumulates rather than collapsing.
+- **Verified end-to-end**: 42 `(tenant, endpoint)` jobs (7 tenants × 6 kinds), 0 failures, 195s. Final state: `report_snapshots` **360 rows** (60 per kind × 6), `report_rows` **32,200 rows** — both grain-clean (n = distinct). Real `account`-attributed rows confirmed with genuine UUIDs joinable to `dim_account.account_id` (also found: some `account` attributes are Xero synthetic group sentinels like `"FXGROUPID"`, not real UUIDs — a real reconciliation-join query will need to filter for UUID-shaped values). All 13 existing tests (`test_bq_writer.py`, `test_gcs_reader.py`) still pass.
+- **`ods_xero_0/1.fact_report_row` built** (both layers) — join `report_rows` (cell grain) onto `report_snapshots` (header context); `_1` is a pass-through + `source_system`, same as every other Xero-only entity. `report_date` parsed via `SAFE.PARSE_DATE` in the ODS layer rather than trusted from staging's typing, which can (and did) vary depending on which concurrent backfill job happened to create the table first.
+
+**Full ODS rebuild (2026-07-24, later) — surfaced and fixed a real correctness bug.**
+Ran `dataform run --tags ods` to refresh all 34 existing tables against the fully-backfilled 7-tenant staging (previously stale — still reflecting the old 6-tenant bucket) and add the 2 new `fact_report_row` tables. Two assertions failed:
+- **`assert_fact_quote_line_reconciles`**: 2/1,193 quotes mismatched. Investigated each — both `status='INVOICED'` with `total_discount=0`, no duplicate lines, no tax-basis issue. This is a known real-world Xero behavior: a quote's own totals can go stale after conversion to an invoice, since the invoice becomes the source of truth and the quote object isn't necessarily recalculated. Genuine tiny source inconsistency, not a bug — converted the assertion to a count threshold (fails only if >5 mismatch), mirroring the manual-journal-balance pattern.
+- **`assert_fact_manual_journal_line_balances`**: 342/1,882 journals unbalanced (some by **millions** of dollars) — this one was a real bug, not a source quirk. Root cause: `etl/xero/manual_journals.py`'s line-merge key was `(tenant_id, record_id, account_id)`, silently assuming one line per account per journal. **Confirmed false against live data** — pulled the raw Xero payload for the worst offender and found a genuine journal with *two separate lines posting to the same account* (`+932,188.95` and `-200,249.25`, a real stock-adjustment split) — a normal, valid accounting pattern Xero fully supports. The flawed key couldn't represent this, and under concurrent writes ended up with 2 duplicate copies of one of the two lines while losing the other entirely (mechanism not fully reconstructed — a `bigquery error: Could not serialize access` race is plausible given concurrent writes to a fresh table — but the underlying key defect was unambiguous and reproducible regardless).
+  - **Fix**: added `line_position` (0-based index in Xero's own `JournalLines[]` array — the only stable-enough identifier, since there's no native `LineItemID`) to the parsed row and changed the merge key to `(tenant_id, record_id, line_position)`.
+  - **Remediation**: dropped `staging_xero.manual_journal_lines` (bad data already baked in under the old key) and re-backfilled. Hit a *second*, related issue: with the table fully dropped, BigQuery had to autodetect a fresh schema from whichever tenant's concurrent job created it first — one all-numeric-chart tenant made it infer `account_code` as INTEGER, breaking the dashed-code tenants (`441-003`, etc. — the same Norwegian-style charts seen with `accounts` earlier). Fixed by pre-creating the table with an explicit schema (`account_code` as STRING) before re-running, sidestepping the autodetect race.
+  - **Result**: 342 unbalanced → **1** (the same single pre-existing genuine anomaly, $1,810.74, identified when this fact was first built — confirmed by exact match, not coincidence).
+  - Also updated `ods_xero_0.fact_manual_journal_line` to use staging's `line_position` directly instead of re-deriving an ordinal via `ROW_NUMBER() ... ORDER BY account_code, line_amount, description` — more correct, preserves Xero's true line order instead of an arbitrary content-based re-sort.
+- **Final state**: all 36 ODS tables (10 dims + 8 facts × 2 layers) rebuilt, **78 assertions pass, 0 failures**. `dim_organisation`/`dim_account` etc. now correctly show 7 tenants (staleness resolved).
+
+**GL checks — design discussion + `fact_general_ledger` build + first reconciliation check (2026-07-24, later).**
+
+Before building the GL fact, talked through what "GL checks" should actually mean: (a) does our own GL fact internally balance (debits=credits), and (b) does it reconcile against Xero's own aggregations (the `report_*` endpoints built earlier exist exactly for this). Agreed order: (1) `fact_general_ledger` + balance assertion, (2) Trial Balance reconciliation, (3) P&L reconciliation, (4) document-fact bottom-up reconciliation, (5) Balance Sheet secondary check — plus a separate follow-on to plan which of these should become routine/automated drift-detectors once the pipeline is scheduled.
+
+**Check 1 — `fact_general_ledger` (done).**
+- Built `ods_xero_0.fact_general_ledger` (native) and `ods_xero_1.fact_general_ledger` (harmonized) — one row per `tenant_id + journal_id + journal_line_id` (`JournalLineID` is a real native Xero field, no synthesized-key risk, unlike the manual-journal-line bug below). Joins `journal_lines` → `journals` header, resolves tracking options via the standard category_id+option_name pattern against `dim_tracking_option`.
+- `_1` renames to `document_type` (=`source_type`), `document_date`, single signed `amount` (=`net_amount`, per the balancing rule verified 2026-07-09/23) — deliberately **not** split into `debit_amount`/`credit_amount` (Visma's convention) yet; deferred until omnibus alignment actually needs it.
+- **`assert_fact_general_ledger_balances`** (count-threshold, mirrors the manual-journal pattern): verified **100% — 70,590/70,590 journals balance exactly on `net_amount`.**
+- Needed two new staging declarations (`staging/xero/journals.sqlx`, `journal_lines.sqlx`) — the tables were already real and populated by `etl/xero/journals.py`, but had no Dataform declaration, so `fact_general_ledger` initially failed to compile ("Could not resolve staging_xero.journals").
+
+**Check 2 — Trial Balance reconciliation (done, diagnostic — real finding, not a bug).**
+- **Enabling change**: added `financial_year_end_day`/`financial_year_end_month` to `etl/xero/organisations.py` (from Xero's `FinancialYearEndDay`/`FinancialYearEndMonth`, confirmed present in the raw payload) and threaded through `dim_organisation` at both `_0`/`_1`. Needed because Xero's Trial Balance report has 4 numeric columns per account (Debit, Credit, YTD Debit, YTD Credit) — empirically confirmed (not assumed) that `YTD Debit − YTD Credit` is the one that matches our own cumulative GL, and that "YTD" resets at each tenant's **fiscal year start**, not calendar year or all-time. **Tenants have mixed fiscal years** — 2 use a June 30 year-end, the rest Dec 31.
+  - Hit the schema-evolution mistyping trap again while adding these two columns: autodetect on the whole batch inferred one tenant's all-numeric `registration_number` as INT64, conflicting with the existing STRING column. Fixed by manually running `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` before re-running the backfill, sidestepping the autodetect path entirely.
+- Built `ods_xero_1.recon_trial_balance` — explicitly **not** a hard assertion (new territory, tolerance not yet established). Computes each tenant's fiscal-year-bounded YTD per account from `fact_general_ledger`, compares against Xero's own `report_trial_balance` (latest snapshot per tenant, `YTD Debit − YTD Credit`, filtered to real account UUIDs via regex — some `attribute_id='account'` rows are synthetic group sentinels like `FXGROUPID`, not real accounts).
+- **Result: 253/429 (59%) accounts match exactly; 175 (41%) mismatched.** Splitting by `dim_account.bs_pl` revealed a clean, non-random pattern:
+
+  | Type | n | Matched | Mismatched |
+  |---|---|---|---|
+  | P&L (Revenue/Expense) | 227 | 222 (98%) | 5 (2%) |
+  | Balance Sheet | 202 | 31 (15%) | 170 (84%) |
+
+  **Root cause (well-supported, not just plausible).** Balance sheet accounts (equity, fixed assets, payables, retained earnings) carry a cumulative balance from company inception, including whatever one-time "conversion balance" / opening balance Xero recorded when the org first moved onto Xero. That entry does not appear in the regular `/Journals` feed under any `source_type` we sync — checked the full observed set (below), nothing resembling `CONVERSION`/`OPENING`. P&L accounts reset to zero every fiscal year, so they have no pre-window carry-forward — `/Journals` alone is complete for them, which is exactly why they match at 98%. Per-tenant earliest-journal-date data supports the same story: several tenants' synced history starts on a suspiciously clean boundary well after likely company inception (e.g. tenant `19b25bd5…`'s earliest journal is exactly `2022-12-31` — a fiscal year-end date).
+  - **Full `journals.source_type` inventory now confirmed** (previously only partially documented): `ACCPAY`, `ACCPAYPAYMENT`, `ACCREC`, `CASHPAID`, `ACCRECPAYMENT`, `MANJOURNAL`, `ACCPAYCREDIT`, `CASHREC`, `INTEGRATEDPAYROLLPE`, `ACCRECCREDIT`, `APOVERPAYMENT`, plus 4 newly-surfaced ones: `TRANSFER` (119), `AROVERPAYMENT` (68), `APCREDITPAYMENT` (40), `ARCREDITPAYMENT` (1). The 4 new ones matter for check 4 (document-fact bottom-up reconciliation) — none has an obvious document-fact mapping yet.
+- **Conclusion: this is a structural, source-data limitation, not a reconciliation-logic or GL-fact bug.** `recon_trial_balance` stays a diagnostic (informational) for Balance Sheet accounts — fixing it would require finding/syncing a Xero conversion-balance source we don't currently have, not fixing our own code. The P&L portion of the same check is solid (98%) and is a real candidate for becoming a hard assertion.
+
+**Check 3 — P&L reconciliation (done, near-perfect — confirms check 2's finding independently).**
+- Built `ods_xero_1.recon_profit_and_loss` vs. Xero's own `report_profit_and_loss`, using each tenant's latest snapshot.
+- **This report is period-bounded, not YTD.** Every observed snapshot has `report_from` = the 1st of the current calendar month and `report_to` = the sync day — Xero's default "this month" P&L window (no fiscal-year framing here, unlike Trial Balance). Reconciliation sums `fact_general_ledger.amount` over `document_date BETWEEN report_from AND report_to` per tenant+account.
+- **⚠ New sign-convention gotcha found and handled (empirically verified, not assumed).** Xero's P&L displays both revenue and expense lines as unsigned/positive "management report" amounts (section labels like "Less Cost of Sales" carry the subtraction meaning, not the cell sign). Tested both sign conventions against real data: **EXPENSE accounts match our signed GL `amount` with no flip (64/64 = 100%)**; **REVENUE accounts match only when Xero's value is negated (16/16 = 100%)**. This is the same class of gotcha as `net_amount`/`gross_amount` and `line_amount_types` — a provider amount field whose sign/basis silently depends on context. Encoded as a `CASE WHEN account_class = 'REVENUE' THEN -x.xero_amount ELSE x.xero_amount END` in the recon query; documented inline.
+- Also scoped the "our" side to `dim_account.bs_pl = 'P&L'` accounts only — without this, balance-sheet-account GL activity in the same date window (bank movements, tax control, AR/AP) shows up as spurious "missing from Xero" noise, since Xero correctly never includes those in a P&L report.
+- **Result: 80/85 (94%) accounts match exactly (`diff = 0`), 0 mismatches.** The remaining 5 are small/near-zero EXPENSE amounts (largest ~$355) present in our GL for the period but absent as a row in Xero's report entirely — plausibly Xero suppressing negligible/credit-only activity from the report display. Not investigated further; flagged as a minor known gap, not a reconciliation defect.
+- **Conclusion:** this independently confirms check 2's P&L finding (98% match there too) — our GL is fully reliable within its synced window. The only real, structural gap across both checks is Balance Sheet accounts' pre-window conversion balances (check 2). This check is strong enough to become a real hard assertion (e.g. fail if match rate drops below ~90%, or investigate any single mismatch >0, since true mismatches were 0/85 here).
+
+**Check 4 prep — full `journals.source_type` → document-fact mapping, verified against real payloads (2026-07-24).**
+
+Before building the reconciliation, joined every `source_type`'s `source_id` against every candidate staging table's primary key to verify (not assume) each mapping, and sampled the unexplained rows directly. Full picture (70,590 total journals):
+
+| `source_type` | journals | % | Verified mapping |
+|---|---|---|---|
+| `ACCPAY` / `ACCREC` | 17,275 / 11,632 | 24.5% / 16.5% | `fact_invoice_line` — `source_id` matches `invoices.invoice_id` 11,705/11,707 and 4,241/4,241 |
+| `ACCPAYPAYMENT` / `ACCRECPAYMENT` | 15,631 / 4,368 | 22.1% / 6.2% | `fact_payment` — matches `payments.payment_id` 12,541/12,543 and 3,805/3,805 |
+| *(NULL)* | 9,157 | **13.0%** | **No document fact — genuinely unmapped by design.** Sampled directly: these are Xero's own **automatically-generated inventory/COGS journals** (e.g. "Materials Purchased" ↔ "Stock", "Stock Transfer" ↔ "Stock"), `source_id` is NULL on all of them. Not tied to any single source document — internal to Xero's inventory valuation engine, triggered by stock movements rather than a document Xero exposes via the API. **Cannot be closed by syncing more endpoints; must be modeled as an explicit "system-generated, unmapped" bucket, not left as a silent gap.** |
+| `CASHPAID` / `CASHREC` | 6,416 / 548 | 9.1% / 0.8% | `fact_bank_transaction_line` — matches `bank_transactions.bank_transaction_id` 4,763/4,763 and 452/452 |
+| `MANJOURNAL` | 3,319 | 4.7% | `fact_manual_journal_line` — matches `manual_journals.manual_journal_id` 1,868/1,868. **Never sum alongside `fact_general_ledger` in the same total — `journals` already includes these postings; that's the double-counting risk documented earlier.** |
+| `ACCPAYCREDIT` / `ACCRECCREDIT` | 1,103 / 331 | 1.6% / 0.5% | `fact_credit_note_line` — matches `credit_notes.credit_note_id` 350/350 and 100/100 |
+| `INTEGRATEDPAYROLLPE` | 362 | 0.5% | **No document fact — structural gap.** Account inspection confirms wages/superannuation/PAYG-PAYE-withholding postings from Xero's integrated Payroll product, which uses a completely separate API surface (`payroll.xro`) that we don't sync at all. Would require a new integration, not just a new parser — out of scope for this reconciliation exercise; document as a permanent, known exclusion. |
+| `APOVERPAYMENT` / `AROVERPAYMENT` | 220 / 68 | 0.3% / 0.1% | **Closed 2026-07-24 — `fact_overpayment_line`.** Both are Xero's `/Overpayments` entity. `etl/xero/overpayments.py` restored from git history (added `LineItems[]` unpacking for account-level grain), backfilled (91 overpayments, 91 lines across 7 tenants), `ods_xero_0/1.fact_overpayment_line` built with the standard tax-basis normalization + reconciliation assertion. Verified: `source_id` matches the overpayment 72/72 (`APOVERPAYMENT`) and 19/19 (`AROVERPAYMENT`). |
+| `TRANSFER` | 119 | 0.2% | **Closed 2026-07-24 — `fact_bank_transfer`.** Xero's `/BankTransfers` entity. `etl/xero/bank_transfers.py` restored from git history, backfilled (113 transfers across 7 tenants), `ods_xero_0/1.fact_bank_transfer` built (header grain, no tax). Verified: `source_id` matches `bank_transfer_id` 113/116 (the 3 unmatched are likely voided/deleted transfers, consistent with the small gaps seen on every other source_type). **⚠ Each transfer also posts a matching SPEND + RECEIVE row in `fact_bank_transaction_line`** (linked via `from/to_bank_transaction_id`) — never sum `fact_bank_transfer` alongside `fact_bank_transaction_line` in the same total, that double-counts the same cash movement. |
+| `APCREDITPAYMENT` / `ARCREDITPAYMENT` | 40 / 1 | 0.06% / 0.00% | **Already fully covered — no new work needed.** These are `payment_type` values Xero already returns from `/Payments` (`staging_xero.payments.payment_type` already contains `APCREDITPAYMENT`/`ARCREDITPAYMENT`/`APOVERPAYMENTPAYMENT` alongside the two known types) — `source_id` matches `payments.payment_id` 28/28 and 1/1. `ods_xero_0/1.fact_payment` is an unfiltered pass-through of `staging_xero.payments`, so these rows are already present in the fact table today; check 4 just needs to route these `source_type`s to `fact_payment` in its mapping table, same as `ACCRECPAYMENT`/`ACCPAYPAYMENT`. |
+
+**Net picture (updated 2026-07-24):** ~86.6% of journal volume now maps cleanly to existing document facts (verified, not assumed) — the `TRANSFER`/`APOVERPAYMENT`/`AROVERPAYMENT` gaps above are closed. ~13.5% is structurally unmappable (inventory system journals + payroll) and must be modeled as an explicit excluded bucket in check 4, not a bug to chase. Check 4 itself (the actual bottom-up reconciliation table) is not yet built.
+
+**Check 4 — document-fact bottom-up reconciliation (done, diagnostic — mostly excellent, 2 tenant-specific outliers flagged).**
+
+Built `ods_xero_1.recon_document_facts`: for every mapped `document_type`, aggregates the corresponding document fact and `fact_general_ledger` independently to `(tenant_id, account_id, document_type)` and compares. Unlike checks 2/3 (which compare against a Xero-computed report snapshot with a natural window), this compares two of *our own* pipelines against each other — there's no external snapshot to bound to, so it's cumulative all-time.
+
+**Two things had to be discovered empirically, not assumed, before the numbers meant anything:**
+1. **Sign convention is per-document_type, not universal.** Tested both directions per type against real data (same method as the P&L check). Pattern that emerged is just normal double-entry logic: a document type and its "credit" counterpart always flip in *opposite* directions from each other, since a credit note reverses the original entry:
+
+   | document_type | flip? | document_type | flip? |
+   |---|---|---|---|
+   | ACCPAY | no | ACCPAYCREDIT | **yes** |
+   | ACCREC | **yes** | ACCRECCREDIT | no |
+   | CASHPAID (SPEND) | no | CASHREC (RECEIVE) | **yes** |
+   | ACCPAYPAYMENT | **yes** | ACCRECPAYMENT | no |
+   | APCREDITPAYMENT | no | ARCREDITPAYMENT | **yes** |
+   | APOVERPAYMENT (SPEND-OVERPAYMENT) | no | AROVERPAYMENT (RECEIVE-OVERPAYMENT) | **yes** |
+   | MANJOURNAL | no (already GL-native) | TRANSFER | unpivoted: from=-amount, to=+amount |
+
+2. **DELETED/VOIDED documents must be excluded from the document-fact side.** A voided invoice still carries its original amount in the live `/Invoices` response, but Xero's GL never posted it (or reversed it) — counting it only inflates the document side. Verified the effect is large: one tenant's `ACCREC` residual dropped from 25% to 0% once excluded; another's from 8.67% to 0.96%. `fact_general_ledger` needs no equivalent filter — `/Journals` only ever returns real, immutable postings.
+
+**Also confirmed (before building, to avoid a double-counting bug): transfer/overpayment-linked `bank_transactions` never independently post to GL.** Every `bank_transfer`/`overpayment` also creates a matching `bank_transactions` row (`transaction_type` `SPEND-TRANSFER`/`RECEIVE-TRANSFER`/`SPEND-OVERPAYMENT`/`RECEIVE-OVERPAYMENT`) for UI/reconciliation display — tested whether these ever appear as a `journals.source_id` under *any* `source_type` and got zero matches. So `fact_bank_transaction_line`'s CASHPAID/CASHREC bucket is filtered to `document_type IN ('SPEND','RECEIVE')` only; including the transfer/overpayment-linked rows would have inflated it with amounts that have no CASHPAID/CASHREC GL posting to compare against.
+
+**Result — rows where both a document total and a GL total exist for that account:**
+
+| document_type | residual (all tenants) | residual (excl. known outliers) |
+|---|---|---|
+| MANJOURNAL | 0.07% | — |
+| CASHREC | 0.13% | 0.05% |
+| CASHPAID | 0.53% | 0.15% |
+| APCREDITPAYMENT | 0.32% | same |
+| ACCPAYCREDIT | 1.61% | same |
+| TRANSFER | 5.74% | 0% (n=4) |
+| ACCRECCREDIT | 7.88% | 7.8% |
+| APOVERPAYMENT | 10.41% | same |
+| ACCRECPAYMENT | 11.94% | 1.98% |
+| ACCREC | 16.10% | 6.53% |
+| ACCPAYPAYMENT | 32.04% | 29.74% (see outlier below) |
+| ACCPAY | 35.20% | 33.47% (see outlier below) |
+
+**Two tenant-specific outliers identified, neither chased to full root cause (flagged, matching this session's pattern of not exhaustively chasing every last data-quality wrinkle):**
+- **`dcb20a20`** (the newest tenant) drives most of the residual on several types — e.g. its `ACCREC` alone is 92% mismatched even after the DELETED/VOIDED fix, including one account with **$7.7M of GL activity and zero matching invoice lines at all**. Plausible explanation: a bulk historical-data conversion that entered directly as journals rather than through normal invoicing, consistent with the tenant's already-known forward-dated (2027) fiscal-year journal entries flagged earlier as unresolved.
+- **`d08f38af`** drives most of the remaining `ACCPAY`/`ACCPAYPAYMENT` residual (82-84% for that tenant alone) — inspected the biggest mismatching accounts: document-fact totals are consistently *larger* than GL by inconsistent ratios (not a fixed FX-rate-multiplier bug), invoice/GL date ranges and row counts are otherwise comparable. Best working hypothesis: invoices whose account coding was edited after the original journal posted (Xero doesn't retroactively rewrite historical `/Journals` entries when a bill's account allocation changes later) — plausible but not confirmed from the data available.
+
+**Also, expected and structural (same shape as the Trial Balance BS finding) — every document type has a large "GL-only" bucket with no document-fact match at all.** This is the AR/AP control-account side of each double entry: document-fact *line items* only ever carry the revenue/expense/bank side of a transaction (what the invoice was coded to), never the control-account line GL adds automatically for the header total. Tens of millions of dollars per type, confirmed structural via inspection — not a bug, and not fixable by parsing more; a control-account balance check would need Trial-Balance-style account-level totals (already covered by check 2), not document facts.
+
+**Conclusion:** the reconciliation methodology is sound (proven by the ~0-10% matches across most types once sign + status handling are correct) and genuinely useful — it already surfaced two real, tenant-specific data questions worth a look. Keeping `recon_document_facts` as a diagnostic (not a hard assertion) given the known outliers; a routine version would need either an outlier allowlist or a materiality threshold per tenant.
+
+**Next steps, in likely order:**
+1. ~~Fix `backfill_gcs.py` cross-job concurrency/scoping~~ — done.
+2. ~~Fix within-job concurrency + the BQ merge race~~ — done, proven on the previously-stuck endpoint.
+3. ~~Full 17-endpoint × 7-tenant backfill from `prj-dw-dev-raw`~~ — done: 119/119 jobs, 0 failures, all grain/balance checks pass.
+4. ~~Clean up orphaned `_tmp_*` tables + add TTL safety net~~ — done.
+5. ~~Build the Xero Reports API parser~~ — done: `staging_xero.report_snapshots` + `report_rows` populated, verified.
+6. ~~Build `ods_xero_0/1.fact_report_row`~~ — done.
+7. ~~Rebuild all of `ods_xero_0/1` against the full 7-tenant staging~~ — done: found + fixed the manual-journal-line merge-key bug, all 78 assertions pass.
+8. ~~Build `ods_xero_0/1.fact_general_ledger` + balance assertion~~ — done: 100% balanced, 70,590/70,590 journals.
+9. ~~Build `ods_xero_1.recon_trial_balance` (check 2)~~ — done: 59% overall, cleanly explained by the BS-vs-P&L split above.
+10. ~~Build the dedicated P&L reconciliation (check 3)~~ — done: 94% exact match, 0 real mismatches, confirms check 2's finding independently.
+11. ~~Document-fact bottom-up reconciliation (check 4)~~ — done: `ods_xero_1.recon_document_facts` built, most document_types match within ~0-10%, 2 tenant-specific outliers flagged (not fully root-caused) — see above.
+12. Balance Sheet secondary check (check 5) vs. `report_balance_sheet` — same point-in-time logic as Trial Balance; lower priority given the BS gap is already understood structurally.
+13. Plan which of checks 1-5 become routine/automated drift-detectors once the pipeline is scheduled (vs. remaining manual/diagnostic) — explicitly requested, not yet started.
+
+---
+
+## Status as of 2026-07-09 (superseded by the above where it conflicts)
+
+**Xero journals (GL) restored & backfilled — first attempt, 3/6 tenants:**
+- Colleague confirmed 3 tenants now have journals in the GCS bucket. Verified directly against the bucket (not just staging): `19b25bd5…` (130 journals), `83adbd31…` (42), `9dc5d3f0…` (750) — 922 total, real `JournalLines[]` content, dated 2026-07-08. The other 3 tenants (`35f4b175…`, `d08f38af…`, `f0b1075e…`) still have **no journals** — confirm with colleague whether/when those are coming. *(Superseded 2026-07-23: this was reading `aquatiq-dw-dev-storage`, which turned out to be frozen; the real sync had moved to `prj-dw-dev-raw`, where all 7 tenants now have journals — see RESUME HERE above.)*
+- Restored `etl/xero/journals.py` from git history (removed 2026-07-07 under the bucket-driven policy; payload matched the live data exactly, no changes needed). Re-added to the `PARSERS` map in both `backfill_gcs.py` and `cloud_function/main.py`.
+- Backfilled: `python -m etl.backfill_gcs journals` → `staging_xero.journals` (922 rows) + `staging_xero.journal_lines` (2,788 rows). Grain verified clean (922=922, 2788=2788, 0 orphans, 0 null line IDs).
+- **⚠ CRITICAL FINDING for the future `fact_general_ledger` build — journal lines balance on `net_amount`, not `gross_amount`.** `gross_amount` includes tax on the origin line only (the tax posts to a separate control-account line), so summing it never balances when a transaction has tax — only 487/899 (54%) "balanced" on gross. Summing `net_amount` balances **899/899 (100%)**, across all 3 tenants, across every `source_type` (ACCPAY, ACCREC, CASHPAID/REC, MANJOURNAL, credit notes, payments, payroll). This is the GL-equivalent of the `line_amount_types` finding on document facts (see "Xero tax basis" below) — **use `net_amount` as the GL posting measure when `ods_xero.fact_general_ledger` is built**, and add a balancing assertion (`assert_fact_general_ledger_balances`) exactly like the manual-journal one.
+- 23 journal headers have no lines at all (all `source_type=NULL`) — likely opening-balance/system journals; not a grain defect, just headers with zero children.
+- Also newly visible in the bucket for those same 3 tenants: 10 previously-absent endpoints (`bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `overpayments`, `prepayments`, `receipts`, `repeating_invoices` — 28 endpoints total now, up from 17). Flagged by drift detection; no parsers built yet — build only if/when a report needs one. `payment_services` remains absent everywhere.
+
+---
+
+## Status as of 2026-07-07 (superseded by the above where it conflicts)
 
 **Done:**
 - Staging layer complete. Python ETL in `etl/` parses raw GCS JSON (`gs://aquatiq-dw-dev-storage`) into `staging_xero` (16 endpoints, ~345k rows). Bucket-driven parser set + drift detection. Reference: `docs/STAGING_XERO.md` for payload shapes.
-- Full ODS design resolved and documented below (see "ODS Layer Design"). **No ODS code written yet.**
+- Full ODS design resolved and documented below (see "ODS Layer Design").
+- **ODS build started — `dim_account` done (not yet materialized in BQ).** Three files written under `Dataform/definitions/`:
+  - `staging/xero/accounts.sqlx` — source declaration for `staging_xero.accounts` (Python-populated; lets ODS `ref()` it).
+  - `ods_xero_0/dim_account.sqlx` — native Xero pass-through, `account_key = tenant_id|account_id`, uniqueKey assertion.
+  - `ods_xero_1/dim_account.sqlx` — Visma-vocabulary skeleton; `bs_pl`/`fsli_1` derived from `account_class` (definitional); Xero-native `reporting_code`/`reporting_name`/`account_type` carried through; `fsli_2`/`fsli_3` + EBITDA/CF/NWC/capex flags left NULL/`unmapped`.
+  - `dataform compile` clean (188 actions). Live preview: **786/786 accounts classify at the coarse level, 0 unmapped**.
+  - **Decision (2026-07-07): no hand-authored Xero→FSLI mapping seed yet.** Ship Xero's own metadata through the DW, show it to the accountants; add a seed (keyed however their logic dictates) only when they define the crosswalk. The `_1` column skeleton + UNION shape are already in place to drop it in. See "ODS Layer Design → Account classification" note.
 
-**Next step — start the ODS build (`ods_xero`):**
-1. Read Visma's `dim_account` (`Dataform/definitions/.../dim_account.sqlx` and its mapping seeds) to extract the target FSLI vocabulary + column names Xero must emit at `_1`.
-2. Build `ods_xero_0.dim_account` (native Xero vocabulary) → `ods_xero_1.dim_account` (Visma vocabulary + Xero→FSLI mapping seed).
-3. Then `dim_contact`, then `fact_invoice_line` as the first enriched fact. Full sequence in "ODS Layer Design → Build sequence".
+**Progress — ALL Xero ODS dimensions built + materialized in BQ (10 dims × `_0`+`_1` = 20 tables; 60 run steps = 20 tables + 40 assertions, all pass):**
+- `dim_account` — `_1` derives `bs_pl`/`fsli_1` from `account_class` (definitional), carries native `reporting_code`/`account_type`; finer FSLI + flags left `unmapped` pending accountant crosswalk.
+- `dim_contact` — `_0` joins `contacts` + `contact_addresses` (STREET/POBOX flattened) + `contact_phones` (DEFAULT/MOBILE), grain verified 1675→1675. `_1` → Visma master vocab (`main_address_line1`, `corporate_id`, `currency_id`, …), keeps `is_customer`/`is_supplier`. **Customer/supplier split deferred to omnibus** (data: 917 supplier-only / 105 customer-only / 39 both / 614 neither).
+- `dim_item` — `_1` → Visma inventory vocab (`inventory_number`, `item_description`, `is_stock_item`, `default_price`).
+- `dim_currency` — already Visma-named.
+- `dim_tax_rate`, `dim_tracking_category`, `dim_tracking_option`, `dim_user`, `dim_branding_theme` — Xero-specific, `_1` = pass-through + `source_system`. (`dim_tracking_option` added as an option-grain child that `fact_invoice_line` will reference.)
+- `dim_organisation` — `_1` light renames (`corporate_id`, `currency_id`); **entity resolution deferred** (Decision 6; `seed_entity_mapping` not yet extended with Xero tenants).
+- All 8 thin dims verified `l0 = l1 = staging` row counts (no fan-out).
+- Materialize command that works: `dataform run --tags ods` (the `--actions "schema.name"` selector does *not* match in Dataform 3.x — use tags). Auth ready via Dataform SA key in `.df-credentials.json`.
 
-**Key locked decisions** (details in "ODS Layer Design"): numbered scopes `ods_xero_N` / `ods_visma_N` / `ods_omnibus_N` (number resets per scope, `0` = native); harmonize to **Visma vocabulary** at `_1`; line-grain facts; GL deferred until `journals` syncs (no reconstruction); providers are entity-disjoint (clean omnibus UNION).
+**Progress — ALL 7 Xero document facts built + materialized. Full Xero ODS dim+fact layer complete (10 dims + 7 facts = 34 tables; 74 assertions pass, 0 failures).**
+- Document facts (line grain, net-of-tax, reconcile to header `sub_total`): `fact_invoice_line`, `fact_credit_note_line`, `fact_bank_transaction_line`, `fact_purchase_order_line`, `fact_quote_line`. Each with an `assert_fact_*_reconciles` guard.
+- `fact_manual_journal_line` — GL postings, NOT net-normalized. Synthesized line key (no LineItemID). `amount` = signed posting = `line_amount + IF(Exclusive, tax_amount, 0)`, which balances to 0 per journal. Guard: `assert_fact_manual_journal_line_balances` (count-threshold; 1 genuine source imbalance tolerated).
+- `fact_payment` — header grain (no lines, no tax). Covers ACCRECPAYMENT + ACCPAYPAYMENT; no currency_key (Xero payments carry no currency_code).
+- All AR/AP variants live in one fact per type (document_type distinguishes); customer/supplier split deferred to omnibus.
+- **⚠ TAX BASIS — `amount` is NET of tax on every fact row.** Xero's raw `line_amount` is tax-inclusive when `line_amount_types='Inclusive'` and net otherwise, so `_1` normalizes to net (`Inclusive → line_amount − tax_amount`). Enforced per fact by `assert_fact_*_reconciles`. See "Xero tax basis (`line_amount_types`)" below. (Exception: `fact_manual_journal_line` will NOT normalize — GL postings must keep gross signed amounts to balance.)
+- **Xero tracking quirk:** line tracking carries category id + option NAME (not option id) → resolve `tracking_option_key` via `dim_tracking_option` on `(tenant_id, tracking_category_id, option_name)`.
+- Field variations handled: PO lines have `account_code` only (no `account_id` → resolve `account_key` by code); quote lines have no account/item/tax_type; credit-note/PO/quote lines have STRING discount fields (SAFE_CAST).
+
+- **⚠ STAGING DUPLICATION BUG — found & fixed (2026-07-08).** `staging_xero.quotes` and `purchase_orders` (headers + lines) were duplicated **exactly 34×**. Root cause: repeated full-snapshot ("master") sync files in GCS × a batch-backfill write path with no dedup — `MERGE` into an empty target inserted every copy. **Fix:** `BQWriter.merge()` now dedups the source batch by key (latest `synced_at`) before MERGE — see `etl/common/bq_writer.py._dedup_by_key` + regression tests in `etl/tests/test_bq_writer.py`. Re-backfilled both endpoints → now 1× (quotes 1,143 / quote_lines 3,153 / purchase_orders 924 / po_lines 2,027). The reconciliation assertions are what caught it. Production Cloud Function path was never affected (one file per event). Full write-up in "Staging duplication bug" below.
+
+**Next step — the Xero provider layer is done; move to cross-provider + deferred families:**
+1. **Visma `_1`** — re-point the existing Visma gold to the shared vocabulary (mostly already speaks it).
+2. **`ods_omnibus_0`** — UNION each provider's `_1` for the shared conformed entities (dim_account, dim_contact→customer/supplier, dim_item, dim_currency, invoice/credit_note/payment facts), then **`ods_omnibus_1`** wide for the datamart. This is where the customer/supplier fact+dim split happens (Xero role flags / document_type route the UNION).
+3. Deferred families: **GL fact** (`fact_general_ledger`) until `journals` syncs; allocation facts (`invoice_payments`, `credit_note_allocations`) if needed; entity resolution (extend `seed_entity_mapping` with Xero tenants) for `_1` company/entity keys.
+- Scope recap: Xero ODS complete at 10 dims + 7 facts (34 tables) + 6 assertions (5 reconcile + 1 balance).
+
+**Key locked decisions** (details in "ODS Layer Design"): numbered scopes `ods_xero_N` / `ods_visma_N` / `ods_omnibus_N` (number resets per scope, `0` = native); harmonize to **Visma vocabulary** at `_1`; **classification ships from Xero-native metadata first — no invented FSLI crosswalk until accountants define it**; line-grain facts; GL deferred until `journals` syncs (no reconstruction); providers are entity-disjoint (clean omnibus UNION).
 
 **Environment notes:** local Python is `/opt/homebrew/bin/python3.13`; GCP auth via ADC often needs `gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform`; BQ project `prj-dw-dev`, region `europe-north2`.
 
@@ -208,6 +418,10 @@ The Dataform silver layer work (46 `.sqlx` files in `Dataform/definitions/silver
 
 `docs/STAGING_XERO.md` remains the canonical reference for Xero API payload structures, date format quirks, and entity-level notes.
 
+**`docs/ACCOUNTANTS_GUIDE_XERO_DATA.md`** (2026-07-24) — a non-technical companion doc written for the accounting team reviewing `ods_xero_0/1`. Explains the same caveats covered in this doc (tax basis, GL vs. document-fact conventions, the Balance Sheet conversion-balance gap, the two flagged-outlier companies from check 4, structural GL-only postings) in plain accounting language, with no data-engineering jargon. Keep it in sync when any of those findings change.
+
+**`docs/ACCOUNTANTS_TABLE_CATALOG.md`** (2026-07-24) — companion to the guide above: lists every table in `ods_xero_0`/`ods_xero_1` (they're 1:1 the same tables, Level 0 = Xero-native field names, Level 1 = renamed) with a plain-English description and row counts, plus the 3 `recon_*` diagnostic tables (Level 1 only). Update alongside any new table added to `ods_xero_0/1`.
+
 ---
 
 ## Key Technical Decisions
@@ -241,7 +455,9 @@ The Dataform silver layer work (46 `.sqlx` files in `Dataform/definitions/silver
 ## GCS File Format & Metadata (UPDATED 2026-06-29)
 
 ### Bucket
-`gs://aquatiq-dw-dev-storage` (not `prj-dw-dev-raw` as originally planned)
+~~`gs://aquatiq-dw-dev-storage` (not `prj-dw-dev-raw` as originally planned)~~
+
+**⚠ SUPERSEDED 2026-07-23 — the bucket switched back.** The live sync moved to **`gs://prj-dw-dev-raw`** (the originally-planned name, ironically); `aquatiq-dw-dev-storage` is now frozen (no writes since 2026-07-08). The pipeline (`etl/backfill_gcs.py`, `etl/cloud_function/main.py`, `etl/common/gcs_reader.py`, tests) has been repointed to `prj-dw-dev-raw`. See RESUME HERE at the top for the full story. Path format and metadata schema below are unchanged and apply to the new bucket too.
 
 ### Path format
 ```
@@ -477,7 +693,7 @@ Concretely:
 
 | # | Decision |
 |---|---|
-| **1 — Account classification** | Native-first at `_0` (Xero `account_class`, `reporting_code` as-is). Harmonize to Visma FSLI vocabulary at `_1` via a **Xero-account → FSLI mapping seed** (Xero codes like `440-001` differ from Visma's numeric chart, so Visma's code-keyed mapping can't be reused — Xero needs its own seed mapping into the same FSLI targets). |
+| **1 — Account classification** | Native-first at `_0` (Xero `account_class`, `reporting_code` as-is). Harmonize to Visma FSLI vocabulary at `_1`. **Refined 2026-07-07 (as-built): no hand-authored mapping seed yet.** `_1` derives `bs_pl`/`fsli_1` from `account_class` (definitional; 786/786 classify, 0 unmapped), carries Xero-native `reporting_code`/`reporting_name`/`account_type` through, and leaves finer FSLI + flags `unmapped`. Ship this to the accountants; add a seed only when they define the crosswalk. See findings note below. |
 | **2 — Fact grain** | Line-level for transactional facts (invoices, credit notes, bank transactions, POs, quotes, manual journals). Header-grain only where there are no lines (payments). No aggregation in ODS. |
 | **3 — Star vs wide** | Hybrid. Conformed dimension tables always exist (star backbone, for drill/ad-hoc). Facts stay lean through provider layers, then **widen at `ods_omnibus_1`** (denormalize dim labels + FSLI onto fact rows) so the datamart is a pure column-select with no joins. |
 | **4 — Journals gap** | GL (`journals`) not synced yet. Two fact families (mirroring Visma): **GL facts** and **document facts**. Build all **document facts + dims now** (Xero has the data → AR/AP/sales reporting works immediately). **Defer the GL fact as an additive family** — build `fact_general_ledger` only when real journals land; **no reconstruction** from documents (fragile, throwaway). Financial statements (P&L/BS) wait for the real GL. |
@@ -498,6 +714,84 @@ Concretely:
 5. Fan out remaining dims + document facts on the established pattern.
 6. `ods_omnibus_0` UNION (Xero + Visma), then `ods_omnibus_1` wide.
 7. GL fact family — deferred until journals sync.
+
+### Account classification — findings from live data (2026-07-07)
+
+Investigated `staging_xero.accounts` (786 accounts, 6 tenants) to decide the `_1` mapping key. Findings drove the "no seed yet" decision:
+
+- **`reporting_code`** is Xero's standard hierarchical management-report taxonomy (dot-delimited, e.g. `ASS.CUR.REC.TRA` = Assets ▸ Current ▸ Receivables ▸ Trade debtors). 100% populated, ~71 distinct values, top levels (`ASS`/`LIA`/`EQU`/`REV`/`EXP`) shared across all 6 tenants. Granular for ~32% of accounts; the other ~68% sit at the coarse top level (`EXP` alone = 342 accounts).
+- **`account_type`** (17 values: `DIRECTCOSTS`, `OVERHEADS`, `DEPRECIATN`, `INVENTORY`, `BANK`, `FIXED`, `TERMLIAB`, `CURRLIAB`, …) carries *more* signal than `account_class` for the coarse majority.
+- **Two chart styles within Xero** (not Xero-vs-Visma): 4 tenants use numeric codes `090`–`9999`; 2 (Aqua Pharma NO entities) use dashed `440-001`–`960-003`. So raw `account_code` does **not** generalize across tenants — but `reporting_code`/`account_type` do. This matters because more source systems are coming; keying group mapping on local codes means re-mapping every new entity.
+- **Why no seed now:** any Xero→group-FSLI crosswalk (whether keyed on `account_code`, `reporting_code`, or `account_type`) embeds finance judgment we can't validate ourselves. Decision: expose Xero's native metadata, let the accountants tell us the crosswalk, then encode it. When they do, the likely shape is a cascade mirroring Visma's own (`exact override → standardized metadata → native type → unmapped`), resolving to a Visma `account_code_3` so `chart_of_accounts` supplies the full hierarchy.
+
+### Xero tax basis (`line_amount_types`) — critical measure convention (2026-07-08)
+
+**This is easy to overlook and will silently corrupt financial totals if forgotten. Read before building or reviewing any Xero transactional fact.**
+
+**The problem.** Xero's line-level monetary field `line_amount` does **not** have a single meaning. Its tax basis is set by the invoice/document header's `line_amount_types`:
+
+| `line_amount_types` | What `line_amount` contains | Share of invoice lines |
+|---|---|---|
+| `Exclusive` | NET (tax-exclusive) | ~74% |
+| `Inclusive` | GROSS (tax **included**) | ~26% |
+| `NoTax` | NET (no tax) | <1% |
+
+So the raw value mixes net and gross across rows. `SUM(line_amount)` across a set of invoices that mixes Exclusive and Inclusive **overstates the Inclusive ones by their tax** — a real, silent error in any revenue / COGS / P&L total.
+
+**The rule (applied in ODS `_1`).** Normalize every transactional-fact amount to **NET** so the measure has one consistent basis:
+
+```
+amount_in_currency = CASE WHEN line_amount_types = 'Inclusive'
+                          THEN line_amount - tax_amount
+                          ELSE line_amount END
+amount (base ccy)  = amount_in_currency * currency_rate
+```
+
+- Net was chosen because Visma's `fact_customer_invoice_line.amount` is net — so both providers align at the omnibus UNION.
+- `tax_amount` is carried separately; **gross = `amount_in_currency` + `tax_amount_in_currency`**.
+- `line_amount_types` is **carried into the fact** so the original basis is always visible.
+- Verified: after normalization, net line sums tie to header `sub_total` for **15,294 / 15,294** invoices.
+
+**This applies to every Xero transactional fact** — `fact_invoice_line`, `fact_credit_note_line`, `fact_bank_transaction_line`, `fact_purchase_order_line`, `fact_quote_line`, `fact_manual_journal_line`. Each header carries its own `line_amount_types`.
+
+**How this is prevented from being forgotten (defense in depth):**
+1. **Enforcement (not just docs) — a Dataform reconciliation assertion.** `definitions/ods_xero_1/assert_fact_invoice_line_reconciles.sqlx` checks that net line sums tie to header `sub_total` per invoice. If the normalization is ever removed or a new fact skips it, the assertion returns failing rows and **`dataform run` fails**. A tax-basis regression breaks ~5,000 invoices by their full tax, far outside the tolerance band. Add an equivalent assertion for each new transactional fact.
+2. **Inline docs** — the TAX BASIS block is spelled out at the top of `ods_xero_1/fact_invoice_line.sqlx`.
+3. **This section + the RESUME HERE ⚠ note** in this doc.
+4. **Payload reference** — noted in `docs/STAGING_XERO.md` (invoices section).
+5. **Session memory** — `memory/xero-line-amount-tax-basis.md`.
+
+### Staging duplication bug — quotes / purchase_orders 34× (found & fixed 2026-07-08)
+
+**Symptom.** `staging_xero.quotes` and `staging_xero.purchase_orders` (both headers and line tables) contained exactly 34 identical copies of every record. The other 13 staging tables were clean (1×). Surfaced by the ODS reconciliation assertions (net line sums came out ~34× the header `sub_total`); would otherwise have silently 34×-inflated all quote/PO reporting.
+
+**Root cause.** Two things combined:
+1. `quotes` and `purchase_orders` are synced to GCS as **repeated full snapshots** ("master" sync-type) — every record re-exported in every run. Each had ~34 snapshot files. (Invoices etc. are incremental — one file per record — which is why they were clean.)
+2. The **batch backfill** (`backfill_gcs.py`) reads *all* files for an endpoint via `GCSReader.iter_records()` (no cross-file dedup) and passes the whole set to `BQWriter.merge()` in one call. `merge()` did not dedup the source batch, and `MERGE … WHEN NOT MATCHED THEN INSERT` into an **empty** target treats all 34 copies of a key as unmatched → inserts all 34.
+
+**Not a production issue.** The Cloud Function path processes one meta file per event; a single snapshot file has each record once, so `MERGE` upserts correctly. The 34× was purely a batch-backfill artifact.
+
+**Fix.** `BQWriter.merge()` now dedups the source batch by `key_columns`, keeping the latest `synced_at`, before writing the temp table (`etl/common/bq_writer.py._dedup_by_key`). This makes the writer's "exactly one current row per key" guarantee real for *any* caller/endpoint, and immunizes against full-snapshot syncs and backfill re-runs. Regression tests: `test_dedup_duplicate_keys_in_batch` (real-BQ, the 34× scenario) and `test_dedup_by_key_unit` (pure Python) in `etl/tests/test_bq_writer.py`.
+
+**Remediation.** Dropped the 4 tables and re-ran `python -m etl.backfill_gcs quotes purchase_orders`; they rebuilt at 1× (the writer deduped 38,862 quote inputs → 1,143 rows on write). Note: re-running the backfill *without* dropping first would not have shrunk them — MERGE updates the 34 matching rows in place; the tables must be empty for the deduped insert to land as 1×.
+
+**Prevention / watch-list.** The reconciliation assertions per transactional fact are the standing guard. If another full-snapshot endpoint is added later, the writer dedup now handles it automatically; the drift detector still flags genuinely new endpoints.
+
+### Materializing ODS tables (how to `dataform run`)
+
+**Auth is ready — no new authorization needed.** Dataform authenticates via the service-account key already in `Dataform/.df-credentials.json` (`prj-dw-dev-bq@prj-dw-dev.iam.gserviceaccount.com`, project `prj-dw-dev`, location `europe-north2`). This is **separate** from the `bq`/gcloud user creds (which expire and need `gcloud auth login`) and from ADC (used by the Python ETL). A `dataform run --dry-run` confirmed the SA key connects to BQ.
+
+To materialize the current ODS models (creates the `ods_xero_0` and `ods_xero_1` datasets + tables):
+
+```bash
+cd Dataform
+dataform run --tags ods --include-deps          # or: --actions "ods_xero_0.dim_account" --actions "ods_xero_1.dim_account"
+```
+
+Notes / prerequisites:
+- The SA must be able to **create the new datasets** `ods_xero_0` / `ods_xero_1` (`bigquery.datasets.create`). It already creates the `dw_1_*` datasets, so this should be in scope; if a run fails with a dataset-create permission error, an admin grants the SA that permission (or pre-creates the two datasets in `europe-north2`).
+- Run from the `Dataform/` dir so `.df-credentials.json` and `workflow_settings.yaml` are picked up.
+- `--dry-run` validates against BQ without creating anything (assertion steps will report the target tables "not found" under dry-run — that is expected, not a failure).
 
 ---
 
@@ -589,14 +883,13 @@ INFO: Merged 126 row(s) into accounts
 
 Things known to be incomplete or pending external input, as of 2026-07-06:
 
-### Journals not yet in GCS (GL source of truth)
-- The Xero `/Journals` endpoint (the general ledger — where every transaction posts) is **not yet in the bucket** for any tenant, including the three expected ones (`19b25bd5…`, `83adbd31…`, `9dc5d3f0…`). Confirmed by listing every endpoint folder per tenant.
-- Colleague confirmed journals **will** arrive eventually but the sync isn't writing them yet (access issues on their side).
-- **Do not confuse `journals` (GL) with `manual_journals` (hand-entered only)** — both are separate Xero endpoints; only `manual_journals` is currently synced.
-- **Parser was removed 2026-07-07** under the bucket-driven policy (see below). Payload format is verified against `dw_1_bronze_xero.xero_journals` and documented in `docs/STAGING_XERO.md`. `endpoint_config.py` still carries the `Journals` / `JournalID` mapping.
-- **When journals land:** the drift detector will flag it. Restore the parser with `git show <pre-2026-07-07-commit>:etl/xero/journals.py > etl/xero/journals.py`, add it back to the PARSERS maps in `backfill_gcs.py` and `cloud_function/main.py`, then run `python -m etl.backfill_gcs journals`.
-- **Multi-tenant caveat:** colleague noted journals access is failing for tenants beyond the three named (`19b25bd5…`, `83adbd31…`, `9dc5d3f0…`). Verify all expected tenants produce journals once the sync is fixed.
-- **Keep `dw_1_bronze_xero` (or its deprecated copy) until journals are live** — it's the reference payload for rebuilding the parser.
+### Journals — FULLY RESOLVED for all 7 tenants (2026-07-23)
+
+**Update 2026-07-23:** what looked like "3 more tenants" turned out to be a **bucket switch** — the live sync had moved from `aquatiq-dw-dev-storage` (frozen since 2026-07-08) to `gs://prj-dw-dev-raw`. All **7** tenants (6 known + 1 new: `dcb20a20…`, "Aqua Pharma Inc") have journals there, with real multi-year history (back to 2017 for one tenant). Pipeline repointed to the new bucket; journals re-backfilled: `staging_xero.journals` **73,401 rows**, `journal_lines` **226,687 rows**, 100% balance on `net_amount`. Full write-up + the bucket-discovery story: see RESUME HERE at the top.
+
+**Superseded 2026-07-09 update (kept for history):** journals were first confirmed for only 3 tenants (`19b25bd5…` 130, `83adbd31…` 42, `9dc5d3f0…` 750 — 922 total) — but that was reading the now-frozen old bucket. See above for the real, current state.
+- **Do not confuse `journals` (GL) with `manual_journals` (hand-entered only)** — both are separate Xero endpoints; `manual_journals` has been synced (and built into the ODS) for all 6 *original* tenants throughout (not yet re-checked for the new 7th tenant).
+- **Keep `dw_1_bronze_xero` (or its deprecated copy)** — still useful as a reference/fallback for the journals payload shape.
 
 ### Parser policy — bucket-driven, not project-driven (changed 2026-07-07)
 
@@ -606,9 +899,11 @@ Previously we carried 28 parsers, all ported from the frozen `dw_1_bronze_xero` 
 
 **Removed 2026-07-07** (were old-project-only, absent from GCS): `bank_transfers`, `batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `journals`, `linked_transactions`, `overpayments`, `payment_services`, `prepayments`, `receipts`, `repeating_invoices`.
 
-These are **preserved in git history** (commit before this change) and their payloads are documented in `docs/STAGING_XERO.md`. Rebuilding any one is a quick `git show <commit>:etl/xero/<name>.py` + re-add to the two PARSERS maps.
+**`journals` restored 2026-07-09** — see "Journals" above. This is the intended lifecycle of the policy working as designed: removed speculatively, drift detection flagged it landing in the bucket, restored from git with the payload unchanged.
 
-> Note: `journals` was removed too, even though it is confirmed coming. When it lands, the drift detector (below) flags it and we restore the parser from git — no need to carry it speculatively in the meantime. Its payload is verified and documented.
+**`bank_transfers`/`overpayments` restored 2026-07-24** — same lifecycle again, this time triggered by the GL-reconciliation `source_type` mapping exercise (see RESUME HERE) rather than a drift-detection warning alone. Both had real data in the bucket for a while (confirmed via drift warnings on every backfill run) but nothing had needed them until `journals.source_type IN ('TRANSFER','APOVERPAYMENT','AROVERPAYMENT')` gave a concrete reason to close the gap.
+
+The remaining 8 (`batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `prepayments`, `receipts`, `repeating_invoices`) are still **preserved in git history** (commit before the 2026-07-07 removal) and documented in `docs/STAGING_XERO.md`. They continue to appear in the bucket (drift detection flags them on every backfill run) — build a parser only when a report actually needs one. `payment_services` remains absent from the bucket entirely.
 
 ### Drift detection — get warned when a new endpoint appears
 
@@ -619,7 +914,7 @@ Both entry points now compare bucket endpoints against the parser set and warn o
 
 `KNOWN_UNPARSED` (endpoints intentionally skipped, kept out of warnings): `bills` — proven subset of `invoices` (ACCPAY).
 
-**Current parser inventory: 16 parsers, all backed by live GCS data.** When your colleague adds or renames a sync endpoint, the next backfill run or Cloud Function event surfaces it automatically — that is the signal to build the parser from the real payload.
+**Current parser inventory (2026-07-24, later): 25 parsers, all backed by live GCS data** (19 endpoint-scoped + `etl/xero/reports.py`, one shared module registered under all 6 `report_*` endpoint names — see RESUME HERE for the full write-up). `bank_transfers` and `overpayments` restored this session to close GL-reconciliation source_type gaps (see RESUME HERE). **8 endpoints remain unparsed** in `prj-dw-dev-raw` (`batch_payments`, `budgets`, `contact_groups`, `expense_claims`, `linked_transactions`, `prepayments`, `receipts`, `repeating_invoices`) — flagged by drift detection every run; build a parser when a report needs one. `contact_groups` specifically unblocks the deferred `dim_contact` group-membership reconciliation (Decision 5) if it's ever built.
 
 ### Cloud Function not yet deployed
 - `cloud_function/main.py` imports from `etl.xero.*` — the `etl/` package must be bundled with the function source before deploy. Resolve packaging (copy `etl/` into the function dir, or restructure with `pyproject.toml`).
