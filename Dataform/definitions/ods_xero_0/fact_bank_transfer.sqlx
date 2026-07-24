@@ -1,0 +1,50 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_bank_transfer",
+  description: "ODS Xero L0 (native): Xero bank transfers (/BankTransfers — money moved between two of the org's own bank accounts). Header grain, no lines, no tax. Native Xero vocabulary; audit anchor. Built 2026-07-24 to close the journals.source_type='TRANSFER' GL-reconciliation gap. ⚠ Each transfer also posts a matching SPEND + RECEIVE row in fact_bank_transaction_line (linked via from/to_bank_transaction_id) — never sum this fact alongside fact_bank_transaction_line in the same total, that double-counts the same cash movement.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["bank_transfer_key", "tenant_id", "bank_transfer_id"],
+    uniqueKey: ["bank_transfer_key"]
+  }
+}
+
+WITH transfers AS (
+  SELECT *
+  FROM ${ref("staging_xero", "bank_transfers")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, bank_transfer_id ORDER BY synced_at DESC) = 1
+)
+
+SELECT
+  CONCAT(CAST(tenant_id AS STRING), '|', CAST(bank_transfer_id AS STRING)) AS bank_transfer_key,
+  tenant_id,
+
+  bank_transfer_id,
+  reference,
+  status,
+
+  from_bank_account_id,
+  from_bank_account_code,
+  from_bank_account_name,
+  to_bank_account_id,
+  to_bank_account_code,
+  to_bank_account_name,
+
+  -- Links back to the matching pair in bank_transactions (double-count guard)
+  from_bank_transaction_id,
+  to_bank_transaction_id,
+  from_is_reconciled,
+  to_is_reconciled,
+
+  transfer_date,
+  created_at,
+  updated_at,
+
+  amount,
+  currency_rate,
+  has_attachments,
+
+  synced_at,
+  first_seen_at
+FROM transfers

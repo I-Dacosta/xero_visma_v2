@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "manual_journals",
+  description: "Staging: Xero manual journals header (hand-entered GL adjustments — distinct from the /Journals general ledger). One row per tenant_id + manual_journal_id. Populated outside Dataform by the Python ETL."
+}

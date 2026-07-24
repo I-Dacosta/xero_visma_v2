@@ -1,0 +1,23 @@
+config {
+  type: "assertion",
+  tags: ["ods", "xero", "l1", "assertion"],
+  description: "Balance guard for ods_xero_1.fact_manual_journal_line: signed GL posting amounts must sum to ~0 per manual journal (double-entry). Uses a count threshold — one journal is a genuine source imbalance (2026-07-08), so the assertion fails only if MORE than 5 journals are unbalanced, which would indicate the posting-amount formula regressed (it would unbalance hundreds)."
+}
+
+WITH journal_balance AS (
+  SELECT manual_journal_id, SUM(amount) AS posting_balance
+  FROM ${ref("ods_xero_1", "fact_manual_journal_line")}
+  GROUP BY manual_journal_id
+),
+
+unbalanced AS (
+  SELECT COUNT(*) AS unbalanced_journals
+  FROM journal_balance
+  WHERE ABS(posting_balance) > 0.02
+)
+
+-- Returns a row (fails) only if the number of unbalanced journals exceeds the
+-- known-good baseline. Expected unbalanced today: 1.
+SELECT unbalanced_journals
+FROM unbalanced
+WHERE unbalanced_journals > 5

@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "contact_addresses",
+  description: "Staging: Xero contact addresses child table (from contacts endpoint Addresses[]). One row per contact_id + address_type (STREET, POBOX). Populated outside Dataform — declared here so ODS models can ref() it."
+}

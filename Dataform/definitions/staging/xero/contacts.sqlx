@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "contacts",
+  description: "Staging: Xero contacts header, parsed from GCS raw JSON by the Python ETL (etl/xero/contacts.py). One row per tenant_id + contact_id. Populated outside Dataform — declared here so ODS models can ref() it."
+}

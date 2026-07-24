@@ -1,0 +1,85 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "fact_manual_journal_line",
+  description: "ODS Xero L1 (harmonized): Xero manual journal lines as signed GL postings. Unlike the document facts, amounts are NOT net-normalized — GL postings must stay at their balancing (gross) value. amount = signed posting = line_amount + (tax_amount when line_amount_types='Exclusive', else 0); this sums to 0 per journal (double-entry). Guarded by assert_fact_manual_journal_line_balances.",
+  tags: ["ods", "xero", "l1", "fact"],
+  assertions: {
+    nonNull: ["manual_journal_line_key", "tenant_id", "manual_journal_id"],
+    uniqueKey: ["manual_journal_line_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_1.fact_manual_journal_line
+-- Source: ods_xero_0.fact_manual_journal_line
+--   + ods_xero_0.dim_tracking_option (resolve category_id + option NAME -> key)
+-- Grain:  one row per manual journal line
+--
+-- GL POSTING AMOUNT (not a document measure — do NOT net-normalize):
+--   amount = line_amount + IF(line_amount_types = 'Exclusive', tax_amount, 0)
+-- Rationale (verified on live data): manual journals balance to 0 per journal on
+--   * line_amount            when NoTax / Inclusive (tax already in line_amount)
+--   * line_amount + tax      when Exclusive (tax posts separately)
+-- so the expression above is the signed amount that actually hits the account
+-- and makes debits = credits. Base currency (manual journals carry no currency).
+-- =============================================================================
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "fact_manual_journal_line")}
+),
+
+tracking_options AS (
+  SELECT tenant_id, tracking_category_id, option_name, tracking_option_key
+  FROM ${ref("ods_xero_0", "dim_tracking_option")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, tracking_category_id, option_name ORDER BY tracking_option_id) = 1
+)
+
+SELECT
+  n.manual_journal_line_key,
+  n.tenant_id,
+  n.manual_journal_id,
+  n.line_number,
+
+  -- Document attributes
+  CAST(n.manual_journal_id AS STRING)                     AS reference_number,
+  'MANUALJOURNAL'                                         AS document_type,
+  n.status,
+  n.narration,
+  DATE(n.journal_date)                                    AS document_date,
+  CAST(FORMAT_DATE('%Y%m%d', DATE(n.journal_date)) AS INT64) AS date_key,
+
+  -- Conformed dimension keys (no currency/contact on manual journals)
+  CONCAT(n.tenant_id, '|', n.account_id)                  AS account_key,
+  to1.tracking_option_key                                 AS tracking_option_key_1,
+  to2.tracking_option_key                                 AS tracking_option_key_2,
+
+  n.description                                           AS line_description,
+
+  -- Signed GL posting amount (balances to 0 per journal; base currency)
+  n.line_amount + IF(n.line_amount_types = 'Exclusive', COALESCE(n.tax_amount, 0), 0) AS amount,
+  n.line_amount,
+  n.tax_amount,
+  n.line_amount_types,
+  n.is_blank,
+
+  -- Native references
+  n.account_id,
+  n.account_code,
+  n.tax_type,
+  n.tracking_category_1_name,
+  n.tracking_option_1_name,
+  n.tracking_category_2_name,
+  n.tracking_option_2_name,
+
+  n.synced_at,
+  'xero'                                                  AS source_system
+
+FROM native AS n
+LEFT JOIN tracking_options AS to1
+  ON to1.tenant_id = n.tenant_id AND to1.tracking_category_id = n.tracking_category_1_id
+ AND to1.option_name = n.tracking_option_1_name
+LEFT JOIN tracking_options AS to2
+  ON to2.tenant_id = n.tenant_id AND to2.tracking_category_id = n.tracking_category_2_id
+ AND to2.option_name = n.tracking_option_2_name

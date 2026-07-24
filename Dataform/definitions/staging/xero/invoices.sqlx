@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "invoices",
+  description: "Staging: Xero invoices header (both ACCREC customer invoices and ACCPAY bills). One row per tenant_id + invoice_id. Populated outside Dataform by the Python ETL."
+}

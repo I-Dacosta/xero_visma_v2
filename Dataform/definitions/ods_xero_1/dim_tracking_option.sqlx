@@ -1,0 +1,13 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "dim_tracking_option",
+  description: "ODS Xero L1 (harmonized): Xero tracking options. Xero-specific concept with no Visma equivalent — pass-through of ods_xero_0.dim_tracking_option plus source_system tag.",
+  tags: ["ods", "xero", "l1", "dimension"],
+  assertions: { nonNull: ["tracking_option_key", "tenant_id", "tracking_option_id"], uniqueKey: ["tracking_option_key"] }
+}
+
+SELECT
+  *,
+  'xero' AS source_system
+FROM ${ref("ods_xero_0", "dim_tracking_option")}

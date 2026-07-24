@@ -1,0 +1,36 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "dim_organisation",
+  description: "ODS Xero L0 (native): Xero organisation (one per tenant). One row per tenant_id + organisation_id. Native Xero vocabulary; audit anchor. Canonical legal-entity resolution is deferred (Decision 6) and happens at _1/omnibus via the extended seed_entity_mapping.",
+  tags: ["ods", "xero", "l0", "dimension"],
+  assertions: { nonNull: ["organisation_key", "tenant_id", "organisation_id"], uniqueKey: ["organisation_key"] }
+}
+
+WITH organisations AS (
+  SELECT *
+  FROM ${ref("staging_xero", "organisations")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, organisation_id ORDER BY synced_at DESC) = 1
+)
+
+SELECT
+  CONCAT(CAST(tenant_id AS STRING), '|', CAST(organisation_id AS STRING)) AS organisation_key,
+  tenant_id,
+
+  organisation_id,
+  organisation_name,
+  legal_name,
+  organisation_type,
+  registration_number,
+  tax_number,
+  base_currency,
+  country_code,
+  status,
+  is_demo_company,
+  financial_year_end_day,
+  financial_year_end_month,
+
+  created_at,
+  synced_at,
+  first_seen_at
+FROM organisations

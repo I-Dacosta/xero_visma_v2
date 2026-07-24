@@ -1,0 +1,55 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "fact_general_ledger",
+  description: "ODS Xero L1 (harmonized): the Xero GL in Visma-adjacent vocabulary (account_key, date_key, document_type=source_type, signed amount=net_amount). No tax normalization — net_amount is already the correct GL posting measure (unlike document facts, which needed net-of-gross derivation). NOT split into debit_amount/credit_amount (Visma's own convention) yet — deferred until omnibus alignment actually needs it; a single signed amount is sufficient for the reconciliation checks this table exists for right now.",
+  tags: ["ods", "xero", "l1", "fact"],
+  assertions: {
+    nonNull: ["general_ledger_line_key", "tenant_id", "journal_id", "journal_line_id"],
+    uniqueKey: ["general_ledger_line_key"]
+  }
+}
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "fact_general_ledger")}
+)
+
+SELECT
+  general_ledger_line_key,
+  tenant_id,
+  journal_id,
+  journal_line_id,
+
+  journal_number                                          AS reference_number,
+  source_type                                             AS document_type,
+  source_id                                                AS document_id,
+  reference,
+  journal_date                                             AS document_date,
+  date_key,
+
+  CONCAT(tenant_id, '|', account_id)                       AS account_key,
+  tracking_option_key_1,
+  tracking_option_key_2,
+
+  description                                              AS line_description,
+
+  -- Signed GL posting amount (base currency; already the correct balancing
+  -- measure — see "Xero tax basis" / journals net_amount note).
+  net_amount                                               AS amount,
+  gross_amount,
+  tax_amount,
+
+  -- Native references
+  account_id,
+  account_code,
+  account_name,
+  account_type,
+  tracking_category_1_name,
+  tracking_option_1_name,
+  tracking_category_2_name,
+  tracking_option_2_name,
+
+  synced_at,
+  'xero'                                                   AS source_system
+
+FROM native

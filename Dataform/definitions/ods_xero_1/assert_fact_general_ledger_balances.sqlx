@@ -1,0 +1,23 @@
+config {
+  type: "assertion",
+  tags: ["ods", "xero", "l1", "assertion"],
+  description: "Balance guard for ods_xero_1.fact_general_ledger: signed GL posting amounts must sum to ~0 per journal (double-entry). Verified 2026-07-24: 70,590/70,590 journals balance on net_amount (100%). Fails only if MORE than 5 journals are unbalanced, mirroring the manual-journal-line threshold — a real regression (e.g. reverting to gross_amount, or a merge-key bug like the one found in manual_journal_lines) would unbalance thousands, not a handful."
+}
+
+WITH journal_balance AS (
+  SELECT journal_id, SUM(amount) AS posting_balance
+  FROM ${ref("ods_xero_1", "fact_general_ledger")}
+  GROUP BY journal_id
+),
+
+unbalanced AS (
+  SELECT COUNT(*) AS unbalanced_journals
+  FROM journal_balance
+  WHERE ABS(posting_balance) > 0.02
+)
+
+-- Returns a row (fails) only if the number of unbalanced journals exceeds the
+-- known-good baseline. Expected unbalanced today: 0.
+SELECT unbalanced_journals
+FROM unbalanced
+WHERE unbalanced_journals > 5

@@ -1,0 +1,107 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "dim_account",
+  description: "ODS Xero L1 (harmonized): Xero chart of accounts expressed in Visma/group vocabulary so it can UNION with Visma at ods_omnibus_0. Classification is derived ONLY from Xero's own metadata (no hand-authored crosswalk): bs_pl/fsli_1 from the definitional account_class correspondence; native reporting_code/reporting_name carried through for accountant review. fsli_2/fsli_3 and analytical flags are left unmapped pending accountant-defined group mapping.",
+  tags: ["ods", "xero", "l1", "dimension"],
+  assertions: {
+    nonNull: ["account_key", "tenant_id", "source_account_id"],
+    uniqueKey: ["account_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_1.dim_account
+-- ODS Layer 1 (Visma/group vocabulary)
+-- Source: ods_xero_0.dim_account
+-- Grain:  one row per tenant_id + account_id (same grain as _0)
+--
+-- Design (decided 2026-07-07): ship Xero's existing metadata through the DW,
+-- show it to the accountants, and let them define the group mapping where the
+-- native metadata is insufficient. Therefore:
+--   * bs_pl / fsli_1  <- account_class  (definitional, not a guess)
+--   * fsli_2 / fsli_3, EBITDA / cash-flow / NWC / capex, account_code_1/2/3
+--     <- left NULL / 'unmapped' until accountants define the crosswalk.
+--   * Xero's native reporting_code hierarchy is carried through so the finer
+--     structure is visible next to the coarse group mapping.
+-- When accountants supply the mapping logic, add a seed here and populate the
+-- currently-null columns — the column skeleton and UNION shape already match.
+-- =============================================================================
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "dim_account")}
+)
+
+SELECT
+  -- Keys ----------------------------------------------------------------------
+  account_key,
+  tenant_id,
+  account_id                                        AS source_account_id,
+
+  -- Conformed reporting account number (Visma calls this account_cd) ----------
+  account_code                                      AS account_cd,
+  SAFE_CAST(account_code AS INT64)                  AS account_cd_numeric,
+
+  -- Attributes ----------------------------------------------------------------
+  account_name,
+  account_description,
+
+  -- Native Xero classification, carried through for accountant review ---------
+  account_class,
+  account_type,
+  status,
+  is_active,
+  tax_type,
+  bank_account_type,
+  reporting_code,
+  reporting_name,
+  reporting_code_name,
+
+  -- Harmonized group vocabulary (Visma FSLI) ----------------------------------
+  -- Definitional correspondence from account_class (same label set Visma uses
+  -- for its native account_type fallback), so the coarse P&L/BS split works now.
+  CASE
+    WHEN account_class IN ('ASSET', 'LIABILITY', 'EQUITY') THEN 'BS'
+    WHEN account_class IN ('REVENUE', 'EXPENSE')           THEN 'P&L'
+  END                                               AS bs_pl,
+
+  CASE
+    WHEN account_class = 'ASSET'     THEN 'Assets'
+    WHEN account_class = 'LIABILITY' THEN 'Equity and liabilities'
+    WHEN account_class = 'EQUITY'    THEN 'Equity and liabilities'
+    WHEN account_class = 'REVENUE'   THEN 'Revenue'
+    WHEN account_class = 'EXPENSE'   THEN 'Operating expenses'
+  END                                               AS fsli_1,
+
+  -- Finer group levels + analytical flags: pending accountant-defined mapping.
+  -- Typed NULLs keep the schema stable and UNION-compatible with Visma _1.
+  CAST(NULL AS STRING)                              AS fsli_2,
+  CAST(NULL AS STRING)                              AS fsli_3,
+  CAST(NULL AS INT64)                               AS account_code_1,
+  CAST(NULL AS INT64)                               AS account_code_2,
+  CAST(NULL AS INT64)                               AS account_code_3,
+  CAST(NULL AS BOOL)                                AS is_ebitda,
+  CAST(NULL AS BOOL)                                AS is_net_income,
+  CAST(NULL AS STRING)                              AS cf_1,
+  CAST(NULL AS STRING)                              AS cf_2,
+  CAST(NULL AS STRING)                              AS cf_3,
+  CAST(NULL AS BOOL)                                AS is_nwc,
+  CAST(NULL AS BOOL)                                AS is_capex,
+  CAST(NULL AS STRING)                              AS intercompany_flag,
+  CAST(NULL AS STRING)                              AS chart_of_accounts_source,
+  FALSE                                             AS has_hierarchy,
+
+  -- Provenance: which tier of the (currently minimal) cascade classified this.
+  CASE
+    WHEN account_class IN ('ASSET','LIABILITY','EQUITY','REVENUE','EXPENSE')
+      THEN 'native_account_class'
+    ELSE 'unmapped'
+  END                                               AS account_mapping_method,
+
+  -- Timestamps ----------------------------------------------------------------
+  updated_at,
+  synced_at,
+
+  'xero'                                            AS source_system
+
+FROM native

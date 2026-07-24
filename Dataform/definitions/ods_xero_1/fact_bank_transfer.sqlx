@@ -1,0 +1,53 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "fact_bank_transfer",
+  description: "ODS Xero L1 (harmonized): Xero bank transfers. Header grain, no lines, no tax — light renames only (document_date/date_key, from/to_account_key). amount_base = amount * currency_rate. ⚠ Never sum alongside fact_bank_transaction_line — see the double-count warning on ods_xero_0.fact_bank_transfer.",
+  tags: ["ods", "xero", "l1", "fact"],
+  assertions: {
+    nonNull: ["bank_transfer_key", "tenant_id", "bank_transfer_id"],
+    uniqueKey: ["bank_transfer_key"]
+  }
+}
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "fact_bank_transfer")}
+)
+
+SELECT
+  bank_transfer_key,
+  tenant_id,
+  bank_transfer_id,
+
+  reference                                        AS reference_number,
+  status,
+  DATE(transfer_date)                              AS document_date,
+  CAST(FORMAT_DATE('%Y%m%d', DATE(transfer_date)) AS INT64) AS date_key,
+
+  -- Conformed dimension keys
+  CONCAT(tenant_id, '|', from_bank_account_id)     AS from_account_key,
+  CONCAT(tenant_id, '|', to_bank_account_id)        AS to_account_key,
+
+  -- Links back to the matching pair in fact_bank_transaction_line
+  from_bank_transaction_id,
+  to_bank_transaction_id,
+  from_is_reconciled,
+  to_is_reconciled,
+
+  -- Measures
+  amount                                           AS amount_in_currency,
+  amount * COALESCE(currency_rate, 1)              AS amount,
+  currency_rate,
+
+  -- Native references
+  from_bank_account_id,
+  from_bank_account_code,
+  from_bank_account_name,
+  to_bank_account_id,
+  to_bank_account_code,
+  to_bank_account_name,
+
+  has_attachments,
+  synced_at,
+  'xero'                                           AS source_system
+FROM native

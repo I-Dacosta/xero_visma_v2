@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "payments",
+  description: "Staging: Xero payments (against invoices; ACCRECPAYMENT / ACCPAYPAYMENT). Header grain — one row per tenant_id + payment_id. Populated outside Dataform by the Python ETL."
+}

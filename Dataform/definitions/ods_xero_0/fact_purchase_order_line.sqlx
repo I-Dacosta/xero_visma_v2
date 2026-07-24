@@ -1,0 +1,72 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_purchase_order_line",
+  description: "ODS Xero L0 (native): Xero purchase order lines at line grain, with header context denormalized. LINE measures only. Native Xero vocabulary; audit anchor.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["purchase_order_line_key", "tenant_id", "line_item_id", "purchase_order_id"],
+    uniqueKey: ["purchase_order_line_key"]
+  }
+}
+
+WITH header AS (
+  SELECT *
+  FROM ${ref("staging_xero", "purchase_orders")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, purchase_order_id ORDER BY synced_at DESC) = 1
+),
+
+lines AS (
+  SELECT * FROM ${ref("staging_xero", "purchase_order_lines")}
+)
+
+SELECT
+  CONCAT(CAST(l.tenant_id AS STRING), '|', CAST(l.line_item_id AS STRING)) AS purchase_order_line_key,
+  l.tenant_id,
+
+  l.line_item_id,
+  l.purchase_order_id,
+  ROW_NUMBER() OVER (PARTITION BY l.tenant_id, l.purchase_order_id ORDER BY l.line_item_id) AS line_number,
+
+  -- Header context
+  h.purchase_order_number,
+  h.purchase_order_type,
+  h.status,
+  h.reference,
+  h.contact_id,
+  h.contact_name,
+  h.currency_code,
+  h.currency_rate,
+  h.order_date,
+  h.order_date_local,
+  h.branding_theme_id,
+  h.line_amount_types,
+
+  -- Line dimension references (native; PO lines carry account_code, no account_id)
+  l.account_code,
+  l.item_code,
+  l.tax_type,
+  l.tracking_category_1_id,
+  l.tracking_category_1_name,
+  l.tracking_option_1_id,
+  l.tracking_option_1_name,
+  l.tracking_category_2_id,
+  l.tracking_category_2_name,
+  l.tracking_option_2_id,
+  l.tracking_option_2_name,
+
+  l.description,
+
+  -- Line measures (transaction currency)
+  l.quantity,
+  l.unit_amount,
+  l.line_amount,
+  l.tax_amount,
+  SAFE_CAST(l.discount_rate AS FLOAT64) AS discount_rate,
+
+  h.updated_at,
+  h.synced_at
+
+FROM lines AS l
+LEFT JOIN header AS h
+  ON h.tenant_id = l.tenant_id AND h.purchase_order_id = l.purchase_order_id

@@ -1,0 +1,54 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "fact_payment",
+  description: "ODS Xero L1 (harmonized): Xero payments in Visma fact_customer_payment vocabulary. Header grain (no lines, no tax). Covers ACCRECPAYMENT + ACCPAYPAYMENT (document_type); customer/supplier split deferred to omnibus. amount_base = amount * currency_rate. Xero payments carry no currency_code, so no currency_key.",
+  tags: ["ods", "xero", "l1", "fact"],
+  assertions: {
+    nonNull: ["payment_key", "tenant_id", "payment_id"],
+    uniqueKey: ["payment_key"]
+  }
+}
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "fact_payment")}
+)
+
+SELECT
+  payment_key,
+  tenant_id,
+  payment_id,
+
+  -- Document attributes
+  payment_type                                     AS document_type,
+  status,
+  reference                                        AS reference_number,
+  DATE(payment_date)                               AS document_date,
+  CAST(FORMAT_DATE('%Y%m%d', DATE(payment_date)) AS INT64) AS date_key,
+  is_reconciled,
+
+  -- Conformed dimension keys (no currency_key — payments carry no currency_code)
+  CONCAT(tenant_id, '|', account_id)               AS account_key,
+  CONCAT(tenant_id, '|', contact_id)               AS contact_key,
+
+  -- Applied-to document (native references)
+  invoice_id,
+  invoice_number,
+  invoice_type                                     AS applied_document_type,
+  batch_payment_id,
+
+  -- Measures
+  amount                                           AS amount_in_currency,
+  amount * COALESCE(currency_rate, 1)              AS amount,
+  bank_amount,
+  currency_rate,
+
+  -- Native references
+  account_id,
+  account_code,
+  contact_id,
+  contact_name,
+
+  synced_at,
+  'xero'                                           AS source_system
+FROM native

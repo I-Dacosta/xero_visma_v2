@@ -1,0 +1,12 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "accounts",
+  description: "Staging: Xero chart of accounts, parsed from GCS raw JSON by the Python ETL (etl/xero/accounts.py). Flat, fully typed, one row per tenant_id + account_id. Populated outside Dataform — declared here so ODS models can ref() it."
+}
+
+-- Source declaration only. This table is written by the Python ETL, not Dataform.
+-- Grain: one current row per (tenant_id, record_id) via the ETL MERGE.
+-- Key native columns: account_id, account_code, account_name, account_type,
+--   account_class, status, tax_type, bank_account_type, reporting_code,
+--   reporting_name, reporting_code_name, updated_at, synced_at.

@@ -1,0 +1,150 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "fact_invoice_line",
+  description: "ODS Xero L1 (harmonized): Xero invoice lines in Visma fact_customer_invoice_line vocabulary. Covers ACCREC + ACCPAY (document_type); customer/supplier split deferred to omnibus. IMPORTANT: amount_in_currency / amount are NET of tax (tax-exclusive) on EVERY row — Xero's raw line_amount is tax-inclusive when line_amount_types='Inclusive', so it is normalized to net here (line_amount - tax_amount) so the measure has a single consistent basis and ties to header sub_total. line_amount_types is carried for transparency. See 'Xero tax basis' in docs/DWH_ARCHITECTURE.md and the reconciliation assertion.",
+  tags: ["ods", "xero", "l1", "fact"],
+  assertions: {
+    nonNull: ["invoice_line_key", "tenant_id", "line_item_id", "invoice_id"],
+    uniqueKey: ["invoice_line_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_1.fact_invoice_line
+-- ODS Layer 1 (Visma/group vocabulary)
+-- Source: ods_xero_0.fact_invoice_line
+--   + ods_xero_0.dim_item            (resolve item_code -> item_key)
+--   + ods_xero_0.dim_tracking_option (resolve category_id + option NAME -> key)
+-- Grain:  one row per tenant_id + line_item_id (same as _0)
+--
+-- ── TAX BASIS (critical) ─────────────────────────────────────────────────────
+-- Xero's raw line_amount is NOT a consistent measure. It depends on the
+-- invoice header's line_amount_types:
+--   * 'Exclusive' / 'NoTax' -> line_amount is NET (tax-exclusive)
+--   * 'Inclusive'           -> line_amount INCLUDES tax
+-- Summing the raw value across a mix would overstate Inclusive invoices by their
+-- tax. Visma's fact_customer_invoice_line.amount is net, so we normalize to net
+-- here: Inclusive -> line_amount - tax_amount; else line_amount. After this,
+-- SUM(amount_in_currency) per invoice ties to header sub_total for 15,294/15,294
+-- invoices (verified). Guarded by assert_fact_invoice_line_reconciles.
+-- gross = amount_in_currency + tax_amount_in_currency (line_amount_types carried).
+-- The same rule applies to every Xero transactional fact (credit notes, POs,
+-- quotes, bank transactions).
+--
+-- Conformed dimension keys use the same formula as the target dims:
+--   account_key = tenant_id|account_id, contact_key = tenant_id|contact_id,
+--   currency_key = tenant_id|currency_code, item_key = tenant_id|item_id,
+--   tracking_option_key_n = dim_tracking_option key resolved by (category_id, name).
+-- Deferred: company_key / entity resolution (Decision 6); tracking -> Visma
+-- project/subaccount/branch mapping (org-specific; tracking carried natively).
+-- =============================================================================
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "fact_invoice_line")}
+),
+
+base AS (
+  SELECT
+    *,
+    -- Net (tax-exclusive) transaction-currency line amount — consistent basis.
+    CASE
+      WHEN line_amount_types = 'Inclusive'
+        THEN line_amount - COALESCE(tax_amount, 0)
+      ELSE line_amount
+    END AS net_amount_in_currency
+  FROM native
+),
+
+items AS (
+  -- Dedup by (tenant_id, item_code): item_code is not a guaranteed unique key
+  -- in dim_item (keyed on item_id), so collapse to one row per code to avoid
+  -- fanning out the line grain on the join below.
+  SELECT tenant_id, item_code, item_id, item_key
+  FROM ${ref("ods_xero_0", "dim_item")}
+  WHERE item_code IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, item_code ORDER BY item_id) = 1
+),
+
+tracking_options AS (
+  -- Xero invoice-line tracking carries the category id + option NAME (not the
+  -- option id), so resolve the conformed option key by (category_id, name).
+  SELECT tenant_id, tracking_category_id, option_name, tracking_option_key
+  FROM ${ref("ods_xero_0", "dim_tracking_option")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, tracking_category_id, option_name ORDER BY tracking_option_id
+  ) = 1
+)
+
+SELECT
+  n.invoice_line_key,
+  n.tenant_id,
+  n.line_item_id,
+  n.invoice_id,
+  n.line_number,
+
+  -- Document attributes (Visma vocabulary)
+  n.invoice_number                                        AS reference_number,
+  n.invoice_type                                          AS document_type,
+  n.status,
+  DATE(n.invoice_date)                                    AS document_date,
+  CAST(FORMAT_DATE('%Y%m%d', DATE(n.invoice_date)) AS INT64) AS date_key,
+  n.due_date_local                                        AS due_date,
+
+  -- Conformed dimension keys
+  CONCAT(n.tenant_id, '|', n.account_id)                  AS account_key,
+  CONCAT(n.tenant_id, '|', n.contact_id)                  AS contact_key,
+  CONCAT(n.tenant_id, '|', n.currency_code)               AS currency_key,
+  i.item_key,
+  to1.tracking_option_key                                 AS tracking_option_key_1,
+  to2.tracking_option_key                                 AS tracking_option_key_2,
+
+  -- Currency
+  n.currency_code                                         AS currency_id,
+  n.currency_rate,
+
+  -- Line detail
+  n.description                                           AS line_description,
+
+  -- Measures — transaction currency (amount is NET of tax; see TAX BASIS above)
+  n.quantity,
+  n.unit_amount                                           AS unit_price,
+  n.net_amount_in_currency                                AS amount_in_currency,
+  n.tax_amount                                            AS tax_amount_in_currency,
+  n.discount_rate                                         AS discount,
+  n.discount_amount                                       AS discount_amount_in_currency,
+
+  -- Measures — base (organisation) currency = net txn amount * currency_rate
+  n.net_amount_in_currency * COALESCE(n.currency_rate, 1) AS amount,
+  n.tax_amount             * COALESCE(n.currency_rate, 1) AS tax_amount,
+  n.discount_amount        * COALESCE(n.currency_rate, 1) AS discount_amount,
+
+  -- Tax basis flag (which basis the SOURCE line_amount used before normalization)
+  n.line_amount_types,
+
+  -- Xero-native references carried through for review
+  n.account_id,
+  n.account_code,
+  n.item_code,
+  n.tax_type,
+  n.tracking_category_1_name,
+  n.tracking_option_1_name,
+  n.tracking_category_2_name,
+  n.tracking_option_2_name,
+  n.contact_id,
+  n.contact_name,
+
+  n.synced_at,
+  'xero'                                                  AS source_system
+
+FROM base AS n
+LEFT JOIN items AS i
+  ON i.tenant_id = n.tenant_id AND i.item_code = n.item_code
+LEFT JOIN tracking_options AS to1
+  ON to1.tenant_id = n.tenant_id
+ AND to1.tracking_category_id = n.tracking_category_1_id
+ AND to1.option_name = n.tracking_option_1_name
+LEFT JOIN tracking_options AS to2
+  ON to2.tenant_id = n.tenant_id
+ AND to2.tracking_category_id = n.tracking_category_2_id
+ AND to2.option_name = n.tracking_option_2_name

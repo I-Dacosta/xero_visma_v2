@@ -1,0 +1,146 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "dim_contact",
+  description: "ODS Xero L0 (native): Xero contact master conformed to one row per tenant_id + contact_id. Joins the contacts header with its address and phone child tables (STREET/POBOX addresses and DEFAULT/MOBILE phones flattened onto the contact). Native Xero vocabulary, including the is_customer/is_supplier role flags (a contact can be both). Audit anchor.",
+  tags: ["ods", "xero", "l0", "dimension"],
+  assertions: {
+    nonNull: ["contact_key", "tenant_id", "contact_id"],
+    uniqueKey: ["contact_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_0.dim_contact
+-- ODS Layer 0 (native Xero vocabulary)
+-- Sources: staging_xero.contacts (header)
+--          staging_xero.contact_addresses (STREET + POBOX per contact)
+--          staging_xero.contact_phones    (DEFAULT + MOBILE, sparse)
+-- Grain:   one row per tenant_id + contact_id
+-- Key:     contact_key = tenant_id | contact_id
+-- Note:    Xero has ONE contact entity with is_customer / is_supplier flags
+--          (a contact can be both). No customer/supplier split here — that is
+--          a harmonization question handled at ods_xero_1. Addresses/phones are
+--          flattened onto the contact (design: contacts + children -> dim_contact).
+-- =============================================================================
+
+WITH contacts AS (
+  SELECT *
+  FROM ${ref("staging_xero", "contacts")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, contact_id
+    ORDER BY synced_at DESC
+  ) = 1
+),
+
+addresses AS (
+  SELECT
+    tenant_id,
+    contact_id,
+    -- STREET is the primary/physical address
+    MAX(IF(address_type = 'STREET', address_line_1, NULL)) AS street_address_line_1,
+    MAX(IF(address_type = 'STREET', address_line_2, NULL)) AS street_address_line_2,
+    MAX(IF(address_type = 'STREET', address_line_3, NULL)) AS street_address_line_3,
+    MAX(IF(address_type = 'STREET', address_line_4, NULL)) AS street_address_line_4,
+    MAX(IF(address_type = 'STREET', city,           NULL)) AS street_city,
+    MAX(IF(address_type = 'STREET', region,         NULL)) AS street_region,
+    MAX(IF(address_type = 'STREET', postal_code,    NULL)) AS street_postal_code,
+    MAX(IF(address_type = 'STREET', country,        NULL)) AS street_country,
+    MAX(IF(address_type = 'STREET', attention_to,   NULL)) AS street_attention_to,
+    -- POBOX is the postal address
+    MAX(IF(address_type = 'POBOX',  address_line_1, NULL)) AS pobox_address_line_1,
+    MAX(IF(address_type = 'POBOX',  city,           NULL)) AS pobox_city,
+    MAX(IF(address_type = 'POBOX',  postal_code,    NULL)) AS pobox_postal_code,
+    MAX(IF(address_type = 'POBOX',  country,        NULL)) AS pobox_country
+  FROM ${ref("staging_xero", "contact_addresses")}
+  GROUP BY tenant_id, contact_id
+),
+
+phones AS (
+  SELECT
+    tenant_id,
+    contact_id,
+    MAX(IF(phone_type = 'DEFAULT', phone_number, NULL)) AS phone_number,
+    MAX(IF(phone_type = 'DEFAULT', area_code,    NULL)) AS phone_area_code,
+    MAX(IF(phone_type = 'DEFAULT', country_code, NULL)) AS phone_country_code,
+    MAX(IF(phone_type = 'MOBILE',  phone_number, NULL)) AS mobile_number
+  FROM ${ref("staging_xero", "contact_phones")}
+  GROUP BY tenant_id, contact_id
+)
+
+SELECT
+  CONCAT(CAST(c.tenant_id AS STRING), '|', CAST(c.contact_id AS STRING)) AS contact_key,
+
+  c.tenant_id,
+
+  -- Natural keys
+  c.contact_id,
+  c.record_id                       AS contact_internal_id,
+  c.contact_number,
+  c.account_number,
+
+  -- Name
+  c.contact_name,
+  c.first_name,
+  c.last_name,
+
+  -- Roles / status (Xero native — a contact can be both customer and supplier)
+  c.is_customer,
+  c.is_supplier,
+  c.is_active,
+  c.status,
+
+  -- Contact info
+  c.email_address,
+  c.website,
+  p.phone_number,
+  p.phone_area_code,
+  p.phone_country_code,
+  p.mobile_number,
+
+  -- Street (physical) address
+  a.street_address_line_1,
+  a.street_address_line_2,
+  a.street_address_line_3,
+  a.street_address_line_4,
+  a.street_city,
+  a.street_region,
+  a.street_postal_code,
+  a.street_country,
+  a.street_attention_to,
+
+  -- PO box (postal) address
+  a.pobox_address_line_1,
+  a.pobox_city,
+  a.pobox_postal_code,
+  a.pobox_country,
+
+  -- Financial attributes (Xero native)
+  c.tax_number,
+  c.ap_tax_type,
+  c.ar_tax_type,
+  c.default_currency,
+  c.default_discount_pct,
+  c.branding_theme_id,
+  c.ar_outstanding,
+  c.ap_outstanding,
+  c.ar_overdue,
+  c.ap_overdue,
+
+  -- Counts / flags carried from the header payload
+  c.group_count,
+  c.phone_count,
+  c.address_count,
+  c.has_validation_errors,
+  c.has_attachments,
+
+  -- Timestamps
+  c.updated_at,
+  c.synced_at,
+  c.first_seen_at
+
+FROM contacts AS c
+LEFT JOIN addresses AS a
+  ON a.tenant_id = c.tenant_id AND a.contact_id = c.contact_id
+LEFT JOIN phones AS p
+  ON p.tenant_id = c.tenant_id AND p.contact_id = c.contact_id

@@ -1,0 +1,75 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "dim_account",
+  description: "ODS Xero L0 (native): Xero chart of accounts conformed in Xero's own vocabulary. Straight pass-through of staging_xero.accounts with a stable surrogate key. Audit anchor — ties 1:1 to the Xero chart-of-accounts UI. No classification/FSLI derivation here (that is ods_xero_1).",
+  tags: ["ods", "xero", "l0", "dimension"],
+  assertions: {
+    nonNull: ["account_key", "tenant_id", "account_id"],
+    uniqueKey: ["account_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_0.dim_account
+-- ODS Layer 0 (native Xero vocabulary)
+-- Source: staging_xero.accounts (Python-populated; declared in definitions/staging/xero)
+-- Grain:  one row per tenant_id + account_id
+-- Key:    account_key = tenant_id | account_id  (GUID; account_code is nullable
+--         on bank/system accounts, so it cannot be the key)
+-- Note:   Pass-through only. Native account_class kept raw
+--         (ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE). No bs_pl/fsli derivation.
+-- =============================================================================
+
+WITH accounts AS (
+  SELECT
+    *
+  FROM ${ref("staging_xero", "accounts")}
+  -- Staging already MERGEs to one current row per (tenant_id, record_id);
+  -- QUALIFY is defensive against any duplicate that slips through.
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, account_id
+    ORDER BY synced_at DESC
+  ) = 1
+)
+
+SELECT
+  CONCAT(CAST(tenant_id AS STRING), '|', CAST(account_id AS STRING)) AS account_key,
+
+  tenant_id,
+
+  -- Natural keys
+  account_id,
+  record_id                                                         AS account_internal_id,
+  account_code,
+
+  -- Classification (Xero native)
+  account_type,
+  account_class,
+  status,
+  is_active,
+  tax_type,
+  bank_account_type,
+
+  -- Attributes
+  account_name,
+  account_description,
+
+  -- Xero reporting metadata (native management-report taxonomy)
+  reporting_code,
+  reporting_name,
+  reporting_code_name,
+
+  -- Boolean flags
+  show_in_expense_claims,
+  enable_payments_to_account,
+  add_to_watchlist,
+  has_attachments,
+
+  -- Timestamps
+  updated_at,
+  reporting_code_updated_at,
+  synced_at,
+  first_seen_at
+
+FROM accounts

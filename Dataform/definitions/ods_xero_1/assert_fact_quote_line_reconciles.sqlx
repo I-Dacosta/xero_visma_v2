@@ -1,0 +1,28 @@
+config {
+  type: "assertion",
+  tags: ["ods", "xero", "l1", "assertion"],
+  description: "Reconciliation guard for ods_xero_1.fact_quote_line: net line amounts must sum, per quote, to the header sub_total. Uses a count threshold — 2 quotes are known genuine source inconsistencies (both status='INVOICED', total_discount=0; a quote's own totals can go stale once converted to an invoice, since the invoice becomes the source of truth), verified 2026-07-24 against 1,193 quotes. Fails only if MORE than 5 quotes mismatch, which would indicate the tax-basis normalization regressed (that breaks hundreds of quotes, not a handful). See 'Xero tax basis' in docs/DWH_ARCHITECTURE.md."
+}
+
+WITH line_sums AS (
+  SELECT tenant_id, quote_id, SUM(amount_in_currency) AS net_line_total
+  FROM ${ref("ods_xero_1", "fact_quote_line")}
+  GROUP BY tenant_id, quote_id
+),
+header AS (
+  SELECT tenant_id, quote_id, sub_total
+  FROM ${ref("staging_xero", "quotes")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, quote_id ORDER BY synced_at DESC) = 1
+),
+mismatched AS (
+  SELECT COUNT(*) AS mismatched_quotes
+  FROM line_sums ls
+  JOIN header h USING(tenant_id, quote_id)
+  WHERE ABS(ls.net_line_total - h.sub_total) > 0.02 + 0.001 * ABS(h.sub_total)
+)
+
+-- Returns a row (fails) only if the number of mismatched quotes exceeds the
+-- known-good baseline. Expected mismatched today: 2.
+SELECT mismatched_quotes
+FROM mismatched
+WHERE mismatched_quotes > 5

@@ -1,0 +1,13 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "dim_tax_rate",
+  description: "ODS Xero L1 (harmonized): Xero tax rates. Xero-specific concept with no Visma equivalent — pass-through of ods_xero_0.dim_tax_rate plus source_system tag.",
+  tags: ["ods", "xero", "l1", "dimension"],
+  assertions: { nonNull: ["tax_rate_key", "tenant_id", "tax_type"], uniqueKey: ["tax_rate_key"] }
+}
+
+SELECT
+  *,
+  'xero' AS source_system
+FROM ${ref("ods_xero_0", "dim_tax_rate")}

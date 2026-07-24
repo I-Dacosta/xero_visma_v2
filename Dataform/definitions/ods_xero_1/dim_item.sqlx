@@ -1,0 +1,42 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "dim_item",
+  description: "ODS Xero L1 (harmonized): Xero items in Visma inventory-item vocabulary (inventory_number, item_description, is_stock_item, default_price). Xero-native purchase/sales/cost attributes carried through. Visma-only inventory attributes are omitted (omnibus aligns columns).",
+  tags: ["ods", "xero", "l1", "dimension"],
+  assertions: { nonNull: ["item_key", "tenant_id", "source_item_id"], uniqueKey: ["item_key"] }
+}
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "dim_item")}
+)
+
+SELECT
+  item_key,
+  tenant_id,
+  item_id                       AS source_item_id,
+
+  -- Harmonized (Visma inventory vocabulary)
+  item_code                     AS inventory_number,
+  item_name,
+  description                   AS item_description,
+  is_tracked_as_inventory       AS is_stock_item,
+  sales_unit_price              AS default_price,
+  sales_tax_type                AS vat_code,
+
+  -- Xero-native attributes carried through for review
+  is_sold,
+  is_purchased,
+  purchase_description,
+  purchase_unit_price,
+  sales_account_code,
+  cogs_account_code,
+  purchase_tax_type,
+  quantity_on_hand,
+  total_cost_pool,
+
+  updated_at                    AS last_modified_at,
+  synced_at,
+
+  'xero'                        AS source_system
+FROM native

@@ -1,0 +1,21 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "dim_currency",
+  description: "ODS Xero L1 (harmonized): Xero currencies in Visma vocabulary (currency_code, currency_description). Visma-only currency attributes (symbol, decimal_precision, is_base_currency, …) are omitted; omnibus aligns columns.",
+  tags: ["ods", "xero", "l1", "dimension"],
+  assertions: { nonNull: ["currency_key", "tenant_id", "currency_code"], uniqueKey: ["currency_key"] }
+}
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "dim_currency")}
+)
+
+SELECT
+  currency_key,
+  tenant_id,
+  currency_code,
+  currency_description,
+  synced_at,
+  'xero' AS source_system
+FROM native

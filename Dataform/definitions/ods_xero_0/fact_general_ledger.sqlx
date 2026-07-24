@@ -1,0 +1,102 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_general_ledger",
+  description: "ODS Xero L0 (native): the Xero general ledger (/Journals) at posting-line grain, header context denormalized. This is the complete, authoritative GL — every document type (invoices, credit notes, payments, bank transactions, manual journals, payroll, overpayments) posts here, tagged by source_type. Signed GL amounts (net_amount; debit positive / credit negative), base currency. Audit anchor.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["general_ledger_line_key", "tenant_id", "journal_id", "journal_line_id"],
+    uniqueKey: ["general_ledger_line_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_0.fact_general_ledger
+-- Sources: staging_xero.journal_lines (line) + staging_xero.journals (header)
+-- Grain:   one row per tenant_id + journal_id + journal_line_id
+-- Key:     general_ledger_line_key = tenant_id | journal_id | journal_line_id
+--          (journal_line_id is a REAL native Xero field — JournalLineID — no
+--          synthesized-key risk here, unlike manual_journal_lines.)
+--
+-- ⚠ RELATIONSHIP TO fact_manual_journal_line: journals already includes manual
+-- journal postings as source_type='MANJOURNAL' (confirmed 2026-07-24: each
+-- MANJOURNAL journal_id's source_id traces back to a real manual_journal_id).
+-- This table is the COMPLETE GL on its own. Never sum this together with
+-- fact_manual_journal_line — that would double-count. fact_manual_journal_line
+-- stays as a separate, narrower document-level view (e.g. for narration).
+--
+-- Measure: net_amount is the GL posting amount (verified 100% balanced,
+-- 70,590/70,590 journals, debits+credits sum to 0 per journal) — see "Xero
+-- journals status + net_amount" in docs/DWH_ARCHITECTURE.md /
+-- docs/STAGING_XERO.md for why gross_amount is NOT usable here (it double-
+-- counts tax on the origin line).
+-- =============================================================================
+
+WITH header AS (
+  SELECT *
+  FROM ${ref("staging_xero", "journals")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, journal_id ORDER BY synced_at DESC) = 1
+),
+
+lines AS (
+  SELECT * FROM ${ref("staging_xero", "journal_lines")}
+),
+
+tracking_options AS (
+  -- Journals carry category id + option NAME only (no option id) — same
+  -- resolution pattern as every other transactional fact.
+  SELECT tenant_id, tracking_category_id, option_name, tracking_option_key
+  FROM ${ref("ods_xero_0", "dim_tracking_option")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, tracking_category_id, option_name ORDER BY tracking_option_id) = 1
+)
+
+SELECT
+  CONCAT(l.tenant_id, '|', l.journal_id, '|', l.journal_line_id) AS general_ledger_line_key,
+  l.tenant_id,
+
+  l.journal_id,
+  l.journal_line_id,
+
+  -- Header context
+  h.journal_number,
+  h.source_id,
+  h.source_type,
+  h.reference,
+  DATE(h.journal_date)                                    AS journal_date,
+  CAST(FORMAT_DATE('%Y%m%d', DATE(h.journal_date)) AS INT64) AS date_key,
+  h.created_at,
+
+  -- Line dimension references (native)
+  l.account_id,
+  l.account_code,
+  l.account_name,
+  l.account_type,
+  to1.tracking_option_key                                 AS tracking_option_key_1,
+  to2.tracking_option_key                                 AS tracking_option_key_2,
+  l.tracking_category_1_id,
+  l.tracking_category_1_name,
+  l.tracking_option_1_name,
+  l.tracking_category_2_id,
+  l.tracking_category_2_name,
+  l.tracking_option_2_name,
+
+  l.description,
+
+  -- GL posting measures (base currency; net_amount is the balancing measure)
+  l.net_amount,
+  l.gross_amount,
+  l.tax_amount,
+
+  h.synced_at,
+  h.first_seen_at
+
+FROM lines AS l
+LEFT JOIN header AS h
+  ON h.tenant_id = l.tenant_id AND h.journal_id = l.journal_id
+LEFT JOIN tracking_options AS to1
+  ON to1.tenant_id = l.tenant_id AND to1.tracking_category_id = l.tracking_category_1_id
+ AND to1.option_name = l.tracking_option_1_name
+LEFT JOIN tracking_options AS to2
+  ON to2.tenant_id = l.tenant_id AND to2.tracking_category_id = l.tracking_category_2_id
+ AND to2.option_name = l.tracking_option_2_name

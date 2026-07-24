@@ -1,0 +1,44 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "dim_item",
+  description: "ODS Xero L0 (native): Xero items (products/services). One row per tenant_id + item_id. Native Xero vocabulary; audit anchor.",
+  tags: ["ods", "xero", "l0", "dimension"],
+  assertions: { nonNull: ["item_key", "tenant_id", "item_id"], uniqueKey: ["item_key"] }
+}
+
+WITH items AS (
+  SELECT *
+  FROM ${ref("staging_xero", "items")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, item_id ORDER BY synced_at DESC) = 1
+)
+
+SELECT
+  CONCAT(CAST(tenant_id AS STRING), '|', CAST(item_id AS STRING)) AS item_key,
+  tenant_id,
+
+  item_id,
+  record_id                     AS item_internal_id,
+  item_code,
+  item_name,
+  description,
+  purchase_description,
+
+  is_sold,
+  is_purchased,
+  is_tracked_as_inventory,
+
+  sales_unit_price,
+  purchase_unit_price,
+  sales_account_code,
+  cogs_account_code,
+  sales_tax_type,
+  purchase_tax_type,
+
+  quantity_on_hand,
+  total_cost_pool,
+
+  updated_at,
+  synced_at,
+  first_seen_at
+FROM items

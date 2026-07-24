@@ -1,0 +1,87 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_report_row",
+  description: "ODS Xero L0 (native): Xero Reports API snapshots (balance sheet, bank/budget/executive summary, P&L, trial balance) flattened to long form, with snapshot header context denormalized onto each cell. Grain: one row per cell (report x snapshot x section x row x cell). Audit anchor — ties 1:1 to Xero's own report output. Intended reconciliation target for our own bottom-up document/GL facts (join on attribute_id='account' + attribute_value = dim_account.account_id).",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["report_row_key", "tenant_id", "record_id"],
+    uniqueKey: ["report_row_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_0.fact_report_row
+-- Sources: staging_xero.report_rows (cell grain) + staging_xero.report_snapshots (header)
+-- Grain:   one row per tenant_id + record_id(snapshot) + report_index +
+--          section_index + row_index + cell_index
+-- Key:     report_row_key = tenant_id | record_id | report_index | section_index
+--                           | row_index | cell_index
+-- Note:    Snapshots, not entities — record_id = "<report>|<run_id>" (see
+--          etl/xero/reports.py). A re-run for the same date window is a new
+--          row here, never an update; this table is append-only history, same
+--          as staging. report_date is parsed here (SAFE.PARSE_DATE) rather
+--          than trusted from staging's typing, which can vary by which
+--          concurrent backfill job happened to create the table first.
+-- Reconciliation hook: attribute_id/attribute_value link a cell to an entity
+--          (e.g. {"account", "<account-guid>"}) — but not every "account"
+--          value is a real UUID (Xero synthetic group sentinels exist, e.g.
+--          "FXGROUPID") — filter for UUID shape before joining to dim_account.
+--          attributes_json carries the full Attributes[] for cells that carry
+--          more than one (~2% of cells — e.g. account + tracking category).
+-- =============================================================================
+
+WITH snapshots AS (
+  SELECT *
+  FROM ${ref("staging_xero", "report_snapshots")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, record_id ORDER BY synced_at DESC) = 1
+),
+
+rows_ AS (
+  SELECT * FROM ${ref("staging_xero", "report_rows")}
+)
+
+SELECT
+  CONCAT(
+    r.tenant_id, '|', r.record_id, '|',
+    CAST(r.report_index AS STRING), '|', CAST(r.section_index AS STRING), '|',
+    CAST(r.row_index AS STRING), '|', CAST(r.cell_index AS STRING)
+  )                                                        AS report_row_key,
+  r.tenant_id,
+  r.record_id,
+  r.report,
+
+  -- Snapshot / header context (denormalized onto each cell)
+  s.report_id,
+  s.report_name,
+  s.report_type,
+  s.report_titles,
+  SAFE.PARSE_DATE('%Y-%m-%d', CAST(s.report_date AS STRING)) AS report_date,
+  s.report_from,
+  s.report_to,
+  s.run_id,
+  s.report_updated_utc,
+
+  -- Position within the report (the long-form grain)
+  r.report_index,
+  r.section_index,
+  r.section_title,
+  r.row_index,
+  r.row_type,
+  r.cell_index,
+
+  -- Cell content
+  r.row_label,
+  r.column_header,
+  r.cell_value,
+  SAFE_CAST(r.cell_value AS FLOAT64)                        AS cell_value_numeric,
+  r.attribute_id,
+  r.attribute_value,
+  r.attributes_json,
+
+  s.synced_at,
+  s.first_seen_at
+
+FROM rows_ AS r
+LEFT JOIN snapshots AS s
+  ON s.tenant_id = r.tenant_id AND s.record_id = r.record_id

@@ -1,0 +1,111 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "fact_overpayment_line",
+  description: "ODS Xero L1 (harmonized): Xero overpayment lines. Covers RECEIVE-OVERPAYMENT (AR) + SPEND-OVERPAYMENT (AP) via overpayment_type (document_type); customer/supplier split deferred to omnibus. amount_in_currency / amount are NET of tax on every row (Inclusive -> line_amount - tax_amount); see 'Xero tax basis' in docs/DWH_ARCHITECTURE.md. Guarded by assert_fact_overpayment_line_reconciles.",
+  tags: ["ods", "xero", "l1", "fact"],
+  assertions: {
+    nonNull: ["overpayment_line_key", "tenant_id", "line_item_id", "overpayment_id"],
+    uniqueKey: ["overpayment_line_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_1.fact_overpayment_line
+-- Source: ods_xero_0.fact_overpayment_line
+--   + ods_xero_0.dim_tracking_option (resolve category_id + option NAME -> key)
+-- Grain:  one row per tenant_id + line_item_id
+--
+-- TAX BASIS: amount is normalized to NET of tax (Inclusive -> line_amount -
+-- tax_amount), same rule as every other transactional fact. See the shared
+-- "Xero tax basis" section in docs/DWH_ARCHITECTURE.md.
+-- =============================================================================
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "fact_overpayment_line")}
+),
+
+base AS (
+  SELECT
+    *,
+    CASE
+      WHEN line_amount_types = 'Inclusive'
+        THEN line_amount - COALESCE(tax_amount, 0)
+      ELSE line_amount
+    END AS net_amount_in_currency
+  FROM native
+),
+
+tracking_options AS (
+  SELECT tenant_id, tracking_category_id, option_name, tracking_option_key
+  FROM ${ref("ods_xero_0", "dim_tracking_option")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, tracking_category_id, option_name ORDER BY tracking_option_id
+  ) = 1
+)
+
+SELECT
+  n.overpayment_line_key,
+  n.tenant_id,
+  n.line_item_id,
+  n.overpayment_id,
+  n.line_number,
+
+  -- Document attributes (Visma vocabulary)
+  n.overpayment_type                                      AS document_type,
+  n.status,
+  n.reference                                             AS reference_number,
+  DATE(n.overpayment_date)                                AS document_date,
+  CAST(FORMAT_DATE('%Y%m%d', DATE(n.overpayment_date)) AS INT64) AS date_key,
+
+  -- Conformed dimension keys
+  CONCAT(n.tenant_id, '|', n.account_id)                  AS account_key,
+  CONCAT(n.tenant_id, '|', n.contact_id)                  AS contact_key,
+  CONCAT(n.tenant_id, '|', n.currency_code)               AS currency_key,
+  to1.tracking_option_key                                 AS tracking_option_key_1,
+  to2.tracking_option_key                                 AS tracking_option_key_2,
+
+  -- Currency
+  n.currency_code                                         AS currency_id,
+  n.currency_rate,
+
+  -- Line detail
+  n.description                                           AS line_description,
+
+  -- Measures — transaction currency (amount is NET of tax; see TAX BASIS)
+  n.quantity,
+  n.unit_amount                                           AS unit_price,
+  n.net_amount_in_currency                                AS amount_in_currency,
+  n.tax_amount                                            AS tax_amount_in_currency,
+
+  -- Measures — base (organisation) currency = net txn amount * currency_rate
+  n.net_amount_in_currency * COALESCE(n.currency_rate, 1) AS amount,
+  n.tax_amount             * COALESCE(n.currency_rate, 1) AS tax_amount,
+
+  -- Tax basis flag
+  n.line_amount_types,
+  n.remaining_credit,
+
+  -- Xero-native references carried through
+  n.account_id,
+  n.account_code,
+  n.tax_type,
+  n.tracking_category_1_name,
+  n.tracking_option_1_name,
+  n.tracking_category_2_name,
+  n.tracking_option_2_name,
+  n.contact_id,
+  n.contact_name,
+
+  n.synced_at,
+  'xero'                                                  AS source_system
+
+FROM base AS n
+LEFT JOIN tracking_options AS to1
+  ON to1.tenant_id = n.tenant_id
+ AND to1.tracking_category_id = n.tracking_category_1_id
+ AND to1.option_name = n.tracking_option_1_name
+LEFT JOIN tracking_options AS to2
+  ON to2.tenant_id = n.tenant_id
+ AND to2.tracking_category_id = n.tracking_category_2_id
+ AND to2.option_name = n.tracking_option_2_name

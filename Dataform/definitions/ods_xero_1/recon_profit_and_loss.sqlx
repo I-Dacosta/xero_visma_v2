@@ -1,0 +1,99 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "recon_profit_and_loss",
+  description: "Reconciliation (diagnostic, not a hard assertion yet): our own fact_general_ledger, aggregated per P&L account over the CURRENT report period, vs Xero's own report_profit_and_loss. Unlike Trial Balance (YTD, fiscal-year-bounded), this report is period-bounded via report_from/report_to (verified empirically: every snapshot observed has report_from = 1st of the current calendar month — i.e. Xero's default 'this month' P&L window, not a fiscal-year window). One row per tenant + account; diffs are the reconciliation signal.",
+  tags: ["ods", "xero", "l1", "reconciliation"]
+}
+
+-- =============================================================================
+-- ods_xero_1.recon_profit_and_loss
+-- Sources: fact_general_ledger (ours) + fact_report_row (Xero's own P&L report) + dim_account
+--
+-- ⚠ SIGN CONVENTION — verified empirically, not assumed (2026-07-24). Xero's P&L
+-- report displays "management report" style: BOTH revenue and expense cells are
+-- shown as positive/unsigned dollar amounts (section headers like "Less Cost of
+-- Sales" carry the subtraction meaning, not the cell sign). Our fact_general_ledger
+-- .amount is a signed double-entry measure (same net_amount convention verified
+-- for fact_general_ledger's own balance assertion). Tested both conventions
+-- against real data across all tenants:
+--   EXPENSE accounts: our_amount matches Xero's cell value with NO sign flip  (64/64 = 100%)
+--   REVENUE accounts: our_amount matches Xero's cell value ONLY when negated  (16/16 = 100%)
+-- This is the P&L-equivalent of the net_amount/gross_amount and line_amount_types
+-- gotchas elsewhere in this pipeline — a provider amount field whose sign/basis
+-- silently depends on context. Do not remove the CASE WHEN below.
+--
+-- Scoped to dim_account.bs_pl = 'P&L' on the "our" side deliberately — GL activity
+-- can post to balance-sheet accounts (bank movements, tax control, AR/AP) within
+-- the same date window, which Xero correctly never includes in a P&L report.
+-- Without this filter those accounts show up as spurious "missing from Xero"
+-- rows; they are not a reconciliation gap, just out-of-scope for this report.
+-- =============================================================================
+
+WITH latest_snapshot AS (
+  SELECT tenant_id, record_id, report_from, report_to
+  FROM ${ref("ods_xero_1", "fact_report_row")}
+  WHERE report = 'report_profit_and_loss'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY report_to DESC) = 1
+),
+
+xero_pl AS (
+  SELECT
+    r.tenant_id,
+    r.attribute_value AS account_id,
+    ANY_VALUE(r.row_label) AS account_label,
+    SUM(COALESCE(r.cell_value_numeric, 0)) AS xero_amount
+  FROM ${ref("ods_xero_1", "fact_report_row")} AS r
+  JOIN latest_snapshot AS s
+    ON s.tenant_id = r.tenant_id AND s.record_id = r.record_id
+  WHERE r.report = 'report_profit_and_loss'
+    AND r.attribute_id = 'account'
+    -- Some "account" attributes are Xero synthetic group sentinels (e.g.
+    -- "FXGROUPID" on the rolled-up FX gain/loss line), not real account UUIDs.
+    AND REGEXP_CONTAINS(r.attribute_value, r'^[0-9a-f]{8}-[0-9a-f]{4}-')
+    -- The account-label cell (column_header = '') carries the row_label as its
+    -- own "cell_value", not a number — exclude it, keep only the data column.
+    AND r.column_header != ''
+  GROUP BY 1, 2
+),
+
+acct AS (
+  SELECT tenant_id, source_account_id AS account_id, account_class
+  FROM ${ref("ods_xero_1", "dim_account")}
+  WHERE bs_pl = 'P&L'
+),
+
+our_pl AS (
+  SELECT
+    gl.tenant_id,
+    gl.account_id,
+    SUM(gl.amount) AS our_amount
+  FROM ${ref("ods_xero_1", "fact_general_ledger")} AS gl
+  JOIN latest_snapshot AS s ON s.tenant_id = gl.tenant_id
+  JOIN acct AS a ON a.tenant_id = gl.tenant_id AND a.account_id = gl.account_id
+  WHERE gl.document_date BETWEEN s.report_from AND s.report_to
+  GROUP BY 1, 2
+)
+
+SELECT
+  COALESCE(x.tenant_id, o.tenant_id)   AS tenant_id,
+  COALESCE(x.account_id, o.account_id) AS account_id,
+  x.account_label,
+  a.account_class,
+  s.report_from,
+  s.report_to,
+  x.xero_amount,
+  o.our_amount,
+  CASE WHEN a.account_class = 'REVENUE' THEN -x.xero_amount ELSE x.xero_amount END AS xero_amount_signed,
+  ROUND(
+    COALESCE(o.our_amount, 0)
+    - COALESCE(CASE WHEN a.account_class = 'REVENUE' THEN -x.xero_amount ELSE x.xero_amount END, 0),
+    2
+  ) AS diff
+FROM xero_pl AS x
+FULL OUTER JOIN our_pl AS o
+  ON o.tenant_id = x.tenant_id AND o.account_id = x.account_id
+LEFT JOIN acct AS a
+  ON a.tenant_id = COALESCE(x.tenant_id, o.tenant_id) AND a.account_id = COALESCE(x.account_id, o.account_id)
+LEFT JOIN latest_snapshot AS s
+  ON s.tenant_id = COALESCE(x.tenant_id, o.tenant_id)

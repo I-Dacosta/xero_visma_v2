@@ -1,0 +1,21 @@
+config {
+  type: "assertion",
+  tags: ["ods", "xero", "l1", "assertion"],
+  description: "Reconciliation guard for ods_xero_1.fact_purchase_order_line: net line amounts must sum, per purchase order, to the header sub_total. Fails the build if the tax-basis normalization regresses. See 'Xero tax basis' in docs/DWH_ARCHITECTURE.md."
+}
+
+WITH line_sums AS (
+  SELECT tenant_id, purchase_order_id, SUM(amount_in_currency) AS net_line_total
+  FROM ${ref("ods_xero_1", "fact_purchase_order_line")}
+  GROUP BY tenant_id, purchase_order_id
+),
+header AS (
+  SELECT tenant_id, purchase_order_id, sub_total
+  FROM ${ref("staging_xero", "purchase_orders")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, purchase_order_id ORDER BY synced_at DESC) = 1
+)
+SELECT ls.tenant_id, ls.purchase_order_id,
+  ROUND(ls.net_line_total,2) AS net_line_total, ROUND(h.sub_total,2) AS header_sub_total,
+  ROUND(ls.net_line_total - h.sub_total,2) AS diff
+FROM line_sums ls JOIN header h USING(tenant_id, purchase_order_id)
+WHERE ABS(ls.net_line_total - h.sub_total) > 0.02 + 0.001 * ABS(h.sub_total)

@@ -1,0 +1,78 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_manual_journal_line",
+  description: "ODS Xero L0 (native): Xero manual journal lines at line grain, header context denormalized. Signed GL postings (debit positive / credit negative). Xero manual journal lines have NO LineItemID, so the line key uses staging's line_position (this line's 0-based index in Xero's own JournalLines[] array — see etl/xero/manual_journals.py; a journal CAN have multiple lines against the same account, confirmed 2026-07-24, which is why account_id alone is not a valid key). No tax normalization (GL postings must stay gross to balance). Native Xero vocabulary; audit anchor.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["manual_journal_line_key", "tenant_id", "manual_journal_id"],
+    uniqueKey: ["manual_journal_line_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_0.fact_manual_journal_line
+-- Sources: staging_xero.manual_journal_lines (line) + staging_xero.manual_journals (header)
+-- Grain:   one row per manual journal line
+-- Key:     manual_journal_line_key = tenant_id | manual_journal_id | line_position
+--          (line_position = this line's 0-based index in Xero's own
+--          JournalLines[] array, assigned by the parser — no native LineItemID
+--          exists, and account_id is NOT unique within a journal: a real
+--          journal can post two separate lines to the same account with
+--          different amounts. Using line_position as the staging MERGE key
+--          fixed a bug where such journals silently lost/duplicated lines —
+--          342 of 1,882 manual journals were unbalanced before this fix,
+--          1 after (a single pre-existing genuine source anomaly).
+-- Note:    No currency / contact on manual journals (base-currency GL entries).
+-- =============================================================================
+
+WITH header AS (
+  SELECT *
+  FROM ${ref("staging_xero", "manual_journals")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, manual_journal_id ORDER BY synced_at DESC) = 1
+),
+
+lines AS (
+  SELECT * FROM ${ref("staging_xero", "manual_journal_lines")}
+)
+
+SELECT
+  CONCAT(CAST(l.tenant_id AS STRING), '|', CAST(l.manual_journal_id AS STRING), '|', CAST(l.line_position AS STRING)) AS manual_journal_line_key,
+  l.tenant_id,
+
+  l.manual_journal_id,
+  l.line_position AS line_number,
+
+  -- Header context
+  h.status,
+  h.narration,
+  h.line_amount_types,
+  h.show_on_cash_basis_reports,
+  h.journal_date,
+
+  -- Line dimension references (native)
+  l.account_id,
+  l.account_code,
+  l.tax_type,
+  l.tracking_category_1_id,
+  l.tracking_category_1_name,
+  l.tracking_option_1_id,
+  l.tracking_option_1_name,
+  l.tracking_category_2_id,
+  l.tracking_category_2_name,
+  l.tracking_option_2_id,
+  l.tracking_option_2_name,
+
+  l.description,
+  l.is_blank,
+
+  -- Line measures (signed GL amounts, base currency)
+  l.line_amount,
+  l.tax_amount,
+
+  h.updated_at,
+  h.synced_at
+
+FROM lines AS l
+LEFT JOIN header AS h
+  ON h.tenant_id = l.tenant_id AND h.manual_journal_id = l.manual_journal_id

@@ -1,0 +1,88 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "fact_quote_line",
+  description: "ODS Xero L1 (harmonized): Xero quote lines. Pre-sales documents — no account/item keys. amount_in_currency / amount are NET of tax on every row (Inclusive -> line_amount - tax_amount); see 'Xero tax basis' in docs/DWH_ARCHITECTURE.md. Guarded by assert_fact_quote_line_reconciles.",
+  tags: ["ods", "xero", "l1", "fact"],
+  assertions: {
+    nonNull: ["quote_line_key", "tenant_id", "line_item_id", "quote_id"],
+    uniqueKey: ["quote_line_key"]
+  }
+}
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "fact_quote_line")}
+),
+
+base AS (
+  SELECT *,
+    CASE WHEN line_amount_types = 'Inclusive'
+         THEN line_amount - COALESCE(tax_amount, 0) ELSE line_amount END AS net_amount_in_currency
+  FROM native
+),
+
+tracking_options AS (
+  SELECT tenant_id, tracking_category_id, option_name, tracking_option_key
+  FROM ${ref("ods_xero_0", "dim_tracking_option")}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tenant_id, tracking_category_id, option_name ORDER BY tracking_option_id) = 1
+)
+
+SELECT
+  n.quote_line_key,
+  n.tenant_id,
+  n.line_item_id,
+  n.quote_id,
+  n.line_number,
+
+  -- Document attributes
+  n.quote_number                                          AS reference_number,
+  'QUOTE'                                                 AS document_type,
+  n.status,
+  DATE(n.quote_date)                                      AS document_date,
+  CAST(FORMAT_DATE('%Y%m%d', DATE(n.quote_date)) AS INT64) AS date_key,
+  DATE(n.expiry_date)                                     AS expiry_date,
+
+  -- Conformed dimension keys (no account/item on quotes)
+  CONCAT(n.tenant_id, '|', n.contact_id)                  AS contact_key,
+  CONCAT(n.tenant_id, '|', n.currency_code)               AS currency_key,
+  to1.tracking_option_key                                 AS tracking_option_key_1,
+  to2.tracking_option_key                                 AS tracking_option_key_2,
+
+  -- Currency
+  n.currency_code                                         AS currency_id,
+  n.currency_rate,
+
+  n.description                                           AS line_description,
+
+  -- Measures — transaction currency (NET of tax)
+  n.quantity,
+  n.unit_amount                                           AS unit_price,
+  n.net_amount_in_currency                                AS amount_in_currency,
+  n.tax_amount                                            AS tax_amount_in_currency,
+  SAFE_CAST(n.discount_amount AS FLOAT64)                 AS discount_amount_in_currency,
+
+  -- Measures — base currency
+  n.net_amount_in_currency * COALESCE(n.currency_rate, 1) AS amount,
+  n.tax_amount             * COALESCE(n.currency_rate, 1) AS tax_amount,
+
+  n.line_amount_types,
+
+  -- Native references
+  n.tracking_category_1_name,
+  n.tracking_option_1_name,
+  n.tracking_category_2_name,
+  n.tracking_option_2_name,
+  n.contact_id,
+  n.contact_name,
+
+  n.synced_at,
+  'xero'                                                  AS source_system
+
+FROM base AS n
+LEFT JOIN tracking_options AS to1
+  ON to1.tenant_id = n.tenant_id AND to1.tracking_category_id = n.tracking_category_1_id
+ AND to1.option_name = n.tracking_option_1_name
+LEFT JOIN tracking_options AS to2
+  ON to2.tenant_id = n.tenant_id AND to2.tracking_category_id = n.tracking_category_2_id
+ AND to2.option_name = n.tracking_option_2_name

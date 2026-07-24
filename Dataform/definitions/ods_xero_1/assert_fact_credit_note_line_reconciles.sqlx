@@ -1,0 +1,28 @@
+config {
+  type: "assertion",
+  tags: ["ods", "xero", "l1", "assertion"],
+  description: "Reconciliation guard for ods_xero_1.fact_credit_note_line: net (tax-exclusive) line amounts must sum, per credit note, to the header sub_total. Fails the build if the tax-basis normalization regresses. See 'Xero tax basis' in docs/DWH_ARCHITECTURE.md."
+}
+
+WITH line_sums AS (
+  SELECT tenant_id, credit_note_id, SUM(amount_in_currency) AS net_line_total
+  FROM ${ref("ods_xero_1", "fact_credit_note_line")}
+  GROUP BY tenant_id, credit_note_id
+),
+
+header AS (
+  SELECT tenant_id, credit_note_id, sub_total
+  FROM ${ref("staging_xero", "credit_notes")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, credit_note_id ORDER BY synced_at DESC) = 1
+)
+
+SELECT
+  ls.tenant_id,
+  ls.credit_note_id,
+  ROUND(ls.net_line_total, 2) AS net_line_total,
+  ROUND(h.sub_total, 2)       AS header_sub_total,
+  ROUND(ls.net_line_total - h.sub_total, 2) AS diff
+FROM line_sums AS ls
+JOIN header AS h
+  ON h.tenant_id = ls.tenant_id AND h.credit_note_id = ls.credit_note_id
+WHERE ABS(ls.net_line_total - h.sub_total) > 0.02 + 0.001 * ABS(h.sub_total)

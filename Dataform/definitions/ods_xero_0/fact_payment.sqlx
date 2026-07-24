@@ -1,0 +1,52 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_payment",
+  description: "ODS Xero L0 (native): Xero payments against invoices (ACCRECPAYMENT / ACCPAYPAYMENT). Header grain — one row per payment (no line items). Native Xero vocabulary; audit anchor.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["payment_key", "tenant_id", "payment_id"],
+    uniqueKey: ["payment_key"]
+  }
+}
+
+WITH payments AS (
+  SELECT *
+  FROM ${ref("staging_xero", "payments")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, payment_id ORDER BY synced_at DESC) = 1
+)
+
+SELECT
+  CONCAT(CAST(tenant_id AS STRING), '|', CAST(payment_id AS STRING)) AS payment_key,
+  tenant_id,
+
+  payment_id,
+  payment_type,
+  status,
+  reference,
+  is_reconciled,
+  has_account,
+  has_validation_errors,
+
+  -- Dimension references (native)
+  account_id,
+  account_code,
+  contact_id,
+  contact_name,
+
+  -- Applied-to document (native)
+  invoice_id,
+  invoice_number,
+  invoice_type,
+  batch_payment_id,
+
+  -- Measures
+  amount,
+  bank_amount,
+  currency_rate,
+
+  payment_date,
+  updated_at,
+  synced_at,
+  first_seen_at
+FROM payments

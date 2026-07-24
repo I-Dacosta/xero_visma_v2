@@ -1,0 +1,35 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "dim_organisation",
+  description: "ODS Xero L1 (harmonized): Xero organisation with light Visma-vocabulary renames (corporate_id, currency_id). Canonical legal-entity resolution (Decision 6) is DEFERRED — the extended seed_entity_mapping (Xero tenant_id -> canonical entity) is not built yet, so entity_code / business_unit are not populated here. tenant_id preserved for audit.",
+  tags: ["ods", "xero", "l1", "dimension"],
+  assertions: { nonNull: ["organisation_key", "tenant_id", "source_organisation_id"], uniqueKey: ["organisation_key"] }
+}
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "dim_organisation")}
+)
+
+SELECT
+  organisation_key,
+  tenant_id,
+
+  organisation_id               AS source_organisation_id,
+  organisation_name,
+  legal_name,
+  organisation_type,
+  registration_number,
+  tax_number                    AS corporate_id,
+  base_currency                 AS currency_id,
+  country_code,
+  status,
+  is_demo_company,
+  financial_year_end_day,
+  financial_year_end_month,
+
+  created_at,
+  synced_at,
+
+  'xero'                        AS source_system
+FROM native

@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "report_rows",
+  description: "Staging: Xero Reports API rows flattened to long form — one row per cell (report x snapshot x section x row x cell). attribute_id/attribute_value carry the FIRST entity link on the cell (e.g. account/contact); attributes_json carries the full Attributes[] array for cells with more than one. Populated outside Dataform by etl/xero/reports.py."
+}

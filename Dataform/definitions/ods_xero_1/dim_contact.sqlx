@@ -1,0 +1,95 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "dim_contact",
+  description: "ODS Xero L1 (harmonized): Xero contact master in Visma master-attribute vocabulary (main_address_line1/2, main_city, main_state, main_postal_code, main_country, main_contact_email/phone, corporate_id, currency_id), one row per tenant_id + contact_id. Role flags (is_customer/is_supplier) are preserved so the omnibus layer can split into dim_customer / dim_supplier when it UNIONs with Visma. Xero-native receivable/payable balances carried through for review.",
+  tags: ["ods", "xero", "l1", "dimension"],
+  assertions: {
+    nonNull: ["contact_key", "tenant_id", "source_contact_id"],
+    uniqueKey: ["contact_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_1.dim_contact
+-- ODS Layer 1 (Visma/group vocabulary)
+-- Source: ods_xero_0.dim_contact
+-- Grain:  one row per tenant_id + contact_id (same grain as _0)
+--
+-- Harmonization scope (consistent with dim_account _1): rename to Visma's
+-- master-attribute vocabulary and carry Xero's own data through. We do NOT
+-- split into customer/supplier here — that changes grain/entity and is an
+-- omnibus UNION-time concern (Xero has one contact with role flags; Visma has
+-- separate dim_customer / dim_supplier). Role flags are preserved for that.
+--
+-- Data facts driving the deferred split (staging_xero.contacts, 1675 rows):
+--   supplier-only 917 | customer-only 105 | both 39 | neither 614.
+-- The 39 "both" belong in both omnibus dims; the 614 "neither" belong in
+-- neither role dim (they remain here in dim_contact). Resolve at omnibus.
+--
+-- Visma-specific attributes with no Xero source (credit_terms, price_class,
+-- sales_account_id, etc.) are intentionally omitted here rather than emitted as
+-- NULL noise; omnibus aligns columns when it merges with Visma.
+-- =============================================================================
+
+WITH native AS (
+  SELECT * FROM ${ref("ods_xero_0", "dim_contact")}
+)
+
+SELECT
+  -- Keys ----------------------------------------------------------------------
+  contact_key,
+  tenant_id,
+  contact_id                                        AS source_contact_id,
+  contact_internal_id,
+  contact_number,
+  account_number,
+
+  -- Name (entity-neutral; omnibus maps to customer_name / supplier_name) ------
+  contact_name,
+  first_name,
+  last_name,
+
+  -- Roles / status (drive the omnibus customer/supplier split) ----------------
+  is_customer,
+  is_supplier,
+  is_active,
+  status,
+
+  -- Harmonized identifiers (Visma vocabulary) --------------------------------
+  tax_number                                        AS corporate_id,
+  default_currency                                  AS currency_id,
+
+  -- Harmonized main contact info (Visma main_* naming) -----------------------
+  email_address                                     AS main_contact_email,
+  COALESCE(phone_number, mobile_number)             AS main_contact_phone,
+  NULLIF(
+    TRIM(CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, ''))),
+    ''
+  )                                                 AS main_contact_name,
+
+  -- Harmonized main address (from Xero STREET address, Visma main_* naming) ---
+  street_address_line_1                             AS main_address_line1,
+  street_address_line_2                             AS main_address_line2,
+  street_city                                       AS main_city,
+  street_region                                     AS main_state,
+  street_postal_code                                AS main_postal_code,
+  street_country                                    AS main_country,
+
+  -- Xero-native financial attributes, carried through for review -------------
+  ar_outstanding,
+  ap_outstanding,
+  ar_overdue,
+  ap_overdue,
+  default_discount_pct,
+  ar_tax_type,
+  ap_tax_type,
+  branding_theme_id,
+
+  -- Timestamps ----------------------------------------------------------------
+  updated_at                                        AS last_modified_at,
+  synced_at,
+
+  'xero'                                            AS source_system
+
+FROM native

@@ -1,0 +1,28 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "dim_tracking_option",
+  description: "ODS Xero L0 (native): Xero tracking options (values within a tracking category; referenced by transaction lines). One row per tenant_id + tracking_option_id. Native Xero vocabulary; audit anchor.",
+  tags: ["ods", "xero", "l0", "dimension"],
+  assertions: { nonNull: ["tracking_option_key", "tenant_id", "tracking_option_id"], uniqueKey: ["tracking_option_key"] }
+}
+
+WITH tracking_options AS (
+  SELECT *
+  FROM ${ref("staging_xero", "tracking_options")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, tracking_option_id ORDER BY option_name) = 1
+)
+
+SELECT
+  CONCAT(CAST(tenant_id AS STRING), '|', CAST(tracking_option_id AS STRING)) AS tracking_option_key,
+  tenant_id,
+
+  tracking_option_id,
+  tracking_category_id,
+  category_name,
+  option_name,
+  status,
+  is_active,
+  is_archived,
+  is_deleted
+FROM tracking_options

@@ -1,0 +1,175 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "recon_document_facts",
+  description: "Reconciliation (diagnostic, not a hard assertion — new territory): bottom-up comparison of every Xero document fact against fact_general_ledger, all-time, at tenant + account + document_type grain. Unlike recon_trial_balance/recon_profit_and_loss (which compare against a Xero-computed report snapshot), this check compares two of OUR OWN pipelines against each other (the document-parsing path vs. the journals/GL path) — there is no external snapshot to bound the window to, so the comparison is cumulative all-time. Excludes journals.source_type IS NULL (Xero's own automatic inventory/COGS journals — no document exists) and INTEGRATEDPAYROLLPE (Xero Payroll product, separate API, not synced) — see docs/DWH_ARCHITECTURE.md for why those are structurally unmappable, not a gap in this table.",
+  tags: ["ods", "xero", "l1", "reconciliation"]
+}
+
+-- =============================================================================
+-- ods_xero_1.recon_document_facts
+-- Sources: every Xero document fact + fact_general_ledger
+--
+-- ⚠ SIGN CONVENTION per document_type — verified empirically against real data
+-- (2026-07-24), not assumed. fact_general_ledger.amount is a signed
+-- debit-positive/credit-negative double-entry measure; each document fact's
+-- own "amount" is stored as a plain positive transaction value. Whether they
+-- match directly or need negating depends on which side of the entry the
+-- document type naturally posts to — tested both conventions per
+-- (document_type, mapped fact) pair against real data; the table below is
+-- the winner for each, confirmed to a residual of a few % or less on every
+-- clean pairing:
+--   ACCPAY              no flip   (expense: debit, same sign as doc fact)
+--   ACCREC              flip      (revenue: credit, opposite sign)
+--   ACCPAYCREDIT         flip      (reverses an expense debit -> credit)
+--   ACCRECCREDIT         no flip   (reverses a revenue credit -> debit)
+--   CASHPAID (SPEND)     no flip
+--   CASHREC (RECEIVE)    flip
+--   MANJOURNAL           no flip   (already GL-native, no tax normalization)
+--   ACCPAYPAYMENT        flip
+--   ACCRECPAYMENT        no flip
+--   APCREDITPAYMENT      no flip
+--   ARCREDITPAYMENT      flip
+--   APOVERPAYMENT (SPEND-OVERPAYMENT)   no flip
+--   AROVERPAYMENT (RECEIVE-OVERPAYMENT) flip
+--   TRANSFER             unpivoted: from_account = -amount, to_account = +amount
+--                         (fact_bank_transfer is one row per transfer covering
+--                         both sides; GL posts 2 lines per transfer, so the
+--                         document side is unpivoted to match that grain)
+--
+-- ⚠ DELETED/VOIDED documents are excluded from the document-fact side.
+-- Verified this matters a lot: for ACCREC alone, excluding them dropped one
+-- tenant's residual from 25% to 0%, another's from 9% to 1%. A voided/deleted
+-- document still carries its original (now-void) amount in the /Invoices
+-- (etc.) API response, but Xero's GL either never posted it or reversed it —
+-- counting it on the document side would overstate that side only.
+-- journals/fact_general_ledger need no equivalent filter — /Journals only
+-- ever returns real, immutable postings.
+--
+-- ⚠ TRANSFER/OVERPAYMENT bank_transactions are NOT double-counted. Every
+-- bank_transfer/overpayment also creates a linked bank_transactions row
+-- (transaction_type SPEND-TRANSFER/RECEIVE-TRANSFER/SPEND-OVERPAYMENT/
+-- RECEIVE-OVERPAYMENT) — confirmed these never appear as a journal source_id
+-- under ANY source_type (0 matches tested), so fact_bank_transaction_line's
+-- CASHPAID/CASHREC bucket below is filtered to document_type IN
+-- ('SPEND','RECEIVE') only, excluding the transfer/overpayment-linked rows
+-- that would otherwise inflate it with amounts that have no CASHPAID/CASHREC
+-- GL posting at all.
+--
+-- fact_manual_journal_line is filtered by document_type IN ('MANJOURNAL')
+-- (it has no other document_type) — never sum this fact alongside
+-- fact_general_ledger's MANJOURNAL rows elsewhere; here they are compared
+-- against each other, which is the point of this table, not double-counted.
+-- =============================================================================
+
+WITH invoice_side AS (
+  SELECT
+    tenant_id, account_id, document_type,
+    SUM(CASE WHEN document_type = 'ACCREC' THEN -amount ELSE amount END) AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_invoice_line")}
+  WHERE status NOT IN ('DELETED', 'VOIDED')
+  GROUP BY 1, 2, 3
+),
+
+credit_note_side AS (
+  SELECT
+    tenant_id, account_id, document_type,
+    SUM(CASE WHEN document_type = 'ACCPAYCREDIT' THEN -amount ELSE amount END) AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_credit_note_line")}
+  WHERE status NOT IN ('DELETED', 'VOIDED')
+  GROUP BY 1, 2, 3
+),
+
+bank_txn_side AS (
+  SELECT
+    tenant_id, account_id,
+    CASE document_type WHEN 'SPEND' THEN 'CASHPAID' WHEN 'RECEIVE' THEN 'CASHREC' END AS document_type,
+    SUM(CASE WHEN document_type = 'RECEIVE' THEN -amount ELSE amount END) AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_bank_transaction_line")}
+  WHERE status NOT IN ('DELETED')
+    AND document_type IN ('SPEND', 'RECEIVE')
+  GROUP BY 1, 2, 3
+),
+
+manual_journal_side AS (
+  SELECT
+    tenant_id, account_id, 'MANJOURNAL' AS document_type,
+    SUM(amount) AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_manual_journal_line")}
+  WHERE status NOT IN ('DELETED', 'VOIDED')
+  GROUP BY 1, 2
+),
+
+payment_side AS (
+  SELECT
+    tenant_id, account_id, document_type,
+    SUM(CASE WHEN document_type IN ('ACCPAYPAYMENT', 'ARCREDITPAYMENT') THEN -amount ELSE amount END) AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_payment")}
+  WHERE status NOT IN ('DELETED')
+    AND document_type IN ('ACCPAYPAYMENT', 'ACCRECPAYMENT', 'APCREDITPAYMENT', 'ARCREDITPAYMENT')
+  GROUP BY 1, 2, 3
+),
+
+overpayment_side AS (
+  SELECT
+    tenant_id, account_id,
+    CASE document_type WHEN 'SPEND-OVERPAYMENT' THEN 'APOVERPAYMENT' WHEN 'RECEIVE-OVERPAYMENT' THEN 'AROVERPAYMENT' END AS document_type,
+    SUM(CASE WHEN document_type = 'RECEIVE-OVERPAYMENT' THEN -amount ELSE amount END) AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_overpayment_line")}
+  WHERE status NOT IN ('VOIDED')
+  GROUP BY 1, 2, 3
+),
+
+transfer_unpivoted AS (
+  SELECT tenant_id, from_bank_account_id AS account_id, -amount AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_bank_transfer")}
+  UNION ALL
+  SELECT tenant_id, to_bank_account_id AS account_id, amount AS doc_amount
+  FROM ${ref("ods_xero_1", "fact_bank_transfer")}
+),
+
+transfer_side AS (
+  SELECT tenant_id, account_id, 'TRANSFER' AS document_type, SUM(doc_amount) AS doc_amount
+  FROM transfer_unpivoted
+  GROUP BY 1, 2
+),
+
+doc_totals AS (
+  SELECT * FROM invoice_side
+  UNION ALL SELECT * FROM credit_note_side
+  UNION ALL SELECT * FROM bank_txn_side
+  UNION ALL SELECT * FROM manual_journal_side
+  UNION ALL SELECT * FROM payment_side
+  UNION ALL SELECT * FROM overpayment_side
+  UNION ALL SELECT * FROM transfer_side
+),
+
+doc_totals_agg AS (
+  SELECT tenant_id, account_id, document_type, SUM(doc_amount) AS doc_amount
+  FROM doc_totals
+  GROUP BY 1, 2, 3
+),
+
+gl_totals AS (
+  SELECT tenant_id, account_id, document_type, SUM(amount) AS gl_amount
+  FROM ${ref("ods_xero_1", "fact_general_ledger")}
+  WHERE document_type IN (
+    'ACCPAY', 'ACCREC', 'ACCPAYCREDIT', 'ACCRECCREDIT', 'CASHPAID', 'CASHREC',
+    'MANJOURNAL', 'ACCPAYPAYMENT', 'ACCRECPAYMENT', 'APCREDITPAYMENT',
+    'ARCREDITPAYMENT', 'APOVERPAYMENT', 'AROVERPAYMENT', 'TRANSFER'
+  )
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  COALESCE(d.tenant_id, g.tenant_id)     AS tenant_id,
+  COALESCE(d.account_id, g.account_id)   AS account_id,
+  COALESCE(d.document_type, g.document_type) AS document_type,
+  ROUND(d.doc_amount, 2) AS doc_amount,
+  ROUND(g.gl_amount, 2)  AS gl_amount,
+  ROUND(COALESCE(d.doc_amount, 0) - COALESCE(g.gl_amount, 0), 2) AS diff
+FROM doc_totals_agg AS d
+FULL OUTER JOIN gl_totals AS g
+  ON g.tenant_id = d.tenant_id
+ AND g.account_id = d.account_id
+ AND g.document_type = d.document_type

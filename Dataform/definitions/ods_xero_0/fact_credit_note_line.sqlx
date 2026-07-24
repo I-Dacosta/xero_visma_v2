@@ -1,0 +1,84 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_credit_note_line",
+  description: "ODS Xero L0 (native): Xero credit note lines at line grain, with credit-note header context denormalized onto each line. Covers ACCRECCREDIT (customer) + ACCPAYCREDIT (supplier) — credit_note_type distinguishes them; customer/supplier split happens at omnibus. LINE measures only. Native Xero vocabulary; audit anchor. Credit-note allocations (applied to invoices) are a separate fact, not built yet.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["credit_note_line_key", "tenant_id", "line_item_id", "credit_note_id"],
+    uniqueKey: ["credit_note_line_key"]
+  }
+}
+
+-- =============================================================================
+-- ods_xero_0.fact_credit_note_line
+-- Sources: staging_xero.credit_note_lines (line) + staging_xero.credit_notes (header)
+-- Grain:   one row per tenant_id + line_item_id
+-- Key:     credit_note_line_key = tenant_id | line_item_id
+-- Note:    Credit note lines have NO item_code (unlike invoice lines).
+--          discount_rate / discount_amount are STRING in staging -> SAFE_CAST.
+-- =============================================================================
+
+WITH header AS (
+  SELECT *
+  FROM ${ref("staging_xero", "credit_notes")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, credit_note_id ORDER BY synced_at DESC) = 1
+),
+
+lines AS (
+  SELECT * FROM ${ref("staging_xero", "credit_note_lines")}
+)
+
+SELECT
+  CONCAT(CAST(l.tenant_id AS STRING), '|', CAST(l.line_item_id AS STRING)) AS credit_note_line_key,
+  l.tenant_id,
+
+  l.line_item_id,
+  l.credit_note_id,
+  ROW_NUMBER() OVER (PARTITION BY l.tenant_id, l.credit_note_id ORDER BY l.line_item_id) AS line_number,
+
+  -- Credit-note header context (denormalized onto the line)
+  h.credit_note_number,
+  h.credit_note_type,
+  h.status,
+  h.reference,
+  h.contact_id,
+  h.contact_name,
+  h.currency_code,
+  h.currency_rate,
+  h.credit_note_date,
+  h.credit_note_date_local,
+  h.due_date,
+  h.line_amount_types,
+
+  -- Line dimension references (native Xero ids/codes)
+  l.account_id,
+  l.account_code,
+  l.tax_type,
+  l.tracking_category_1_id,
+  l.tracking_category_1_name,
+  l.tracking_option_1_id,
+  l.tracking_option_1_name,
+  l.tracking_category_2_id,
+  l.tracking_category_2_name,
+  l.tracking_option_2_id,
+  l.tracking_option_2_name,
+
+  -- Line detail
+  l.description,
+
+  -- Line measures (transaction currency)
+  l.quantity,
+  l.unit_amount,
+  l.line_amount,
+  l.tax_amount,
+  SAFE_CAST(l.discount_rate   AS FLOAT64) AS discount_rate,
+  SAFE_CAST(l.discount_amount AS FLOAT64) AS discount_amount,
+
+  -- Timestamps (from header)
+  h.updated_at,
+  h.synced_at
+
+FROM lines AS l
+LEFT JOIN header AS h
+  ON h.tenant_id = l.tenant_id AND h.credit_note_id = l.credit_note_id

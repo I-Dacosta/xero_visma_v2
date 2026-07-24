@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "items",
+  description: "Staging: Xero items (products/services). One row per tenant_id + item_id. Populated outside Dataform by the Python ETL."
+}

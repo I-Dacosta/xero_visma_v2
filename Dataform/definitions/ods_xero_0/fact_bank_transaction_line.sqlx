@@ -1,0 +1,73 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_bank_transaction_line",
+  description: "ODS Xero L0 (native): Xero bank transaction lines at line grain, with header context denormalized. Covers SPEND + RECEIVE (transaction_type). LINE measures only. Native Xero vocabulary; audit anchor.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["bank_transaction_line_key", "tenant_id", "line_item_id", "bank_transaction_id"],
+    uniqueKey: ["bank_transaction_line_key"]
+  }
+}
+
+WITH header AS (
+  SELECT *
+  FROM ${ref("staging_xero", "bank_transactions")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, bank_transaction_id ORDER BY synced_at DESC) = 1
+),
+
+lines AS (
+  SELECT * FROM ${ref("staging_xero", "bank_transaction_lines")}
+)
+
+SELECT
+  CONCAT(CAST(l.tenant_id AS STRING), '|', CAST(l.line_item_id AS STRING)) AS bank_transaction_line_key,
+  l.tenant_id,
+
+  l.line_item_id,
+  l.bank_transaction_id,
+  ROW_NUMBER() OVER (PARTITION BY l.tenant_id, l.bank_transaction_id ORDER BY l.line_item_id) AS line_number,
+
+  -- Header context
+  h.transaction_type,
+  h.status,
+  h.reference,
+  h.is_reconciled,
+  h.contact_id,
+  h.contact_name,
+  h.bank_account_id,
+  h.bank_account_code,
+  h.bank_account_name,
+  h.currency_code,
+  h.currency_rate,
+  h.transaction_date,
+  h.transaction_date_local,
+  h.line_amount_types,
+
+  -- Line dimension references (native)
+  l.account_id,
+  l.account_code,
+  l.tax_type,
+  l.tracking_category_1_id,
+  l.tracking_category_1_name,
+  l.tracking_option_1_id,
+  l.tracking_option_1_name,
+  l.tracking_category_2_id,
+  l.tracking_category_2_name,
+  l.tracking_option_2_id,
+  l.tracking_option_2_name,
+
+  l.description,
+
+  -- Line measures (transaction currency)
+  l.quantity,
+  l.unit_amount,
+  l.line_amount,
+  l.tax_amount,
+
+  h.updated_at,
+  h.synced_at
+
+FROM lines AS l
+LEFT JOIN header AS h
+  ON h.tenant_id = l.tenant_id AND h.bank_transaction_id = l.bank_transaction_id

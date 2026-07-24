@@ -1,0 +1,71 @@
+config {
+  type: "table",
+  schema: "ods_xero_0",
+  name: "fact_quote_line",
+  description: "ODS Xero L0 (native): Xero quote lines at line grain, with header context denormalized. LINE measures only. Quote lines have no account/item/tax_type (pre-sales documents). Native Xero vocabulary; audit anchor.",
+  tags: ["ods", "xero", "l0", "fact"],
+  assertions: {
+    nonNull: ["quote_line_key", "tenant_id", "line_item_id", "quote_id"],
+    uniqueKey: ["quote_line_key"]
+  }
+}
+
+WITH header AS (
+  SELECT *
+  FROM ${ref("staging_xero", "quotes")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, quote_id ORDER BY synced_at DESC) = 1
+),
+
+lines AS (
+  SELECT * FROM ${ref("staging_xero", "quote_lines")}
+)
+
+SELECT
+  CONCAT(CAST(l.tenant_id AS STRING), '|', CAST(l.line_item_id AS STRING)) AS quote_line_key,
+  l.tenant_id,
+
+  l.line_item_id,
+  l.quote_id,
+  ROW_NUMBER() OVER (PARTITION BY l.tenant_id, l.quote_id ORDER BY l.line_item_id) AS line_number,
+
+  -- Header context
+  h.quote_number,
+  h.status,
+  h.reference,
+  h.terms,
+  h.contact_id,
+  h.contact_name,
+  h.contact_email,
+  h.currency_code,
+  h.currency_rate,
+  h.quote_date,
+  h.quote_date_local,
+  h.expiry_date,
+  h.expiry_date_local,
+  h.line_amount_types,
+
+  -- Line dimension references (native — tracking only; no account/item on quotes)
+  l.tracking_category_1_id,
+  l.tracking_category_1_name,
+  l.tracking_option_1_id,
+  l.tracking_option_1_name,
+  l.tracking_category_2_id,
+  l.tracking_category_2_name,
+  l.tracking_option_2_id,
+  l.tracking_option_2_name,
+
+  l.description,
+
+  -- Line measures (transaction currency)
+  l.quantity,
+  l.unit_amount,
+  l.line_amount,
+  l.tax_amount,
+  SAFE_CAST(l.discount_amount AS FLOAT64) AS discount_amount,
+
+  h.updated_at,
+  h.synced_at
+
+FROM lines AS l
+LEFT JOIN header AS h
+  ON h.tenant_id = l.tenant_id AND h.quote_id = l.quote_id

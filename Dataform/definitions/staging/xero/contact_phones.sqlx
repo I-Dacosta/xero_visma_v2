@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "contact_phones",
+  description: "Staging: Xero contact phones child table (from contacts endpoint Phones[]). One row per contact_id + phone_type (DEFAULT, MOBILE, DDI, FAX). Populated outside Dataform — declared here so ODS models can ref() it."
+}

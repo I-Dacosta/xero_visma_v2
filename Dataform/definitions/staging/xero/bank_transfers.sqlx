@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "bank_transfers",
+  description: "Staging: Xero bank transfers (/BankTransfers — money moved between two of the org's own bank accounts). Header only, no lines. One row per tenant_id + bank_transfer_id. Restored 2026-07-24 to close the journals.source_type='TRANSFER' GL-reconciliation gap. Populated outside Dataform by the Python ETL (etl/xero/bank_transfers.py). ⚠ Each transfer also creates a matching SPEND + RECEIVE row in staging_xero.bank_transactions (linked via from/to_bank_transaction_id) — never sum bank_transfers.amount alongside bank_transactions in the same total, that would double-count."
+}

@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "quote_lines",
+  description: "Staging: Xero quote line items. One row per tenant_id + line_item_id. No account/item/tax_type (pre-sales). Carries up to 2 tracking category/option pairs. Populated outside Dataform by the Python ETL."
+}

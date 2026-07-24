@@ -1,0 +1,36 @@
+config {
+  type: "assertion",
+  tags: ["ods", "xero", "l1", "assertion"],
+  description: "Reconciliation guard for ods_xero_1.fact_invoice_line: the net (tax-exclusive) line amounts must sum, per invoice, to the Xero header sub_total. Fails the build if the tax-basis normalization (Inclusive -> line_amount - tax_amount) ever regresses — a regression would break ~5,000 Inclusive invoices by their full tax amount, so this catches it immediately. Currently returns 0 rows (all 15,294 invoices reconcile)."
+}
+
+-- Returns one row per invoice whose net line total does NOT tie to the header
+-- sub_total. Tolerance: absolute 0.02 plus a small relative 0.1% band to absorb
+-- benign float rounding on large invoices, while a tax-basis regression (order
+-- 10-25% off) is far outside the band and will surface here.
+
+WITH line_sums AS (
+  SELECT
+    tenant_id,
+    invoice_id,
+    SUM(amount_in_currency) AS net_line_total
+  FROM ${ref("ods_xero_1", "fact_invoice_line")}
+  GROUP BY tenant_id, invoice_id
+),
+
+header AS (
+  SELECT tenant_id, invoice_id, sub_total
+  FROM ${ref("staging_xero", "invoices")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id, invoice_id ORDER BY synced_at DESC) = 1
+)
+
+SELECT
+  ls.tenant_id,
+  ls.invoice_id,
+  ROUND(ls.net_line_total, 2) AS net_line_total,
+  ROUND(h.sub_total, 2)       AS header_sub_total,
+  ROUND(ls.net_line_total - h.sub_total, 2) AS diff
+FROM line_sums AS ls
+JOIN header AS h
+  ON h.tenant_id = ls.tenant_id AND h.invoice_id = ls.invoice_id
+WHERE ABS(ls.net_line_total - h.sub_total) > 0.02 + 0.001 * ABS(h.sub_total)

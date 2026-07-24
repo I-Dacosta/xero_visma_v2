@@ -1,0 +1,97 @@
+config {
+  type: "table",
+  schema: "ods_xero_1",
+  name: "recon_trial_balance",
+  description: "Reconciliation (not yet a hard assertion — new territory, tolerance not yet established): our own fact_general_ledger, aggregated per account for the CURRENT fiscal year to date, vs Xero's own Trial Balance report (YTD Debit - YTD Credit). Fiscal year is bounded per-tenant using dim_organisation.financial_year_end_day/month (verified 2026-07-24: tenants have MIXED fiscal years — 2 use a June 30 year-end, the rest Dec 31 — do not assume calendar year). Uses each tenant's LATEST report_trial_balance snapshot. One row per tenant + account; diffs are the reconciliation signal.",
+  tags: ["ods", "xero", "l1", "reconciliation"]
+}
+
+-- =============================================================================
+-- ods_xero_1.recon_trial_balance
+-- Sources: fact_general_ledger (ours) + fact_report_row (Xero's own report) + dim_organisation (fiscal year)
+--
+-- Trial Balance has 4 numeric columns per account: Debit, Credit, YTD Debit,
+-- YTD Credit. Verified empirically (not assumed) which one matches our GL:
+-- YTD Debit - YTD Credit matches our own cumulative SUM(net_amount) bounded to
+-- the CURRENT FISCAL YEAR (not all-time, not calendar year) — confirmed by
+-- testing real accounts: those with no prior-fiscal-year history matched
+-- exactly; others diverged by precisely their pre-this-year accumulation.
+--
+-- Fiscal year start/end computed from dim_organisation.financial_year_end_day
+-- /_month (Xero's Organisation.FinancialYearEndDay/Month — added to the
+-- organisations parser specifically to support this check).
+-- =============================================================================
+
+WITH latest_snapshot AS (
+  SELECT tenant_id, record_id, report_date
+  FROM ${ref("ods_xero_1", "fact_report_row")}
+  WHERE report = 'report_trial_balance'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY report_date DESC) = 1
+),
+
+org AS (
+  SELECT tenant_id, financial_year_end_day, financial_year_end_month
+  FROM ${ref("ods_xero_1", "dim_organisation")}
+),
+
+snapshot_with_fy AS (
+  SELECT
+    s.tenant_id,
+    s.record_id,
+    s.report_date,
+    CASE
+      WHEN s.report_date <= DATE(EXTRACT(YEAR FROM s.report_date), o.financial_year_end_month, o.financial_year_end_day)
+        THEN DATE_ADD(
+          DATE(EXTRACT(YEAR FROM s.report_date) - 1, o.financial_year_end_month, o.financial_year_end_day),
+          INTERVAL 1 DAY)
+      ELSE DATE_ADD(
+          DATE(EXTRACT(YEAR FROM s.report_date), o.financial_year_end_month, o.financial_year_end_day),
+          INTERVAL 1 DAY)
+    END AS fiscal_year_start
+  FROM latest_snapshot AS s
+  LEFT JOIN org AS o ON o.tenant_id = s.tenant_id
+),
+
+xero_trial_balance AS (
+  SELECT
+    r.tenant_id,
+    r.attribute_value AS account_id,
+    ANY_VALUE(r.row_label)                                             AS account_label,
+    SUM(IF(r.column_header = 'YTD Debit',  COALESCE(r.cell_value_numeric, 0), 0))
+      - SUM(IF(r.column_header = 'YTD Credit', COALESCE(r.cell_value_numeric, 0), 0)) AS xero_ytd_net
+  FROM ${ref("ods_xero_1", "fact_report_row")} AS r
+  JOIN latest_snapshot AS s
+    ON s.tenant_id = r.tenant_id AND s.record_id = r.record_id
+  WHERE r.report = 'report_trial_balance'
+    AND r.attribute_id = 'account'
+    -- Some "account" attributes are Xero synthetic group sentinels (e.g.
+    -- "FXGROUPID"), not real account UUIDs — exclude them.
+    AND REGEXP_CONTAINS(r.attribute_value, r'^[0-9a-f]{8}-[0-9a-f]{4}-')
+  GROUP BY 1, 2
+),
+
+our_ytd AS (
+  SELECT
+    gl.tenant_id,
+    gl.account_id,
+    SUM(gl.amount) AS our_ytd_net
+  FROM ${ref("ods_xero_1", "fact_general_ledger")} AS gl
+  JOIN snapshot_with_fy AS s ON s.tenant_id = gl.tenant_id
+  WHERE gl.document_date BETWEEN s.fiscal_year_start AND s.report_date
+  GROUP BY 1, 2
+)
+
+SELECT
+  COALESCE(x.tenant_id, g.tenant_id)   AS tenant_id,
+  COALESCE(x.account_id, g.account_id) AS account_id,
+  x.account_label,
+  s.report_date,
+  s.fiscal_year_start,
+  COALESCE(x.xero_ytd_net, 0)          AS xero_ytd_net,
+  COALESCE(g.our_ytd_net, 0)           AS our_ytd_net,
+  ROUND(COALESCE(g.our_ytd_net, 0) - COALESCE(x.xero_ytd_net, 0), 2) AS diff
+FROM xero_trial_balance AS x
+FULL OUTER JOIN our_ytd AS g
+  ON g.tenant_id = x.tenant_id AND g.account_id = x.account_id
+LEFT JOIN snapshot_with_fy AS s
+  ON s.tenant_id = COALESCE(x.tenant_id, g.tenant_id)

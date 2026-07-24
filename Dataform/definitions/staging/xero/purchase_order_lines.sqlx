@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "staging_xero",
+  name: "purchase_order_lines",
+  description: "Staging: Xero purchase order line items. One row per tenant_id + line_item_id. Carries up to 2 tracking category/option pairs. Populated outside Dataform by the Python ETL."
+}
